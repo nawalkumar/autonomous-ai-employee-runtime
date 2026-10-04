@@ -9,17 +9,19 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 | **Phase 0** | Done | Project foundation (FastAPI, uv, LLM abstraction, Docker, `/health`) |
 | **Phase 1** | Done | Domain contracts + `ExecutionState` + SQLite persistence + audit events |
 | **Phase 2** | Done | Mock company world + tools + registry + deterministic failure injection |
-| **Future** | Not started | Runtime/orchestrator, recovery, verification, HITL, live LLM integration |
+| **Phase 3** | Done | Deterministic execution runtime (predefined plans, no LLM) |
+| **Future** | Not started | LLM planning, recovery/retry, verification, HITL |
 
-### Phase 2 implemented
+### Phase 3 implemented
 
-- Deterministic mock company world (`employees`, `customers`, `tickets`) in SQLite
-- `CompanyRepository` separate from runtime `SQLiteStore` (shared DB file)
-- Tool abstraction (`BaseTool`, `ToolResult`, `RiskLevel`, `ToolRegistry`)
-- `CompanyAPITool` — real CRUD against the mock company DB
-- `FileTool` — sandboxed read/write under `workspace/` with traversal rejection
-- One-shot `FailureInjector` for demo/test transient failures
-- Offline-capable: no LLM keys or external APIs required
+- `ExecutionRuntime` executes predefined plans via `ToolRegistry` only
+- Task creation from caller-supplied goal + plan (no interpretation/planning)
+- Step lifecycle: `PENDING → RUNNING → COMPLETED|FAILED`
+- Persists `ToolCallRecord`, `Observation`, `FailureRecord`, audit events
+- Stops on first failure (**no retry / no recovery**)
+- Resume from SQLite: completed steps are not re-executed
+- Stable idempotency key: `{task_id}:{step_id}` (dedupe later)
+- Still offline: no LLM, LangGraph, or external APIs
 
 Default DB path: `workspace/runtime.db` (gitignored).
 
@@ -78,7 +80,7 @@ uv run pytest
 app/
   api/        # HTTP routes (health)
   models/     # domain contracts + ExecutionState
-  runtime/    # agent orchestrator (future)
+  runtime/    # deterministic ExecutionRuntime
   tools/      # BaseTool, registry, company/file tools
   llm/        # provider-agnostic LLM clients
   store/      # runtime SQLite persistence

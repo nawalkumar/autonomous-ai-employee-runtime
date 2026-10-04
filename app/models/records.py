@@ -25,6 +25,9 @@ class ToolCallRecord(BaseModel):
     completed_at: datetime | None = None
     status: ToolCallStatus = ToolCallStatus.RUNNING
     idempotency_key: str | None = None
+    result: dict[str, Any] | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
 class Observation(BaseModel):
@@ -33,6 +36,7 @@ class Observation(BaseModel):
     observation_id: str = Field(default_factory=lambda: new_id("obs_"))
     source: str
     ok: bool
+    summary: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
     error_type: str | None = None
     error_message: str | None = None
