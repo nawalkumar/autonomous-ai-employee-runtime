@@ -171,7 +171,9 @@ def test_end_to_end_employee_update(
         interpreted_goal=result.interpreted_goal,
         plan=result.plan.steps,
     )
-    final = runtime.run(task.task_id)
+    paused = runtime.run(task.task_id)
+    assert paused.final_status is TaskStatus.NEEDS_APPROVAL
+    final = runtime.approve_task(task.task_id)
 
     assert final.final_status is TaskStatus.COMPLETED
     assert all(s.status is PlanStepStatus.COMPLETED for s in final.plan)

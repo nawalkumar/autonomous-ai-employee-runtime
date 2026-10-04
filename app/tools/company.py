@@ -69,8 +69,9 @@ _RETRY_SAFE_OPS = frozenset(
         "get_employee",
         "find_customer",
         "get_ticket",
-        # create_ticket is retry-safe for pre-mutation injected transient failures.
+        # Write ops are retry-safe for pre-mutation injected transient failures.
         "create_ticket",
+        "update_employee",
     }
 )
 

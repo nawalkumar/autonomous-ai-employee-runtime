@@ -30,6 +30,9 @@ class EventType:
     VERIFICATION_PASSED = "verification.passed"
     VERIFICATION_FAILED = "verification.failed"
     EVIDENCE_RECORDED = "evidence.recorded"
+    APPROVAL_REQUESTED = "approval.requested"
+    APPROVAL_APPROVED = "approval.approved"
+    APPROVAL_REJECTED = "approval.rejected"
 
 
 def make_event(

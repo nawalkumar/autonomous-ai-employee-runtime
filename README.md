@@ -13,7 +13,14 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 | **Phase 4** | Done | Goal interpreter + planner (LLM understands/plans; runtime executes) |
 | **Phase 5** | Done | Observe → classify failure → bounded recovery/retry → continue plan |
 | **Phase 6** | Done | Independent verification + evidence before COMPLETED |
-| **Future** | Not started | HITL |
+| **Phase 7** | Done | Human-in-the-loop approval (pause / approve / reject / resume) |
+
+### Phase 7 implemented
+
+- Deterministic `ApprovalPolicy` gates sensitive tools **before** invocation
+- `PendingAction` + `ApprovalStatus` persisted on `ExecutionState`
+- `ExecutionRuntime.approve_task` / `reject_task` resume or terminate cleanly
+- Audit events: `approval.requested`, `approval.approved`, `approval.rejected`
 
 ### Phase 6 implemented
 
@@ -22,6 +29,46 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 - Success criteria / derived outcomes checked against actual world state
 - Evidence recorded from observed facts only
 - Task reaches `COMPLETED` only when verification passes
+
+## Human-in-the-Loop Approval
+
+Sensitive plan steps pause for human approval **before** the tool runs.
+
+**Requires approval**
+- `company_api` / `update_employee`
+- Any tool operation classified as `destructive`
+
+**Does not require approval**
+- Read-only company operations (`get_employee`, `find_customer`, list/search)
+- Demo ticket creation
+- `file` writes (unless marked destructive)
+
+When approval is required the runtime:
+
+1. Creates a `PendingAction` (tool, arguments, risk, reason)
+2. Sets `TaskStatus.NEEDS_APPROVAL` and `ApprovalStatus.PENDING`
+3. Keeps the plan step `PENDING` (no mutation)
+4. Emits `approval.requested` and returns control to the caller
+
+Then:
+
+- `runtime.approve_task(task_id)` → marks approved, resumes from the same step, continues recovery/verification
+- `runtime.reject_task(task_id, reason)` → marks rejected, sets `ABORTED`, never invokes the tool
+
+```text
+Goal
+  → Plan
+  → Policy check
+  → Approval required?
+       ├── No  → Execute → Verify → Complete
+       └── Yes → Pause (PendingAction)
+                    ↓
+               Human decision
+                    ├── Approve → Execute → Verify → Complete
+                    └── Reject  → Terminate (no mutation)
+```
+
+Pending approvals survive process restart via SQLite. Double-approve and approve-after-reject raise `ApprovalError("no pending approval")`.
 
 ## Independent Verification
 
@@ -81,8 +128,6 @@ Failure?
     ├── Yes → Retry → Continue
     └── No  → Fail safely
 ```
-
-This phase does **not** implement HITL or independent verification.
 
 Default DB path: `workspace/runtime.db` (gitignored).
 
@@ -147,7 +192,7 @@ app/
   tools/      # BaseTool, registry, company/file tools
   llm/        # provider-agnostic LLM clients (mock/xai)
   store/      # runtime SQLite persistence
-  policy/     # risk / HITL (future)
+  policy/     # ApprovalPolicy (HITL gate)
   verify/     # independent OutcomeVerifier + evidence
   world/      # mock company repository + seed data
 tests/

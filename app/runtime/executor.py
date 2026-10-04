@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pathlib import Path
+
 from app.config import get_settings
 from app.models.enums import (
     Actor,
+    ApprovalStatus,
     FailureType,
     PlanStepStatus,
     TaskStatus,
@@ -20,10 +23,12 @@ from app.models.records import (
     EvidenceItem,
     FailureRecord,
     Observation,
+    PendingAction,
     ToolCallRecord,
     utc_now,
 )
 from app.models.state import ExecutionState
+from app.policy import ApprovalPolicy
 from app.runtime.recovery import (
     RecoveryAction,
     classify_failure,
@@ -35,8 +40,6 @@ from app.runtime.transitions import (
     make_event,
     observe_tool_result,
 )
-from pathlib import Path
-
 from app.store.sqlite_store import SQLiteStore
 from app.tools.base import BaseTool
 from app.tools.registry import ToolRegistry
@@ -45,6 +48,16 @@ from app.verify.verifier import OutcomeVerifier
 from app.world.repository import CompanyRepository
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL = {
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.ABORTED,
+}
+
+
+class ApprovalError(ValueError):
+    """Raised for invalid approval/rejection operations."""
 
 
 class ExecutionRuntime:
@@ -58,9 +71,11 @@ class ExecutionRuntime:
         max_recovery_attempts: int | None = None,
         verifier: OutcomeVerifier | None = None,
         workspace_path: str | Path | None = None,
+        policy: ApprovalPolicy | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
+        self.policy = policy or ApprovalPolicy()
         self.max_recovery_attempts = (
             max_recovery_attempts
             if max_recovery_attempts is not None
@@ -122,13 +137,11 @@ class ExecutionRuntime:
         return state
 
     def run(self, task_id: str) -> ExecutionState:
-        """Execute pending steps until the task completes or fails."""
+        """Execute pending steps until complete, failed, aborted, or approval required."""
         state = self.load(task_id)
-        if state.final_status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.ABORTED,
-        }:
+        if state.final_status in _TERMINAL:
+            return state
+        if state.final_status is TaskStatus.NEEDS_APPROVAL:
             return state
 
         if state.final_status is TaskStatus.QUEUED:
@@ -136,18 +149,14 @@ class ExecutionRuntime:
 
         while True:
             state = self.load(task_id)
-            if state.final_status in {
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.ABORTED,
-            }:
+            if state.final_status in _TERMINAL:
+                return state
+            if state.final_status is TaskStatus.NEEDS_APPROVAL:
                 return state
             advanced = self.execute_next(task_id)
-            if advanced.final_status in {
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.ABORTED,
-            }:
+            if advanced.final_status in _TERMINAL:
+                return advanced
+            if advanced.final_status is TaskStatus.NEEDS_APPROVAL:
                 return advanced
             if advanced.current_step == state.current_step and all(
                 s.status is not PlanStepStatus.PENDING for s in advanced.plan
@@ -157,11 +166,9 @@ class ExecutionRuntime:
     def execute_next(self, task_id: str) -> ExecutionState:
         """Execute exactly one pending plan step (with bounded recovery), then return."""
         state = self.load(task_id)
-        if state.final_status in {
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.ABORTED,
-        }:
+        if state.final_status in _TERMINAL:
+            return state
+        if state.final_status is TaskStatus.NEEDS_APPROVAL:
             return state
 
         if state.final_status is TaskStatus.QUEUED:
@@ -172,6 +179,82 @@ class ExecutionRuntime:
             return self._complete_task(state)
 
         return self._execute_step(state, step_index)
+
+    def approve_task(self, task_id: str) -> ExecutionState:
+        """Approve the pending action and resume execution from that step."""
+        state = self.load(task_id)
+        if (
+            state.final_status is not TaskStatus.NEEDS_APPROVAL
+            or state.approval_status is not ApprovalStatus.PENDING
+            or state.pending_action is None
+        ):
+            raise ApprovalError("no pending approval")
+
+        pending = state.pending_action.model_copy(
+            update={"resolved_at": utc_now()}
+        )
+        state = state.model_copy(
+            update={
+                "approval_status": ApprovalStatus.APPROVED,
+                "pending_action": pending,
+                "final_status": TaskStatus.RUNNING,
+            }
+        ).touch()
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.APPROVAL_APPROVED,
+                action="approval_approved",
+                tool=pending.tool_name,
+                arguments=dict(pending.arguments),
+                result={
+                    "step_id": pending.step_id,
+                    "risk": pending.risk,
+                },
+                actor=Actor.HUMAN,
+            )
+        )
+        return self.run(task_id)
+
+    def reject_task(self, task_id: str, reason: str = "Rejected by human") -> ExecutionState:
+        """Reject the pending action and terminate without executing the tool."""
+        state = self.load(task_id)
+        if (
+            state.final_status is not TaskStatus.NEEDS_APPROVAL
+            or state.approval_status is not ApprovalStatus.PENDING
+            or state.pending_action is None
+        ):
+            raise ApprovalError("no pending approval")
+
+        pending = state.pending_action.model_copy(
+            update={"resolved_at": utc_now()}
+        )
+        state = state.model_copy(
+            update={
+                "approval_status": ApprovalStatus.REJECTED,
+                "pending_action": pending,
+                "final_status": TaskStatus.ABORTED,
+                "completion_summary": reason,
+            }
+        ).touch()
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.APPROVAL_REJECTED,
+                action="approval_rejected",
+                tool=pending.tool_name,
+                arguments=dict(pending.arguments),
+                result={
+                    "step_id": pending.step_id,
+                    "risk": pending.risk,
+                    "reason": reason,
+                },
+                actor=Actor.HUMAN,
+            )
+        )
+        return state
 
     def _mark_running(self, state: ExecutionState) -> ExecutionState:
         state = state.model_copy(update={"final_status": TaskStatus.RUNNING}).touch()
@@ -200,6 +283,19 @@ class ExecutionRuntime:
         if not tool_name:
             return self._fail_missing_tool(state, step_index, step, None)
 
+        try:
+            tool = self.registry.get(tool_name)
+        except KeyError:
+            tool = None
+
+        # Policy gate BEFORE any tool mutation or step RUNNING transition.
+        paused_or_ready = self._apply_approval_gate(
+            state, step_index, step, tool_name, tool
+        )
+        if paused_or_ready.final_status is TaskStatus.NEEDS_APPROVAL:
+            return paused_or_ready
+        state = paused_or_ready
+
         state = self._update_step(
             state,
             step_index,
@@ -220,11 +316,6 @@ class ExecutionRuntime:
                 },
             )
         )
-
-        try:
-            tool = self.registry.get(tool_name)
-        except KeyError:
-            tool = None
 
         attempt = 0
         while True:
@@ -571,17 +662,24 @@ class ExecutionRuntime:
         extracted = dict(state.extracted_information)
         extracted.update(self._extract_info(result))
 
-        state = state.model_copy(
-            update={
-                "plan": plan,
-                "tool_calls": tool_calls,
-                "observations": [*state.observations, observation],
-                "evidence": evidence,
-                "completed_steps": completed_steps,
-                "extracted_information": extracted,
-                "current_step": step_index + 1,
-            }
-        ).touch()
+        updates: dict[str, Any] = {
+            "plan": plan,
+            "tool_calls": tool_calls,
+            "observations": [*state.observations, observation],
+            "evidence": evidence,
+            "completed_steps": completed_steps,
+            "extracted_information": extracted,
+            "current_step": step_index + 1,
+        }
+        if (
+            state.pending_action is not None
+            and state.pending_action.step_id == step.step_id
+            and state.approval_status is ApprovalStatus.APPROVED
+        ):
+            updates["pending_action"] = None
+            updates["approval_status"] = ApprovalStatus.NONE
+
+        state = state.model_copy(update=updates).touch()
         self._save(state)
 
         self._emit(
@@ -786,6 +884,90 @@ class ExecutionRuntime:
                     "message": result.failure_reason or result.summary,
                 },
             )
+        )
+        return state
+
+    def _apply_approval_gate(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        tool_name: str,
+        tool: BaseTool | None,
+    ) -> ExecutionState:
+        """Pause before sensitive tools unless this step was already approved."""
+        decision = self.policy.evaluate(
+            tool_name=tool_name,
+            arguments=dict(step.arguments),
+            tool=tool,
+        )
+        if not decision.requires_approval:
+            return state
+
+        # Human already approved this exact pending step — allow tool execution.
+        # Keep pending_action until the step succeeds so a crash mid-resume
+        # still remembers the approval and does not re-prompt or re-mutate twice.
+        if (
+            state.approval_status is ApprovalStatus.APPROVED
+            and state.pending_action is not None
+            and state.pending_action.step_id == step.step_id
+            and state.pending_action.tool_name == tool_name
+        ):
+            return state.model_copy(update={"current_step": step_index}).touch()
+
+        # Already waiting on this step.
+        if (
+            state.final_status is TaskStatus.NEEDS_APPROVAL
+            and state.approval_status is ApprovalStatus.PENDING
+            and state.pending_action is not None
+            and state.pending_action.step_id == step.step_id
+        ):
+            return state
+
+        key = idempotency_key_for(state.task_id, step.step_id)
+        pending = PendingAction(
+            tool_name=tool_name,
+            arguments=dict(step.arguments),
+            step_id=step.step_id,
+            idempotency_key=key,
+            reason=decision.reason,
+            risk=decision.risk.value,
+        )
+        # Keep the plan step PENDING — sensitive tool must not run yet.
+        plan = list(state.plan)
+        plan[step_index] = step.model_copy(update={"status": PlanStepStatus.PENDING})
+        state = state.model_copy(
+            update={
+                "plan": plan,
+                "current_step": step_index,
+                "pending_action": pending,
+                "approval_status": ApprovalStatus.PENDING,
+                "final_status": TaskStatus.NEEDS_APPROVAL,
+                "completion_summary": decision.reason,
+            }
+        ).touch()
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.APPROVAL_REQUESTED,
+                action="approval_requested",
+                tool=tool_name,
+                arguments=dict(step.arguments),
+                result={
+                    "step_id": step.step_id,
+                    "risk": decision.risk.value,
+                    "reason": decision.reason,
+                    "operation": decision.operation,
+                },
+                actor=Actor.SYSTEM,
+            )
+        )
+        logger.info(
+            "[POLICY] approval required step=%s tool=%s reason=%s",
+            step.step_id,
+            tool_name,
+            decision.reason,
         )
         return state
 

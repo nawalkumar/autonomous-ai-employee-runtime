@@ -52,7 +52,11 @@ def test_success_update_employee_and_write_file(
         ],
     )
 
-    final = runtime.run(state.task_id)
+    paused = runtime.run(state.task_id)
+    assert paused.final_status is TaskStatus.NEEDS_APPROVAL
+    assert company_repo.get_employee("E-17").title != "Senior Engineer"
+
+    final = runtime.approve_task(state.task_id)
 
     assert final.final_status is TaskStatus.COMPLETED
     assert all(s.status is PlanStepStatus.COMPLETED for s in final.plan)
@@ -72,6 +76,8 @@ def test_success_update_employee_and_write_file(
     types = [e.event_type for e in events]
     assert EventType.TASK_CREATED in types
     assert EventType.PLAN_STARTED in types
+    assert EventType.APPROVAL_REQUESTED in types
+    assert EventType.APPROVAL_APPROVED in types
     assert EventType.TOOL_CALLED in types
     assert EventType.TOOL_SUCCEEDED in types
     assert EventType.STEP_SUCCEEDED in types
@@ -233,13 +239,13 @@ def test_persist_and_resume_does_not_rerun_completed_step(
         ],
     )
 
-    after_first = runtime1.execute_next(state.task_id)
-    assert after_first.plan[0].status is PlanStepStatus.COMPLETED
-    assert after_first.plan[1].status is PlanStepStatus.PENDING
-    assert after_first.final_status is TaskStatus.RUNNING
-    assert len(after_first.tool_calls) == 1
+    paused = runtime1.execute_next(state.task_id)
+    assert paused.final_status is TaskStatus.NEEDS_APPROVAL
+    assert paused.plan[0].status is PlanStepStatus.PENDING
+    assert paused.approval_status.value == "pending"
+    assert len(paused.tool_calls) == 0
 
-    # Fresh runtime + store against the same DB.
+    # Fresh runtime + store against the same DB — pending approval survives restart.
     store2 = SQLiteStore(db_path)
     registry2 = ToolRegistry()
     registry2.register(
@@ -251,14 +257,18 @@ def test_persist_and_resume_does_not_rerun_completed_step(
     registry2.register(FileTool(workspace))
     runtime2 = ExecutionRuntime(store=store2, registry=registry2, workspace_path=workspace)
 
-    final = runtime2.run(state.task_id)
+    loaded = runtime2.load(state.task_id)
+    assert loaded.final_status is TaskStatus.NEEDS_APPROVAL
+    assert loaded.pending_action is not None
+
+    final = runtime2.approve_task(state.task_id)
     assert final.final_status is TaskStatus.COMPLETED
     assert [s.status for s in final.plan] == [
         PlanStepStatus.COMPLETED,
         PlanStepStatus.COMPLETED,
         PlanStepStatus.COMPLETED,
     ]
-    # Step 1 must not have been executed again.
+    # Sensitive step executes once after approval; later steps continue.
     assert len(final.tool_calls) == 3
     assert final.tool_calls[0].step_id == "r1"
     assert final.tool_calls[1].step_id == "r2"

@@ -74,3 +74,6 @@ class PendingAction(BaseModel):
     step_id: str | None = None
     idempotency_key: str | None = None
     reason: str | None = None
+    risk: str = "write"
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = None
