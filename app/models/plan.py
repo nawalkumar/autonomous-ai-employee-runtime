@@ -22,3 +22,9 @@ class PlanStep(BaseModel):
     def resolved_tool_name(self) -> str | None:
         """Prefer explicit tool_name; fall back to tool_hint for compatibility."""
         return self.tool_name or self.tool_hint
+
+
+class Plan(BaseModel):
+    """Ordered executable plan produced by the planner."""
+
+    steps: list[PlanStep] = Field(default_factory=list)

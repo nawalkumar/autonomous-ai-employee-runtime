@@ -12,7 +12,7 @@ from app.models.enums import (
 from app.models.events import AuditEvent
 from app.models.goal import InterpretedGoal, SuccessCriterion
 from app.models.ids import new_id
-from app.models.plan import PlanStep
+from app.models.plan import Plan, PlanStep
 from app.models.records import (
     EvidenceItem,
     FailureRecord,
@@ -34,6 +34,7 @@ __all__ = [
     "InterpretedGoal",
     "Observation",
     "PendingAction",
+    "Plan",
     "PlanStep",
     "PlanStepStatus",
     "SuccessCriterion",

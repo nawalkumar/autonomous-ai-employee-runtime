@@ -10,18 +10,18 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 | **Phase 1** | Done | Domain contracts + `ExecutionState` + SQLite persistence + audit events |
 | **Phase 2** | Done | Mock company world + tools + registry + deterministic failure injection |
 | **Phase 3** | Done | Deterministic execution runtime (predefined plans, no LLM) |
-| **Future** | Not started | LLM planning, recovery/retry, verification, HITL |
+| **Phase 4** | Done | Goal interpreter + planner (LLM understands/plans; runtime executes) |
+| **Future** | Not started | Recovery/retry, verification, HITL |
 
-### Phase 3 implemented
+### Phase 4 implemented
 
-- `ExecutionRuntime` executes predefined plans via `ToolRegistry` only
-- Task creation from caller-supplied goal + plan (no interpretation/planning)
-- Step lifecycle: `PENDING → RUNNING → COMPLETED|FAILED`
-- Persists `ToolCallRecord`, `Observation`, `FailureRecord`, audit events
-- Stops on first failure (**no retry / no recovery**)
-- Resume from SQLite: completed steps are not re-executed
-- Stable idempotency key: `{task_id}:{step_id}` (dedupe later)
-- Still offline: no LLM, LangGraph, or external APIs
+- `GoalInterpreter`: natural language → `InterpretedGoal` (structured JSON + Pydantic)
+- `Planner`: `InterpretedGoal` → validated `Plan` using `ToolRegistry` metadata
+- `PlanningPipeline.interpret_and_plan()` / `build_plan()`
+- Default `LLM_PROVIDER=mock` with deterministic demos (E-17 title update, Acme ticket)
+- Optional `LLM_PROVIDER=xai` via existing OpenAI-compatible client (opt-in, not required for tests)
+- Plan validation: tool existence, args schema, unique step IDs, non-empty plan
+- LLM never executes tools or mutates SQLite/files — only `ExecutionRuntime` does
 
 Default DB path: `workspace/runtime.db` (gitignored).
 
@@ -81,8 +81,9 @@ app/
   api/        # HTTP routes (health)
   models/     # domain contracts + ExecutionState
   runtime/    # deterministic ExecutionRuntime
+  planning/   # GoalInterpreter + Planner + validation
   tools/      # BaseTool, registry, company/file tools
-  llm/        # provider-agnostic LLM clients
+  llm/        # provider-agnostic LLM clients (mock/xai)
   store/      # runtime SQLite persistence
   policy/     # risk / HITL (future)
   verify/     # outcome verification (future)
