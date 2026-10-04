@@ -1,9 +1,11 @@
-"""Deterministic plan execution engine (no LLM, no retry, no recovery)."""
+"""Deterministic plan execution engine with bounded recovery."""
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from app.config import get_settings
 from app.models.enums import (
     Actor,
     FailureType,
@@ -21,6 +23,11 @@ from app.models.records import (
     utc_now,
 )
 from app.models.state import ExecutionState
+from app.runtime.recovery import (
+    RecoveryAction,
+    classify_failure,
+    evaluate_recovery,
+)
 from app.runtime.transitions import (
     EventType,
     idempotency_key_for,
@@ -28,16 +35,30 @@ from app.runtime.transitions import (
     observe_tool_result,
 )
 from app.store.sqlite_store import SQLiteStore
+from app.tools.base import BaseTool
 from app.tools.registry import ToolRegistry
 from app.tools.result import ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionRuntime:
     """Executes a predefined plan against tools via the registry."""
 
-    def __init__(self, store: SQLiteStore, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        store: SQLiteStore,
+        registry: ToolRegistry,
+        *,
+        max_recovery_attempts: int | None = None,
+    ) -> None:
         self.store = store
         self.registry = registry
+        self.max_recovery_attempts = (
+            max_recovery_attempts
+            if max_recovery_attempts is not None
+            else get_settings().max_recovery_attempts
+        )
 
     def create_task(
         self,
@@ -83,7 +104,7 @@ class ExecutionRuntime:
         return state
 
     def run(self, task_id: str) -> ExecutionState:
-        """Execute pending steps until the task completes or fails. No retries."""
+        """Execute pending steps until the task completes or fails."""
         state = self.load(task_id)
         if state.final_status in {
             TaskStatus.COMPLETED,
@@ -110,14 +131,13 @@ class ExecutionRuntime:
                 TaskStatus.ABORTED,
             }:
                 return advanced
-            # Safety: if nothing progressed, stop rather than loop forever.
             if advanced.current_step == state.current_step and all(
                 s.status is not PlanStepStatus.PENDING for s in advanced.plan
             ):
                 return advanced
 
     def execute_next(self, task_id: str) -> ExecutionState:
-        """Execute exactly one pending plan step, then persist and return."""
+        """Execute exactly one pending plan step (with bounded recovery), then return."""
         state = self.load(task_id)
         if state.final_status in {
             TaskStatus.COMPLETED,
@@ -153,7 +173,6 @@ class ExecutionRuntime:
             if step.status is PlanStepStatus.PENDING:
                 return index
             if step.status is PlanStepStatus.RUNNING:
-                # Incomplete step after interruption: allow one re-attempt.
                 return index
         return None
 
@@ -163,7 +182,6 @@ class ExecutionRuntime:
         if not tool_name:
             return self._fail_missing_tool(state, step_index, step, None)
 
-        # Mark step running
         state = self._update_step(
             state,
             step_index,
@@ -185,44 +203,306 @@ class ExecutionRuntime:
             )
         )
 
-        key = idempotency_key_for(state.task_id, step.step_id)
-        call = ToolCallRecord(
-            task_id=state.task_id,
-            step_id=step.step_id,
-            tool_name=tool_name,
-            arguments=dict(step.arguments),
-            status=ToolCallStatus.RUNNING,
-            idempotency_key=key,
-        )
-        state = state.model_copy(
-            update={"tool_calls": [*state.tool_calls, call]}
-        ).touch()
-        self._save(state)
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.TOOL_CALLED,
-                action="tool_called",
-                tool=tool_name,
-                arguments=dict(step.arguments),
-                result={"idempotency_key": key, "step_id": step.step_id},
-                actor=Actor.AGENT,
-            )
-        )
-
         try:
             tool = self.registry.get(tool_name)
         except KeyError:
-            result = ToolResult.failure(
-                FailureType.ENVIRONMENT_UNEXPECTED.value,
-                f"Unknown tool: {tool_name}",
-            )
-            return self._finish_failed_step(state, step_index, call, result)
+            tool = None
 
-        result = tool.invoke(step.arguments, idempotency_key=key)
-        if result.ok:
-            return self._finish_successful_step(state, step_index, call, result)
-        return self._finish_failed_step(state, step_index, call, result)
+        attempt = 0
+        while True:
+            attempt += 1
+            key = idempotency_key_for(state.task_id, step.step_id)
+            logger.info(
+                "[EXECUTE] step=%s tool=%s attempt=%s",
+                step.step_id,
+                tool_name,
+                attempt,
+            )
+
+            call = ToolCallRecord(
+                task_id=state.task_id,
+                step_id=step.step_id,
+                tool_name=tool_name,
+                arguments=dict(step.arguments),
+                status=ToolCallStatus.RUNNING,
+                idempotency_key=key,
+            )
+            state = state.model_copy(
+                update={"tool_calls": [*state.tool_calls, call]}
+            ).touch()
+            self._save(state)
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.TOOL_CALLED,
+                    action="tool_called",
+                    tool=tool_name,
+                    arguments=dict(step.arguments),
+                    result={
+                        "idempotency_key": key,
+                        "step_id": step.step_id,
+                        "attempt": attempt,
+                    },
+                    actor=Actor.AGENT,
+                )
+            )
+
+            if tool is None:
+                result = ToolResult.failure(
+                    FailureType.ENVIRONMENT_UNEXPECTED.value,
+                    f"Unknown tool: {tool_name}",
+                )
+            else:
+                result = tool.invoke(step.arguments, idempotency_key=key)
+
+            if result.ok:
+                if attempt > 1:
+                    self._emit(
+                        make_event(
+                            task_id=state.task_id,
+                            event_type=EventType.RECOVERY_RETRY_SUCCEEDED,
+                            action="recovery_retry_succeeded",
+                            tool=tool_name,
+                            result={
+                                "step_id": step.step_id,
+                                "attempt": attempt,
+                            },
+                        )
+                    )
+                    logger.info("[RECOVERY] recovered step=%s attempt=%s", step.step_id, attempt)
+                return self._finish_successful_step(state, step_index, call, result)
+
+            state, decision = self._handle_failed_attempt(
+                state=state,
+                step_index=step_index,
+                call=call,
+                result=result,
+                tool=tool,
+                attempt=attempt,
+            )
+            if decision.action is RecoveryAction.RETRY:
+                self._emit(
+                    make_event(
+                        task_id=state.task_id,
+                        event_type=EventType.RECOVERY_RETRY_STARTED,
+                        action="recovery_retry_started",
+                        tool=tool_name,
+                        result={
+                            "step_id": step.step_id,
+                            "attempt": attempt,
+                            "next_attempt": attempt + 1,
+                            "reason": decision.reason,
+                        },
+                    )
+                )
+                logger.info(
+                    "[RECOVERY] type=%s action=RETRY attempt=%s",
+                    decision.failure_type.value,
+                    attempt,
+                )
+                state = self.load(state.task_id)
+                step = state.plan[step_index]
+                continue
+
+            if decision.failure_type is FailureType.REPEATED or (
+                decision.reason.endswith("budget exhausted")
+            ):
+                self._emit(
+                    make_event(
+                        task_id=state.task_id,
+                        event_type=EventType.RECOVERY_EXHAUSTED,
+                        action="recovery_exhausted",
+                        tool=tool_name,
+                        failure={
+                            "step_id": step.step_id,
+                            "attempt": attempt,
+                            "reason": decision.reason,
+                        },
+                    )
+                )
+            return self._finalize_step_failure(
+                state=state,
+                step_index=step_index,
+                call=call,
+                result=result,
+                failure_type=decision.failure_type,
+                recovery_action=decision.action.value,
+            )
+
+    def _handle_failed_attempt(
+        self,
+        *,
+        state: ExecutionState,
+        step_index: int,
+        call: ToolCallRecord,
+        result: ToolResult,
+        tool: BaseTool | None,
+        attempt: int,
+    ) -> tuple[ExecutionState, Any]:
+        step = state.plan[step_index]
+        summary = observe_tool_result(call.tool_name, result)
+        completed_at = utc_now()
+        failure_type = classify_failure(result)
+        logger.info(
+            "[OBSERVE] failure step=%s type=%s message=%s",
+            step.step_id,
+            failure_type.value,
+            result.error_message,
+        )
+
+        updated_call = call.model_copy(
+            update={
+                "status": ToolCallStatus.FAILED,
+                "completed_at": completed_at,
+                "result": result.model_dump(),
+                "error_type": failure_type.value,
+                "error_message": result.error_message,
+            }
+        )
+        observation = Observation(
+            source=call.tool_name,
+            ok=False,
+            summary=summary,
+            data={**(result.data or {}), "attempt": attempt},
+            error_type=failure_type.value,
+            error_message=result.error_message,
+        )
+        # attempt 1 → 0 recovery retries used; attempt 2 → 1; etc.
+        retries_used = max(0, attempt - 1)
+
+        decision = evaluate_recovery(
+            failure_type=failure_type,
+            tool=tool,
+            tool_args=dict(step.arguments),
+            attempt=attempt,
+            retries_used=retries_used,
+            max_recovery_attempts=self.max_recovery_attempts,
+        )
+
+        failure = FailureRecord(
+            task_id=state.task_id,
+            step_id=step.step_id,
+            failure_type=failure_type,
+            message=result.error_message or summary,
+            retryable=decision.action is RecoveryAction.RETRY,
+            recovery_action=decision.action.value,
+        )
+
+        tool_calls = [
+            updated_call if c.call_id == call.call_id else c for c in state.tool_calls
+        ]
+        state = state.model_copy(
+            update={
+                "tool_calls": tool_calls,
+                "observations": [*state.observations, observation],
+                "failures": [*state.failures, failure],
+                "retry_count": state.retry_count
+                + (1 if decision.action is RecoveryAction.RETRY else 0),
+                "current_step": step_index,
+            }
+        ).touch()
+        # Keep step RUNNING while recovery may continue.
+        self._save(state)
+
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.TOOL_FAILED,
+                action="tool_failed",
+                tool=call.tool_name,
+                result={**result.model_dump(), "attempt": attempt},
+                failure={
+                    "failure_type": failure_type.value,
+                    "message": failure.message,
+                    "attempt": attempt,
+                },
+                actor=Actor.AGENT,
+            )
+        )
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.FAILURE_DETECTED,
+                action="failure_detected",
+                tool=call.tool_name,
+                failure={
+                    "failure_type": failure_type.value,
+                    "message": failure.message,
+                    "step_id": step.step_id,
+                    "attempt": attempt,
+                },
+            )
+        )
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.RECOVERY_EVALUATED,
+                action="recovery_evaluated",
+                tool=call.tool_name,
+                result={
+                    "step_id": step.step_id,
+                    "failure_type": decision.failure_type.value,
+                    "action": decision.action.value,
+                    "attempt": attempt,
+                    "allowed": decision.allowed,
+                    "reason": decision.reason,
+                    "max_recovery_attempts": self.max_recovery_attempts,
+                },
+            )
+        )
+        return state, decision
+
+    def _finalize_step_failure(
+        self,
+        *,
+        state: ExecutionState,
+        step_index: int,
+        call: ToolCallRecord,
+        result: ToolResult,
+        failure_type: FailureType,
+        recovery_action: str,
+    ) -> ExecutionState:
+        step = state.plan[step_index]
+        summary = observe_tool_result(call.tool_name, result)
+        plan = list(state.plan)
+        plan[step_index] = step.model_copy(update={"status": PlanStepStatus.FAILED})
+        state = state.model_copy(
+            update={
+                "plan": plan,
+                "current_step": step_index,
+                "final_status": TaskStatus.FAILED,
+                "completion_summary": summary,
+            }
+        ).touch()
+        self._save(state)
+
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.STEP_FAILED,
+                action="step_failed",
+                tool=call.tool_name,
+                observation={"summary": summary, "step_id": step.step_id},
+                failure={
+                    "failure_type": failure_type.value,
+                    "message": result.error_message or summary,
+                    "recovery_action": recovery_action,
+                },
+            )
+        )
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.TASK_FAILED,
+                action="task_failed",
+                failure={
+                    "failure_type": failure_type.value,
+                    "message": result.error_message or summary,
+                    "step_id": step.step_id,
+                },
+            )
+        )
+        return state
 
     def _finish_successful_step(
         self,
@@ -256,7 +536,11 @@ class ExecutionRuntime:
                 EvidenceItem(
                     type=str(item.get("type", "tool_evidence")),
                     description=summary,
-                    data=item.get("data", item) if isinstance(item.get("data", item), dict) else {"value": item},
+                    data=(
+                        item.get("data", item)
+                        if isinstance(item.get("data", item), dict)
+                        else {"value": item}
+                    ),
                 )
             )
 
@@ -306,109 +590,6 @@ class ExecutionRuntime:
             return self._complete_task(state)
         return state
 
-    def _finish_failed_step(
-        self,
-        state: ExecutionState,
-        step_index: int,
-        call: ToolCallRecord,
-        result: ToolResult,
-    ) -> ExecutionState:
-        step = state.plan[step_index]
-        summary = observe_tool_result(call.tool_name, result)
-        completed_at = utc_now()
-        error_type = result.error_type or FailureType.ENVIRONMENT_UNEXPECTED.value
-
-        updated_call = call.model_copy(
-            update={
-                "status": ToolCallStatus.FAILED,
-                "completed_at": completed_at,
-                "result": result.model_dump(),
-                "error_type": error_type,
-                "error_message": result.error_message,
-            }
-        )
-        observation = Observation(
-            source=call.tool_name,
-            ok=False,
-            summary=summary,
-            data=result.data or {},
-            error_type=error_type,
-            error_message=result.error_message,
-        )
-        try:
-            failure_type = FailureType(error_type)
-        except ValueError:
-            failure_type = FailureType.ENVIRONMENT_UNEXPECTED
-
-        failure = FailureRecord(
-            task_id=state.task_id,
-            step_id=step.step_id,
-            failure_type=failure_type,
-            message=result.error_message or summary,
-            retryable=failure_type is FailureType.TRANSIENT,
-            recovery_action=None,
-        )
-
-        tool_calls = [
-            updated_call if c.call_id == call.call_id else c for c in state.tool_calls
-        ]
-        plan = list(state.plan)
-        plan[step_index] = step.model_copy(update={"status": PlanStepStatus.FAILED})
-
-        state = state.model_copy(
-            update={
-                "plan": plan,
-                "tool_calls": tool_calls,
-                "observations": [*state.observations, observation],
-                "failures": [*state.failures, failure],
-                "current_step": step_index,
-                "final_status": TaskStatus.FAILED,
-                "completion_summary": summary,
-            }
-        ).touch()
-        self._save(state)
-
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.TOOL_FAILED,
-                action="tool_failed",
-                tool=call.tool_name,
-                result=result.model_dump(),
-                failure={
-                    "failure_type": failure_type.value,
-                    "message": failure.message,
-                },
-                actor=Actor.AGENT,
-            )
-        )
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.STEP_FAILED,
-                action="step_failed",
-                tool=call.tool_name,
-                observation={"summary": summary, "step_id": step.step_id},
-                failure={
-                    "failure_type": failure_type.value,
-                    "message": failure.message,
-                },
-            )
-        )
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.TASK_FAILED,
-                action="task_failed",
-                failure={
-                    "failure_type": failure_type.value,
-                    "message": failure.message,
-                    "step_id": step.step_id,
-                },
-            )
-        )
-        return state
-
     def _fail_missing_tool(
         self,
         state: ExecutionState,
@@ -437,7 +618,22 @@ class ExecutionRuntime:
                 "current_step": step_index,
             }
         ).touch()
-        return self._finish_failed_step(state, step_index, call, result)
+        state, decision = self._handle_failed_attempt(
+            state=state,
+            step_index=step_index,
+            call=call,
+            result=result,
+            tool=None,
+            attempt=1,
+        )
+        return self._finalize_step_failure(
+            state=state,
+            step_index=step_index,
+            call=call,
+            result=result,
+            failure_type=decision.failure_type,
+            recovery_action=decision.action.value,
+        )
 
     def _complete_task(self, state: ExecutionState) -> ExecutionState:
         summary = (

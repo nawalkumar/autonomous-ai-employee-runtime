@@ -20,6 +20,11 @@ class EventType:
     STEP_FAILED = "STEP_FAILED"
     TASK_COMPLETED = "TASK_COMPLETED"
     TASK_FAILED = "TASK_FAILED"
+    FAILURE_DETECTED = "failure.detected"
+    RECOVERY_EVALUATED = "recovery.evaluated"
+    RECOVERY_RETRY_STARTED = "recovery.retry_started"
+    RECOVERY_RETRY_SUCCEEDED = "recovery.retry_succeeded"
+    RECOVERY_EXHAUSTED = "recovery.exhausted"
 
 
 def make_event(

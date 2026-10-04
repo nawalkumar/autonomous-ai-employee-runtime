@@ -183,7 +183,7 @@ def test_end_to_end_employee_update(
     assert "Senior Engineer" in note.read_text(encoding="utf-8")
 
 
-def test_ticket_plan_fails_without_retry_on_injected_503(
+def test_ticket_plan_recovers_from_injected_503(
     store: SQLiteStore,
     registry: ToolRegistry,
     company_repo: CompanyRepository,
@@ -200,14 +200,12 @@ def test_ticket_plan_fails_without_retry_on_injected_503(
     task = runtime.create_task(user_goal=GOAL_B, plan=plan.steps)
     final = runtime.run(task.task_id)
 
-    assert final.final_status is TaskStatus.FAILED
-    assert final.plan[0].status is PlanStepStatus.COMPLETED  # find succeeded
-    assert final.plan[1].status is PlanStepStatus.FAILED
-    assert company_repo.list_tickets() == []
-    # No retry
-    again = runtime.run(task.task_id)
-    assert len(again.tool_calls) == 2
-    assert company_repo.list_tickets() == []
+    assert final.final_status is TaskStatus.COMPLETED
+    assert final.plan[0].status is PlanStepStatus.COMPLETED
+    assert final.plan[1].status is PlanStepStatus.COMPLETED
+    assert len(company_repo.list_tickets()) == 1
+    # find + failed create + successful create
+    assert len(final.tool_calls) == 3
 
 
 def test_planner_unknown_goal_errors(registry: ToolRegistry) -> None:

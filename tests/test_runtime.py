@@ -78,29 +78,22 @@ def test_success_update_employee_and_write_file(
     assert EventType.TASK_COMPLETED in types
 
 
-def test_failure_no_retry(
+def test_validation_failure_is_not_retried(
     store: SQLiteStore,
     registry: ToolRegistry,
     company_repo: CompanyRepository,
-    failure_injector: FailureInjector,
 ) -> None:
-    failure_injector.inject_once(
-        operation="company_api.create_ticket",
-        error_type=FailureType.TRANSIENT.value,
-        error_message="Mock company API temporarily unavailable",
-    )
     runtime = ExecutionRuntime(store=store, registry=registry)
     state = runtime.create_task(
-        user_goal="Create a ticket for Acme",
+        user_goal="Create a ticket with invalid args",
         plan=[
             PlanStep(
                 step_id="step_ticket",
-                description="Create ticket",
+                description="Create ticket with missing subject",
                 tool_name="company_api",
                 arguments={
                     "operation": "create_ticket",
                     "customer_id": "C-1001",
-                    "subject": "Billing discrepancy",
                     "description": "$240 mismatch",
                     "priority": "high",
                 },
@@ -125,22 +118,13 @@ def test_failure_no_retry(
     assert final.plan[1].status is PlanStepStatus.PENDING
     assert len(final.tool_calls) == 1
     assert final.tool_calls[0].status is ToolCallStatus.FAILED
-    assert len(final.failures) == 1
-    assert final.failures[0].failure_type is FailureType.TRANSIENT
-    assert final.observations[0].ok is False
-    assert "unavailable" in final.observations[0].summary.lower()
+    assert final.failures[0].failure_type is FailureType.INVALID_ARGS
     assert company_repo.list_tickets() == []
 
-    # Explicit no-retry: running again must not invoke the tool again.
     again = runtime.run(state.task_id)
     assert again.final_status is TaskStatus.FAILED
     assert len(again.tool_calls) == 1
     assert company_repo.list_tickets() == []
-
-    event_types = [e.event_type for e in store.get_events(state.task_id)]
-    assert EventType.TOOL_FAILED in event_types
-    assert EventType.TASK_FAILED in event_types
-    assert EventType.TASK_COMPLETED not in event_types
 
 
 def test_multi_step_ticket_flow(

@@ -23,6 +23,8 @@ class BaseTool(ABC):
     description: str
     risk_level: RiskLevel
     args_schema: type[BaseModel]
+    # Default: do not automatically retry writes unless a subclass opts in.
+    retry_safe: bool = False
 
     def invoke(
         self,
@@ -53,10 +55,16 @@ class BaseTool(ABC):
     ) -> ToolResult:
         """Perform the tool side effect and return a normalized result."""
 
+    def is_retry_safe(self, args: BaseModel | dict[str, Any] | None = None) -> bool:
+        """Whether a failed invocation may be retried under a recovery policy."""
+        _ = args
+        return self.retry_safe
+
     def metadata(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "risk_level": self.risk_level.value,
+            "retry_safe": self.retry_safe,
             "args_schema": self.args_schema.model_json_schema(),
         }

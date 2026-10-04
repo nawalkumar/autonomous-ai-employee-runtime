@@ -64,6 +64,17 @@ class CompanyAPIArgs(BaseModel):
         return self
 
 
+_RETRY_SAFE_OPS = frozenset(
+    {
+        "get_employee",
+        "find_customer",
+        "get_ticket",
+        # create_ticket is retry-safe for pre-mutation injected transient failures.
+        "create_ticket",
+    }
+)
+
+
 class CompanyAPITool(BaseTool):
     name = "company_api"
     description = (
@@ -71,6 +82,7 @@ class CompanyAPITool(BaseTool):
     )
     args_schema = CompanyAPIArgs
     risk_level = RiskLevel.WRITE
+    retry_safe = True
 
     def __init__(
         self,
@@ -83,6 +95,15 @@ class CompanyAPITool(BaseTool):
     def risk_for(self, operation: CompanyOperation) -> RiskLevel:
         return RiskLevel.WRITE if operation in _WRITE_OPS else RiskLevel.READ
 
+    def is_retry_safe(self, args: BaseModel | dict[str, Any] | None = None) -> bool:
+        if args is None:
+            return False
+        if isinstance(args, dict):
+            operation = args.get("operation")
+        else:
+            operation = getattr(args, "operation", None)
+        return operation in _RETRY_SAFE_OPS
+
     def metadata(self) -> dict[str, Any]:
         meta = super().metadata()
         meta["operations"] = {
@@ -92,6 +113,7 @@ class CompanyAPITool(BaseTool):
             "create_ticket": RiskLevel.WRITE.value,
             "get_ticket": RiskLevel.READ.value,
         }
+        meta["retry_safe_operations"] = sorted(_RETRY_SAFE_OPS)
         return meta
 
     def execute(

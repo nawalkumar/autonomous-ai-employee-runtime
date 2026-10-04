@@ -33,6 +33,8 @@ class FileTool(BaseTool):
     description = "Read and write files inside the sandboxed workspace directory."
     args_schema = FileToolArgs
     risk_level = RiskLevel.WRITE
+    # Workspace writes overwrite deterministically; reads are naturally retry-safe.
+    retry_safe = True
 
     def __init__(self, workspace_root: str | Path) -> None:
         self.workspace_root = Path(workspace_root).resolve()
@@ -40,6 +42,10 @@ class FileTool(BaseTool):
 
     def risk_for(self, operation: FileOperation) -> RiskLevel:
         return RiskLevel.WRITE if operation == "write" else RiskLevel.READ
+
+    def is_retry_safe(self, args: BaseModel | dict[str, Any] | None = None) -> bool:
+        _ = args
+        return True
 
     def metadata(self) -> dict[str, Any]:
         meta = super().metadata()

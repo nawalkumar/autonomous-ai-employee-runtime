@@ -11,17 +11,50 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 | **Phase 2** | Done | Mock company world + tools + registry + deterministic failure injection |
 | **Phase 3** | Done | Deterministic execution runtime (predefined plans, no LLM) |
 | **Phase 4** | Done | Goal interpreter + planner (LLM understands/plans; runtime executes) |
-| **Future** | Not started | Recovery/retry, verification, HITL |
+| **Phase 5** | Done | Observe → classify failure → bounded recovery/retry → continue plan |
+| **Future** | Not started | Verification, HITL |
 
-### Phase 4 implemented
+### Phase 5 implemented
 
-- `GoalInterpreter`: natural language → `InterpretedGoal` (structured JSON + Pydantic)
-- `Planner`: `InterpretedGoal` → validated `Plan` using `ToolRegistry` metadata
-- `PlanningPipeline.interpret_and_plan()` / `build_plan()`
-- Default `LLM_PROVIDER=mock` with deterministic demos (E-17 title update, Acme ticket)
-- Optional `LLM_PROVIDER=xai` via existing OpenAI-compatible client (opt-in, not required for tests)
-- Plan validation: tool existence, args schema, unique step IDs, non-empty plan
-- LLM never executes tools or mutates SQLite/files — only `ExecutionRuntime` does
+- Deterministic failure classification (`TRANSIENT`, validation, missing info, policy, …)
+- Explicit recovery decisions: `RETRY` / `FAIL` (`REPLAN` reserved)
+- Bounded retries via `MAX_RECOVERY_ATTEMPTS` (default 2)
+- Retry only when failure is transient **and** operation is `retry_safe`
+- Failed attempts preserved in history; recovery audit events persisted
+- After successful recovery, later plan steps continue to `COMPLETED`
+
+## Failure Recovery
+
+The runtime can:
+
+- observe tool failures
+- classify failures
+- distinguish transient vs non-retryable failures
+- apply bounded recovery policies
+- retry safe transient failures
+- preserve execution history
+- continue the plan after successful recovery
+- persist recovery events
+
+```text
+Execute
+  ↓
+Observe
+  ↓
+Failure?
+ ├── No → Continue
+ └── Yes
+       ↓
+   Classify
+       ↓
+   Recovery Policy
+       ↓
+   Retry allowed?
+    ├── Yes → Retry → Continue
+    └── No  → Fail safely
+```
+
+This phase does **not** implement HITL or independent verification.
 
 Default DB path: `workspace/runtime.db` (gitignored).
 
@@ -45,6 +78,7 @@ See `.env.example`. Important keys:
 | `APP_HOST` / `APP_PORT` | Local server bind |
 | `DATABASE_PATH` | SQLite file path (default `workspace/runtime.db`) |
 | `WORKSPACE_PATH` | FileTool sandbox root (default `workspace`) |
+| `MAX_RECOVERY_ATTEMPTS` | Max recovery retries after first failure (default `2`) |
 
 Never commit `.env` or real secrets.
 

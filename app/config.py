@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # Sandboxed filesystem root for FileTool
     workspace_path: str = "workspace"
 
+    # Bounded recovery retries after the first failed attempt of a step
+    max_recovery_attempts: int = 2
+
 
 @lru_cache
 def get_settings() -> Settings:
