@@ -22,8 +22,11 @@ class Settings(BaseSettings):
     app_port: int = 8000
     log_level: str = "info"
 
-    # SQLite path for ExecutionState + audit events (Phase 1+)
+    # SQLite path for ExecutionState + audit events + company world tables
     database_path: str = "workspace/runtime.db"
+
+    # Sandboxed filesystem root for FileTool
+    workspace_path: str = "workspace"
 
 
 @lru_cache

@@ -8,17 +8,20 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 |-------|--------|-------|
 | **Phase 0** | Done | Project foundation (FastAPI, uv, LLM abstraction, Docker, `/health`) |
 | **Phase 1** | Done | Domain contracts + `ExecutionState` + SQLite persistence + audit events |
-| **Future** | Not started | Runtime/orchestrator, tools, recovery, verification, HITL, live LLM integration |
+| **Phase 2** | Done | Mock company world + tools + registry + deterministic failure injection |
+| **Future** | Not started | Runtime/orchestrator, recovery, verification, HITL, live LLM integration |
 
-### Phase 1 implemented
+### Phase 2 implemented
 
-- Pydantic v2 domain models (`Task`, `InterpretedGoal`, `PlanStep`, records, enums)
-- Central `ExecutionState` contract (JSON-serializable, orchestrator-agnostic)
-- `SQLiteStore`: `save_state` / `get_state` / `append_event` / `get_events`
-- Append-only audit `events` table + `tasks` snapshot table
-- Unit tests for models and persistence round-trips
+- Deterministic mock company world (`employees`, `customers`, `tickets`) in SQLite
+- `CompanyRepository` separate from runtime `SQLiteStore` (shared DB file)
+- Tool abstraction (`BaseTool`, `ToolResult`, `RiskLevel`, `ToolRegistry`)
+- `CompanyAPITool` — real CRUD against the mock company DB
+- `FileTool` — sandboxed read/write under `workspace/` with traversal rejection
+- One-shot `FailureInjector` for demo/test transient failures
+- Offline-capable: no LLM keys or external APIs required
 
-Default DB path: `workspace/runtime.db` (gitignored via `*.db`).
+Default DB path: `workspace/runtime.db` (gitignored).
 
 ## Setup (uv)
 
@@ -39,6 +42,7 @@ See `.env.example`. Important keys:
 | `XAI_MODEL` | Model id, e.g. `grok-2-latest` |
 | `APP_HOST` / `APP_PORT` | Local server bind |
 | `DATABASE_PATH` | SQLite file path (default `workspace/runtime.db`) |
+| `WORKSPACE_PATH` | FileTool sandbox root (default `workspace`) |
 
 Never commit `.env` or real secrets.
 
@@ -75,12 +79,12 @@ app/
   api/        # HTTP routes (health)
   models/     # domain contracts + ExecutionState
   runtime/    # agent orchestrator (future)
-  tools/      # tool abstractions (future)
+  tools/      # BaseTool, registry, company/file tools
   llm/        # provider-agnostic LLM clients
-  store/      # SQLite persistence
+  store/      # runtime SQLite persistence
   policy/     # risk / HITL (future)
   verify/     # outcome verification (future)
-  world/      # mock company environment (future)
+  world/      # mock company repository + seed data
 tests/
-workspace/    # sandbox + runtime.db (local)
+workspace/    # FileTool sandbox + runtime.db (local)
 ```
