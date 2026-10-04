@@ -22,7 +22,7 @@ def test_success_update_employee_and_write_file(
     company_repo: CompanyRepository,
     workspace: Path,
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     state = runtime.create_task(
         user_goal="Update employee E-17 title to Senior Engineer and write a note",
         interpreted_goal=InterpretedGoal(
@@ -82,8 +82,9 @@ def test_validation_failure_is_not_retried(
     store: SQLiteStore,
     registry: ToolRegistry,
     company_repo: CompanyRepository,
+    workspace: Path,
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     state = runtime.create_task(
         user_goal="Create a ticket with invalid args",
         plan=[
@@ -133,7 +134,7 @@ def test_multi_step_ticket_flow(
     company_repo: CompanyRepository,
     workspace: Path,
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     state = runtime.create_task(
         user_goal="Find Acme, create ticket, write confirmation",
         plan=[
@@ -195,7 +196,7 @@ def test_persist_and_resume_does_not_rerun_completed_step(
     )
     registry1.register(FileTool(workspace))
 
-    runtime1 = ExecutionRuntime(store=store1, registry=registry1)
+    runtime1 = ExecutionRuntime(store=store1, registry=registry1, workspace_path=workspace)
     state = runtime1.create_task(
         user_goal="Resume demo",
         plan=[
@@ -248,7 +249,7 @@ def test_persist_and_resume_does_not_rerun_completed_step(
         )
     )
     registry2.register(FileTool(workspace))
-    runtime2 = ExecutionRuntime(store=store2, registry=registry2)
+    runtime2 = ExecutionRuntime(store=store2, registry=registry2, workspace_path=workspace)
 
     final = runtime2.run(state.task_id)
     assert final.final_status is TaskStatus.COMPLETED
@@ -267,9 +268,9 @@ def test_persist_and_resume_does_not_rerun_completed_step(
 
 
 def test_idempotency_key_stable(
-    store: SQLiteStore, registry: ToolRegistry
+    store: SQLiteStore, registry: ToolRegistry, workspace: Path
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     state = runtime.create_task(
         user_goal="key check",
         plan=[
@@ -288,9 +289,9 @@ def test_idempotency_key_stable(
 
 
 def test_runtime_uses_registry_not_direct_tools(
-    store: SQLiteStore, registry: ToolRegistry
+    store: SQLiteStore, registry: ToolRegistry, workspace: Path
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     assert "company_api" in registry
     assert runtime.registry.get("company_api").name == "company_api"
     state = runtime.create_task(

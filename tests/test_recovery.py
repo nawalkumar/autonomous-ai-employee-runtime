@@ -30,13 +30,14 @@ def test_transient_failure_recovers(
     registry: ToolRegistry,
     company_repo: CompanyRepository,
     failure_injector: FailureInjector,
+    workspace: Path,
 ) -> None:
     failure_injector.inject_once(
         "company_api.create_ticket",
         FailureType.TRANSIENT.value,
         "503 Service Unavailable",
     )
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(user_goal="Create ticket", plan=[_ticket_step()])
     final = runtime.run(task.task_id)
 
@@ -55,13 +56,14 @@ def test_recovery_events_persisted(
     store: SQLiteStore,
     registry: ToolRegistry,
     failure_injector: FailureInjector,
+    workspace: Path,
 ) -> None:
     failure_injector.inject_once(
         "company_api.create_ticket",
         FailureType.TRANSIENT.value,
         "503 Service Unavailable",
     )
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(user_goal="Create ticket", plan=[_ticket_step()])
     runtime.run(task.task_id)
 
@@ -77,8 +79,9 @@ def test_non_transient_failure_not_retried(
     store: SQLiteStore,
     registry: ToolRegistry,
     company_repo: CompanyRepository,
+    workspace: Path,
 ) -> None:
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(
         user_goal="Invalid ticket",
         plan=[
@@ -108,6 +111,7 @@ def test_retry_budget_is_bounded(
     registry: ToolRegistry,
     company_repo: CompanyRepository,
     failure_injector: FailureInjector,
+    workspace: Path,
 ) -> None:
     failure_injector.inject_always(
         "company_api.create_ticket",
@@ -118,6 +122,7 @@ def test_retry_budget_is_bounded(
         store=store,
         registry=registry,
         max_recovery_attempts=2,
+        workspace_path=workspace,
     )
     task = runtime.create_task(user_goal="Create ticket", plan=[_ticket_step()])
     final = runtime.run(task.task_id)
@@ -143,7 +148,7 @@ def test_recovered_step_allows_later_steps(
         FailureType.TRANSIENT.value,
         "503 Service Unavailable",
     )
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(
         user_goal="Find, ticket, confirm",
         plan=[
@@ -193,7 +198,7 @@ def test_recovery_history_persists_across_runtime_instances(
         "503 Service Unavailable",
     )
 
-    runtime1 = ExecutionRuntime(store=store1, registry=registry1)
+    runtime1 = ExecutionRuntime(store=store1, registry=registry1, workspace_path=workspace)
     task = runtime1.create_task(user_goal="ticket", plan=[_ticket_step()])
     final1 = runtime1.run(task.task_id)
     assert final1.final_status is TaskStatus.COMPLETED

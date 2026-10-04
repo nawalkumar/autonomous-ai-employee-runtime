@@ -12,6 +12,7 @@ from app.models.enums import (
     PlanStepStatus,
     TaskStatus,
     ToolCallStatus,
+    VerificationStatus,
 )
 from app.models.goal import InterpretedGoal
 from app.models.plan import PlanStep
@@ -34,10 +35,14 @@ from app.runtime.transitions import (
     make_event,
     observe_tool_result,
 )
+from pathlib import Path
+
 from app.store.sqlite_store import SQLiteStore
 from app.tools.base import BaseTool
 from app.tools.registry import ToolRegistry
 from app.tools.result import ToolResult
+from app.verify.verifier import OutcomeVerifier
+from app.world.repository import CompanyRepository
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,8 @@ class ExecutionRuntime:
         registry: ToolRegistry,
         *,
         max_recovery_attempts: int | None = None,
+        verifier: OutcomeVerifier | None = None,
+        workspace_path: str | Path | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -59,6 +66,14 @@ class ExecutionRuntime:
             if max_recovery_attempts is not None
             else get_settings().max_recovery_attempts
         )
+        if verifier is not None:
+            self.verifier = verifier
+        else:
+            ws = workspace_path or get_settings().workspace_path
+            self.verifier = OutcomeVerifier(
+                CompanyRepository(store.db_path),
+                ws,
+            )
 
     def create_task(
         self,
@@ -66,18 +81,21 @@ class ExecutionRuntime:
         user_goal: str,
         plan: list[PlanStep],
         interpreted_goal: InterpretedGoal | None = None,
+        success_criteria: list | None = None,
         task_id: str | None = None,
     ) -> ExecutionState:
         """Create and persist a queued ExecutionState with a predefined plan."""
         if not plan:
             raise ValueError("plan must contain at least one step")
 
+        criteria = list(success_criteria or [])
+        if not criteria and interpreted_goal is not None:
+            criteria = list(interpreted_goal.success_criteria)
+
         kwargs: dict[str, Any] = {
             "user_goal": user_goal,
             "interpreted_goal": interpreted_goal,
-            "success_criteria": (
-                list(interpreted_goal.success_criteria) if interpreted_goal else []
-            ),
+            "success_criteria": criteria,
             "plan": plan,
             "final_status": TaskStatus.QUEUED,
             "current_step": 0,
@@ -636,24 +654,136 @@ class ExecutionRuntime:
         )
 
     def _complete_task(self, state: ExecutionState) -> ExecutionState:
-        summary = (
-            f"Completed {len(state.completed_steps)} plan step(s) successfully."
+        """Run independent verification before declaring COMPLETED."""
+        return self._verify_and_finalize(state)
+
+    def verify_task(self, task_id: str) -> ExecutionState:
+        """Public entrypoint to verify a fully executed task against world state."""
+        state = self.load(task_id)
+        return self._verify_and_finalize(state)
+
+    def _verify_and_finalize(self, state: ExecutionState) -> ExecutionState:
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.VERIFICATION_STARTED,
+                action="verification_started",
+                result={"completed_steps": state.completed_steps},
+            )
+        )
+        self._save(state.touch())
+
+        result = self.verifier.verify(state)
+        for check in result.checks:
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.VERIFICATION_CHECK,
+                    action="verification_check",
+                    result=check.model_dump(mode="json"),
+                )
+            )
+
+        evidence = list(state.evidence) + list(result.evidence)
+        state = state.model_copy(
+            update={
+                "verification_status": result.status,
+                "verification_summary": result.summary,
+                "verification_checks": [
+                    c.model_dump(mode="json") for c in result.checks
+                ],
+                "evidence": evidence,
+            }
+        ).touch()
+        self._save(state)
+
+        for item in result.evidence:
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.EVIDENCE_RECORDED,
+                    action="evidence_recorded",
+                    result={
+                        "evidence_id": item.evidence_id,
+                        "type": item.type,
+                        "description": item.description,
+                        "data": item.data,
+                    },
+                )
+            )
+
+        if result.passed:
+            summary = (
+                f"Completed {len(state.completed_steps)} plan step(s); "
+                f"verification passed. {result.summary}"
+            )
+            state = state.model_copy(
+                update={
+                    "final_status": TaskStatus.COMPLETED,
+                    "completion_summary": summary,
+                    "verification_status": VerificationStatus.PASSED,
+                }
+            ).touch()
+            self._save(state)
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.VERIFICATION_PASSED,
+                    action="verification_passed",
+                    verification_result=result.model_dump(mode="json"),
+                    result={"summary": result.summary},
+                )
+            )
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.TASK_COMPLETED,
+                    action="task_completed",
+                    result={
+                        "completed_steps": state.completed_steps,
+                        "summary": summary,
+                        "verification": "passed",
+                    },
+                )
+            )
+            return state
+
+        failure = FailureRecord(
+            task_id=state.task_id,
+            failure_type=FailureType.VERIFICATION_FAILED,
+            message=result.failure_reason or result.summary,
+            retryable=False,
+            recovery_action="fail",
         )
         state = state.model_copy(
             update={
-                "final_status": TaskStatus.COMPLETED,
-                "completion_summary": summary,
+                "final_status": TaskStatus.FAILED,
+                "completion_summary": result.summary,
+                "verification_status": VerificationStatus.FAILED,
+                "failures": [*state.failures, failure],
             }
         ).touch()
         self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
-                event_type=EventType.TASK_COMPLETED,
-                action="task_completed",
-                result={
-                    "completed_steps": state.completed_steps,
-                    "summary": summary,
+                event_type=EventType.VERIFICATION_FAILED,
+                action="verification_failed",
+                failure={
+                    "failure_type": FailureType.VERIFICATION_FAILED.value,
+                    "message": result.failure_reason or result.summary,
+                },
+                verification_result=result.model_dump(mode="json"),
+            )
+        )
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.TASK_FAILED,
+                action="task_failed",
+                failure={
+                    "failure_type": FailureType.VERIFICATION_FAILED.value,
+                    "message": result.failure_reason or result.summary,
                 },
             )
         )

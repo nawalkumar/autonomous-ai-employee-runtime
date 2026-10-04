@@ -165,7 +165,7 @@ def test_end_to_end_employee_update(
     planning = PlanningPipeline(MockLLMClient(), registry)
     result = planning.interpret_and_plan(GOAL_A)
 
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(
         user_goal=GOAL_A,
         interpreted_goal=result.interpreted_goal,
@@ -188,6 +188,7 @@ def test_ticket_plan_recovers_from_injected_503(
     registry: ToolRegistry,
     company_repo: CompanyRepository,
     failure_injector: FailureInjector,
+    workspace: Path,
 ) -> None:
     plan = PlanningPipeline(MockLLMClient(), registry).build_plan(GOAL_B)
     failure_injector.inject_once(
@@ -196,7 +197,7 @@ def test_ticket_plan_recovers_from_injected_503(
         error_message="Mock company API temporarily unavailable",
     )
 
-    runtime = ExecutionRuntime(store=store, registry=registry)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
     task = runtime.create_task(user_goal=GOAL_B, plan=plan.steps)
     final = runtime.run(task.task_id)
 

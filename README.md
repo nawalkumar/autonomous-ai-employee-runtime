@@ -12,16 +12,44 @@ Prototype runtime for CentrAlign AI's Founding Engineer challenge: an autonomous
 | **Phase 3** | Done | Deterministic execution runtime (predefined plans, no LLM) |
 | **Phase 4** | Done | Goal interpreter + planner (LLM understands/plans; runtime executes) |
 | **Phase 5** | Done | Observe → classify failure → bounded recovery/retry → continue plan |
-| **Future** | Not started | Verification, HITL |
+| **Phase 6** | Done | Independent verification + evidence before COMPLETED |
+| **Future** | Not started | HITL |
 
-### Phase 5 implemented
+### Phase 6 implemented
 
-- Deterministic failure classification (`TRANSIENT`, validation, missing info, policy, …)
-- Explicit recovery decisions: `RETRY` / `FAIL` (`REPLAN` reserved)
-- Bounded retries via `MAX_RECOVERY_ATTEMPTS` (default 2)
-- Retry only when failure is transient **and** operation is `retry_safe`
-- Failed attempts preserved in history; recovery audit events persisted
-- After successful recovery, later plan steps continue to `COMPLETED`
+- `OutcomeVerifier` inspects CompanyRepository + workspace filesystem
+- Does **not** trust `ToolResult.ok` alone
+- Success criteria / derived outcomes checked against actual world state
+- Evidence recorded from observed facts only
+- Task reaches `COMPLETED` only when verification passes
+
+## Independent Verification
+
+The executor performs the requested actions, but completion is not
+declared based solely on tool success. A deterministic verifier
+independently inspects the resulting company/workspace state and
+produces evidence before the task can reach COMPLETED.
+
+```text
+Execute
+   ↓
+Actual World State
+   ↓
+Independent Verifier
+   ↓
+Checks
+   ↓
+Evidence
+   ↓
+Verified?
+ ├── YES → COMPLETED
+ └── NO  → Verification Failed
+```
+
+### Why this exists
+
+- **Action success:** a tool returned `ok=true`
+- **Outcome success:** the intended company/workspace state actually exists
 
 ## Failure Recovery
 
@@ -114,13 +142,13 @@ uv run pytest
 app/
   api/        # HTTP routes (health)
   models/     # domain contracts + ExecutionState
-  runtime/    # deterministic ExecutionRuntime
+  runtime/    # deterministic ExecutionRuntime + recovery
   planning/   # GoalInterpreter + Planner + validation
   tools/      # BaseTool, registry, company/file tools
   llm/        # provider-agnostic LLM clients (mock/xai)
   store/      # runtime SQLite persistence
   policy/     # risk / HITL (future)
-  verify/     # outcome verification (future)
+  verify/     # independent OutcomeVerifier + evidence
   world/      # mock company repository + seed data
 tests/
 workspace/    # FileTool sandbox + runtime.db (local)

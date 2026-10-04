@@ -48,6 +48,8 @@ class ExecutionState(BaseModel):
     pending_action: PendingAction | None = None
 
     verification_status: VerificationStatus = VerificationStatus.PENDING
+    verification_summary: str | None = None
+    verification_checks: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
 
     final_status: TaskStatus = TaskStatus.QUEUED

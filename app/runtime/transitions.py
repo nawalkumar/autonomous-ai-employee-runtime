@@ -25,6 +25,11 @@ class EventType:
     RECOVERY_RETRY_STARTED = "recovery.retry_started"
     RECOVERY_RETRY_SUCCEEDED = "recovery.retry_succeeded"
     RECOVERY_EXHAUSTED = "recovery.exhausted"
+    VERIFICATION_STARTED = "verification.started"
+    VERIFICATION_CHECK = "verification.check"
+    VERIFICATION_PASSED = "verification.passed"
+    VERIFICATION_FAILED = "verification.failed"
+    EVIDENCE_RECORDED = "evidence.recorded"
 
 
 def make_event(
@@ -37,6 +42,7 @@ def make_event(
     result: dict[str, Any] | None = None,
     observation: dict[str, Any] | None = None,
     failure: dict[str, Any] | None = None,
+    verification_result: dict[str, Any] | None = None,
     actor: Actor = Actor.SYSTEM,
 ) -> AuditEvent:
     return AuditEvent(
@@ -48,6 +54,7 @@ def make_event(
         result=result,
         observation=observation,
         failure=failure,
+        verification_result=verification_result,
         actor=actor,
     )
 

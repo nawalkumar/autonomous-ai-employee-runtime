@@ -188,6 +188,15 @@ class CompanyRepository:
             ).fetchone()
         return Ticket.model_validate(dict(row)) if row else None
 
+    def delete_ticket(self, ticket_id: str) -> bool:
+        """Remove a ticket by id. Used for independence tests / controlled demos."""
+        with connect(self.db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM company_tickets WHERE ticket_id = ?",
+                (ticket_id,),
+            )
+            return cur.rowcount > 0
+
     def list_tickets(self) -> list[Ticket]:
         with connect(self.db_path) as conn:
             rows = conn.execute(
