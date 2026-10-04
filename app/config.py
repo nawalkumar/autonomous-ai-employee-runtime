@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     app_port: int = 8000
     log_level: str = "info"
 
+    # SQLite path for ExecutionState + audit events (Phase 1+)
+    database_path: str = "workspace/runtime.db"
+
 
 @lru_cache
 def get_settings() -> Settings:
