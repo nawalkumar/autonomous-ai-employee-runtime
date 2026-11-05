@@ -11,7 +11,7 @@ from app.tools.base import BaseTool, RiskLevel
 from app.tools.failures import FailureInjector
 from app.tools.result import ToolResult
 from app.world.models import TicketPriority
-from app.world.repository import CompanyRepository
+from app.world.repository import CompanyRepository, IdempotencyConflictError
 
 CompanyOperation = Literal[
     "get_employee",
@@ -22,6 +22,30 @@ CompanyOperation = Literal[
 ]
 
 _WRITE_OPS = frozenset({"update_employee", "create_ticket"})
+
+
+def _write_result(
+    entity: str,
+    data: dict[str, Any],
+    evidence_type: str,
+    replayed: bool,
+    idempotency_key: str | None,
+) -> ToolResult:
+    """Normalized write result; a replay returns the originally committed record."""
+    if replayed:
+        return ToolResult.success(
+            {entity: data, "idempotent_replay": True},
+            evidence=[
+                {
+                    "type": "idempotent_replay",
+                    "data": {"idempotency_key": idempotency_key, entity: data},
+                }
+            ],
+        )
+    return ToolResult.success(
+        {entity: data},
+        evidence=[{"type": evidence_type, "data": data}],
+    )
 
 
 class CompanyAPIArgs(BaseModel):
@@ -130,13 +154,14 @@ class CompanyAPITool(BaseTool):
             # Failure happens before any mutation.
             return injected
 
-        _ = idempotency_key  # Interface groundwork only in Phase 2.
+        if args.operation == "update_employee":
+            return self._update_employee(args, idempotency_key)
+        if args.operation == "create_ticket":
+            return self._create_ticket(args, idempotency_key)
 
         handlers = {
             "get_employee": self._get_employee,
-            "update_employee": self._update_employee,
             "find_customer": self._find_customer,
-            "create_ticket": self._create_ticket,
             "get_ticket": self._get_ticket,
         }
         return handlers[args.operation](args)
@@ -154,18 +179,22 @@ class CompanyAPITool(BaseTool):
             evidence=[{"type": "employee_record", "data": data}],
         )
 
-    def _update_employee(self, args: CompanyAPIArgs) -> ToolResult:
-        updated = self.repository.update_employee(args.employee_id or "", args.fields)
+    def _update_employee(
+        self, args: CompanyAPIArgs, idempotency_key: str | None
+    ) -> ToolResult:
+        try:
+            updated, replayed = self.repository.update_employee_idempotent(
+                args.employee_id or "", args.fields, idempotency_key=idempotency_key
+            )
+        except IdempotencyConflictError as exc:
+            return ToolResult.failure(FailureType.INVALID_ARGS.value, str(exc))
         if updated is None:
             return ToolResult.failure(
                 FailureType.ENVIRONMENT_UNEXPECTED.value,
                 f"Employee not found: {args.employee_id}",
             )
         data = updated.model_dump(mode="json")
-        return ToolResult.success(
-            {"employee": data},
-            evidence=[{"type": "employee_updated", "data": data}],
-        )
+        return _write_result("employee", data, "employee_updated", replayed, idempotency_key)
 
     def _find_customer(self, args: CompanyAPIArgs) -> ToolResult:
         customers = self.repository.find_customers(
@@ -179,13 +208,16 @@ class CompanyAPITool(BaseTool):
             evidence=[{"type": "customer_search", "data": {"count": len(payload)}}],
         )
 
-    def _create_ticket(self, args: CompanyAPIArgs) -> ToolResult:
+    def _create_ticket(
+        self, args: CompanyAPIArgs, idempotency_key: str | None
+    ) -> ToolResult:
         try:
-            ticket = self.repository.create_ticket(
+            ticket, replayed = self.repository.create_ticket_idempotent(
                 customer_id=args.customer_id or "",
                 subject=args.subject or "",
                 description=args.description or "",
                 priority=args.priority,
+                idempotency_key=idempotency_key,
             )
         except ValueError as exc:
             return ToolResult.failure(
@@ -193,10 +225,7 @@ class CompanyAPITool(BaseTool):
                 str(exc),
             )
         data = ticket.model_dump(mode="json")
-        return ToolResult.success(
-            {"ticket": data},
-            evidence=[{"type": "ticket_created", "data": data}],
-        )
+        return _write_result("ticket", data, "ticket_created", replayed, idempotency_key)
 
     def _get_ticket(self, args: CompanyAPIArgs) -> ToolResult:
         ticket = self.repository.get_ticket(args.ticket_id or "")

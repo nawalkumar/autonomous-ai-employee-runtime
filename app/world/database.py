@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 _COMPANY_SCHEMA = """
@@ -40,6 +42,15 @@ CREATE TABLE IF NOT EXISTS company_ticket_seq (
     next_value INTEGER NOT NULL
 );
 
+-- One row per committed write; inserted in the same transaction as the mutation.
+CREATE TABLE IF NOT EXISTS company_idempotency (
+    idempotency_key TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_company_customers_company
     ON company_customers (company);
 CREATE INDEX IF NOT EXISTS idx_company_tickets_customer
@@ -58,6 +69,25 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+@contextmanager
+def write_transaction(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Serialized write transaction: BEGIN IMMEDIATE ... COMMIT, ROLLBACK on error."""
+    ensure_parent_dir(db_path)
+    conn = sqlite3.connect(db_path, isolation_level=None, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
 
 
 def init_company_schema(conn: sqlite3.Connection) -> None:

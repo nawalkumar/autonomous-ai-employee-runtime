@@ -5,12 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from app.models.enums import VerificationStatus
+from app.models.enums import PlanStepStatus, ToolCallStatus, VerificationStatus
 from app.models.goal import SuccessCriterion
 from app.models.records import EvidenceItem
 from app.models.state import ExecutionState
+from app.tools.file import is_protected_file
 from app.verify.results import VerificationCheckResult, VerificationResult
-from app.verify.rules import collect_criteria
+from app.verify.rules import collect_criteria, created_ticket_ids
 from app.world.repository import CompanyRepository
 
 
@@ -87,6 +88,8 @@ class OutcomeVerifier:
         if not isinstance(expected, dict):
             expected = {"value": expected}
 
+        if ctype == "step_completed":
+            return self._verify_step_completed(state, criterion, expected)
         if ctype in {"ticket_exists", "ticket"}:
             return self._verify_ticket(state, criterion, expected)
         if ctype in {"employee_field", "employee"}:
@@ -108,28 +111,102 @@ class OutcomeVerifier:
         )
         return check, []
 
+    def _verify_step_completed(
+        self,
+        state: ExecutionState,
+        criterion: SuccessCriterion,
+        expected: dict[str, Any],
+    ) -> tuple[VerificationCheckResult, list[EvidenceItem]]:
+        step_id = expected.get("step_id")
+        step = next((s for s in state.plan if s.step_id == step_id), None)
+        succeeded = any(
+            c.step_id == step_id and c.status is ToolCallStatus.SUCCEEDED
+            for c in state.tool_calls
+        )
+        if step is None or step.status is not PlanStepStatus.COMPLETED or not succeeded:
+            check = VerificationCheckResult(
+                name="step_completed",
+                passed=False,
+                expected=expected,
+                actual={
+                    "step_status": step.status.value if step else None,
+                    "successful_tool_call": succeeded,
+                },
+                message=f"Planned mutating step '{step_id}' was not completed",
+            )
+            return check, []
+
+        check = VerificationCheckResult(
+            name="step_completed",
+            passed=True,
+            expected=expected,
+            actual={"step_status": step.status.value, "successful_tool_call": True},
+            message=f"Planned step '{step_id}' completed with a successful tool call",
+        )
+        return check, []
+
     def _verify_ticket(
         self,
         state: ExecutionState,
         criterion: SuccessCriterion,
         expected: dict[str, Any],
     ) -> tuple[VerificationCheckResult, list[EvidenceItem]]:
-        ticket_id = expected.get("ticket_id") or state.extracted_information.get(
-            "last_ticket_id"
-        )
+        """Verify one exact ticket; never fall back to another ticket.
+
+        - ``ticket_id`` given: that exact ticket must exist and match.
+        - Bound to a creation call (``source_call_id``) without an ID: the creation
+          result was missing/malformed, so verification fails.
+        - No ``ticket_id``: a creation requirement; only tickets created by a
+          successful create_ticket call in this task can satisfy it.
+        """
+        ticket_id = expected.get("ticket_id")
+        if ticket_id:
+            return self._verify_ticket_by_id(str(ticket_id), expected)
+
+        if "source_call_id" in expected:
+            check = VerificationCheckResult(
+                name="ticket_exists",
+                passed=False,
+                expected=expected,
+                actual=None,
+                message=(
+                    "create_ticket call result has no ticket_id "
+                    f"(call_id={expected.get('source_call_id')})"
+                ),
+            )
+            return check, []
+
+        candidates = created_ticket_ids(state)
+        if not candidates:
+            check = VerificationCheckResult(
+                name="ticket_created",
+                passed=False,
+                expected=expected,
+                actual={"created_ticket_ids": []},
+                message=(
+                    "No ticket was created by a successful create_ticket call in this task"
+                ),
+            )
+            return check, []
+
+        failure: tuple[VerificationCheckResult, list[EvidenceItem]] | None = None
+        for candidate in candidates:
+            check, evidence = self._verify_ticket_by_id(candidate, expected)
+            if check.passed:
+                return check, evidence
+            failure = failure or (check, evidence)
+        assert failure is not None
+        return failure
+
+    def _verify_ticket_by_id(
+        self,
+        ticket_id: str,
+        expected: dict[str, Any],
+    ) -> tuple[VerificationCheckResult, list[EvidenceItem]]:
         customer_id = expected.get("customer_id")
         company = expected.get("company")
 
-        ticket = self.repository.get_ticket(str(ticket_id)) if ticket_id else None
-        if ticket is None and customer_id:
-            # Fall back to latest ticket for customer.
-            matches = [
-                t
-                for t in self.repository.list_tickets()
-                if t.customer_id == customer_id
-            ]
-            ticket = matches[-1] if matches else None
-
+        ticket = self.repository.get_ticket(ticket_id)
         evidence: list[EvidenceItem] = []
         name = "ticket_exists"
         if ticket is None:
@@ -335,7 +412,25 @@ class OutcomeVerifier:
             )
             return check, []
 
-        content = path.read_text(encoding="utf-8")
+        if is_protected_file(path):
+            check = VerificationCheckResult(
+                name="file_exists",
+                passed=False,
+                expected=expected,
+                message=f"Database files are not valid workspace outcomes: {rel}",
+            )
+            return check, []
+
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            check = VerificationCheckResult(
+                name="file_exists",
+                passed=False,
+                expected=expected,
+                message=f"File is not readable UTF-8 text: {rel}",
+            )
+            return check, []
         evidence = [
             EvidenceItem(
                 type="file_record",

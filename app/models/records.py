@@ -25,6 +25,9 @@ class ToolCallRecord(BaseModel):
     completed_at: datetime | None = None
     status: ToolCallStatus = ToolCallStatus.RUNNING
     idempotency_key: str | None = None
+    # 1-based position of this invocation among all attempts for the step,
+    # continuous across restarts. None on records persisted before this field.
+    attempt: int | None = None
     result: dict[str, Any] | None = None
     error_type: str | None = None
     error_message: str | None = None

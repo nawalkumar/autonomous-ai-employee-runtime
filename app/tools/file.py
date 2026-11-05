@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -12,6 +13,33 @@ from app.tools.base import BaseTool, RiskLevel
 from app.tools.result import ToolResult
 
 FileOperation = Literal["read", "write", "list"]
+
+# SQLite databases and their sidecar journal files are never workspace content.
+_PROTECTED_SUFFIXES = (
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".db-journal",
+    ".db-wal",
+    ".db-shm",
+    ".sqlite-journal",
+    ".sqlite-wal",
+    ".sqlite-shm",
+)
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def is_protected_file(path: Path) -> bool:
+    """True for database files by name, or any existing file with a SQLite header."""
+    if path.name.lower().endswith(_PROTECTED_SUFFIXES):
+        return True
+    try:
+        if path.is_file():
+            with path.open("rb") as handle:
+                return handle.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return True
+    return False
 
 
 class FileToolArgs(BaseModel):
@@ -36,9 +64,23 @@ class FileTool(BaseTool):
     # Workspace writes overwrite deterministically; reads are naturally retry-safe.
     retry_safe = True
 
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        *,
+        protected_paths: Iterable[str | Path] = (),
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.protected_paths = tuple(Path(p).resolve() for p in protected_paths)
+
+    def _is_blocked(self, path: Path) -> bool:
+        resolved = path.resolve()
+        if any(
+            resolved == p or p in resolved.parents for p in self.protected_paths
+        ):
+            return True
+        return is_protected_file(resolved)
 
     def risk_for(self, operation: FileOperation) -> RiskLevel:
         return RiskLevel.WRITE if operation == "write" else RiskLevel.READ
@@ -72,6 +114,12 @@ class FileTool(BaseTool):
             return ToolResult.failure(
                 FailureType.POLICY_BLOCKED.value,
                 str(exc),
+            )
+
+        if args.operation in {"read", "write"} and self._is_blocked(target):
+            return ToolResult.failure(
+                FailureType.POLICY_BLOCKED.value,
+                f"Access to database files is not allowed: {args.path}",
             )
 
         if args.operation == "write":
@@ -135,6 +183,6 @@ class FileTool(BaseTool):
         entries = sorted(
             str(p.relative_to(self.workspace_root))
             for p in target.rglob("*")
-            if p.is_file()
+            if p.is_file() and not self._is_blocked(p)
         )
         return ToolResult.success({"files": entries, "count": len(entries)})

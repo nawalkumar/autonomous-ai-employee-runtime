@@ -7,7 +7,7 @@ from typing import Any
 
 from pathlib import Path
 
-from app.config import get_settings
+from app.config import database_inside_workspace, get_settings
 from app.models.enums import (
     Actor,
     ApprovalStatus,
@@ -81,6 +81,13 @@ class ExecutionRuntime:
             if max_recovery_attempts is not None
             else get_settings().max_recovery_attempts
         )
+        if workspace_path is not None and database_inside_workspace(
+            store.db_path, workspace_path
+        ):
+            raise ValueError(
+                f"Runtime database {store.db_path} must be outside the workspace "
+                f"{workspace_path}"
+            )
         if verifier is not None:
             self.verifier = verifier
         else:
@@ -102,6 +109,12 @@ class ExecutionRuntime:
         """Create and persist a queued ExecutionState with a predefined plan."""
         if not plan:
             raise ValueError("plan must contain at least one step")
+        not_pending = [s for s in plan if s.status is not PlanStepStatus.PENDING]
+        if not_pending:
+            raise ValueError(
+                "New tasks must start with all plan steps PENDING; got "
+                + ", ".join(f"'{s.step_id}'={s.status.value}" for s in not_pending)
+            )
 
         criteria = list(success_criteria or [])
         if not criteria and interpreted_goal is not None:
@@ -176,6 +189,11 @@ class ExecutionRuntime:
 
         step_index = self._next_pending_index(state)
         if step_index is None:
+            blocker = self._finalization_blocker(state)
+            if blocker is not None:
+                # Nothing left to run, yet the plan is not fully completed
+                # (empty, FAILED/SKIPPED steps, stale approval): invalid stored state.
+                return self._fail_invalid_state(state, blocker)
             return self._complete_task(state)
 
         return self._execute_step(state, step_index)
@@ -296,6 +314,19 @@ class ExecutionRuntime:
             return paused_or_ready
         state = paused_or_ready
 
+        if step.status is PlanStepStatus.RUNNING:
+            state = self._mark_interrupted_calls(state, step, tool_name)
+
+        # Attempts already made for this step in any process (interrupted ones
+        # included), so a restart never resets the retry budget.
+        prior_attempts = self._prior_attempts(state, step.step_id)
+        if prior_attempts > 0:
+            refused = self._refuse_resumed_attempt(
+                state, step_index, step, tool_name, tool, prior_attempts
+            )
+            if refused is not None:
+                return refused
+
         state = self._update_step(
             state,
             step_index,
@@ -317,7 +348,7 @@ class ExecutionRuntime:
             )
         )
 
-        attempt = 0
+        attempt = prior_attempts
         while True:
             attempt += 1
             key = idempotency_key_for(state.task_id, step.step_id)
@@ -335,6 +366,7 @@ class ExecutionRuntime:
                 arguments=dict(step.arguments),
                 status=ToolCallStatus.RUNNING,
                 idempotency_key=key,
+                attempt=attempt,
             )
             state = state.model_copy(
                 update={"tool_calls": [*state.tool_calls, call]}
@@ -362,7 +394,13 @@ class ExecutionRuntime:
                     f"Unknown tool: {tool_name}",
                 )
             else:
-                result = tool.invoke(step.arguments, idempotency_key=key)
+                try:
+                    result = tool.invoke(step.arguments, idempotency_key=key)
+                except Exception as exc:
+                    result = ToolResult.failure(
+                        FailureType.ENVIRONMENT_UNEXPECTED.value,
+                        f"Tool '{tool_name}' raised {type(exc).__name__}: {exc}",
+                    )
 
             if result.ok:
                 if attempt > 1:
@@ -720,6 +758,7 @@ class ExecutionRuntime:
             arguments=dict(step.arguments),
             status=ToolCallStatus.FAILED,
             idempotency_key=idempotency_key_for(state.task_id, step.step_id),
+            attempt=self._prior_attempts(state, step.step_id) + 1,
             error_type=FailureType.INVALID_ARGS.value,
             error_message="Plan step is missing tool_name/tool_hint",
             completed_at=utc_now(),
@@ -740,7 +779,7 @@ class ExecutionRuntime:
             call=call,
             result=result,
             tool=None,
-            attempt=1,
+            attempt=call.attempt or 1,
         )
         return self._finalize_step_failure(
             state=state,
@@ -756,11 +795,67 @@ class ExecutionRuntime:
         return self._verify_and_finalize(state)
 
     def verify_task(self, task_id: str) -> ExecutionState:
-        """Public entrypoint to verify a fully executed task against world state."""
+        """Verify and finalize a fully executed RUNNING task.
+
+        Queued, incomplete, approval-pending, invalid, and terminal tasks are
+        returned unchanged: no status change, events, or evidence.
+        """
         state = self.load(task_id)
         return self._verify_and_finalize(state)
 
+    @staticmethod
+    def _finalization_blocker(state: ExecutionState) -> str | None:
+        """Why the task may not be finalized by verification, or None if it may."""
+        if state.final_status is not TaskStatus.RUNNING:
+            return f"task status is {state.final_status.value}, not running"
+        if not state.plan:
+            return "plan has no steps"
+        if state.approval_status is ApprovalStatus.PENDING:
+            return "an approval is pending"
+        for step in state.plan:
+            if step.status is not PlanStepStatus.COMPLETED:
+                return f"step '{step.step_id}' is {step.status.value}, not completed"
+        return None
+
+    def _fail_invalid_state(self, state: ExecutionState, reason: str) -> ExecutionState:
+        message = f"Invalid task state; cannot finalize: {reason}"
+        failure = FailureRecord(
+            task_id=state.task_id,
+            failure_type=FailureType.ENVIRONMENT_UNEXPECTED,
+            message=message,
+            retryable=False,
+            recovery_action="fail",
+        )
+        state = state.model_copy(
+            update={
+                "final_status": TaskStatus.FAILED,
+                "completion_summary": message,
+                "failures": [*state.failures, failure],
+            }
+        ).touch()
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.TASK_FAILED,
+                action="task_failed",
+                failure={
+                    "failure_type": FailureType.ENVIRONMENT_UNEXPECTED.value,
+                    "message": message,
+                },
+            )
+        )
+        logger.warning("[LIFECYCLE] task=%s failed: %s", state.task_id, message)
+        return state
+
     def _verify_and_finalize(self, state: ExecutionState) -> ExecutionState:
+        blocker = self._finalization_blocker(state)
+        if blocker is not None:
+            logger.info(
+                "[LIFECYCLE] task=%s not finalized: %s", state.task_id, blocker
+            )
+            return state
+
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -968,6 +1063,147 @@ class ExecutionRuntime:
             step.step_id,
             tool_name,
             decision.reason,
+        )
+        return state
+
+    @staticmethod
+    def _prior_attempts(state: ExecutionState, step_id: str) -> int:
+        """Invocation attempts already recorded for a step, across all processes.
+
+        Every persisted call for the step counts (failed, interrupted, or running),
+        because an interrupted call may have reached the tool before a crash.
+        Records persisted without ``attempt`` are numbered by their position in
+        the step's ordered call history.
+        """
+        highest = 0
+        position = 0
+        for call in state.tool_calls:
+            if call.step_id != step_id:
+                continue
+            position += 1
+            highest = max(highest, call.attempt or position)
+        return highest
+
+    def _refuse_resumed_attempt(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        tool_name: str,
+        tool: BaseTool | None,
+        prior_attempts: int,
+    ) -> ExecutionState | None:
+        """Fail the step instead of invoking when another attempt is not allowed.
+
+        ``max_recovery_attempts`` counts retries after the initial attempt, so a
+        step may be invoked at most ``1 + max_recovery_attempts`` times over the
+        task's lifetime. With ``max_recovery_attempts=0`` an interrupted initial
+        invocation is not re-invoked, even for idempotent writes: the step fails
+        and a write that may have committed is not reconciled automatically.
+        """
+        max_attempts = 1 + self.max_recovery_attempts
+        if prior_attempts >= max_attempts:
+            failure_type = FailureType.REPEATED
+            message = (
+                f"Retry budget exhausted for step '{step.step_id}': "
+                f"{prior_attempts} of {max_attempts} allowed attempts already used "
+                "(interrupted attempts count)"
+            )
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.RECOVERY_EXHAUSTED,
+                    action="recovery_exhausted",
+                    tool=tool_name,
+                    failure={
+                        "step_id": step.step_id,
+                        "attempt": prior_attempts,
+                        "max_attempts": max_attempts,
+                        "reason": message,
+                    },
+                )
+            )
+        elif tool is not None and not tool.is_retry_safe(step.arguments):
+            failure_type = FailureType.ENVIRONMENT_UNEXPECTED
+            message = (
+                f"Step '{step.step_id}' has a previous attempt whose outcome is "
+                f"unknown and '{tool_name}' is not retry-safe; it will not be "
+                "invoked again"
+            )
+        else:
+            return None
+
+        logger.info("[RECOVERY] step=%s not re-invoked: %s", step.step_id, message)
+        last_call = next(
+            c for c in reversed(state.tool_calls) if c.step_id == step.step_id
+        )
+        state = state.model_copy(
+            update={
+                "failures": [
+                    *state.failures,
+                    FailureRecord(
+                        task_id=state.task_id,
+                        step_id=step.step_id,
+                        failure_type=failure_type,
+                        message=message,
+                        retryable=False,
+                        recovery_action=RecoveryAction.FAIL.value,
+                    ),
+                ]
+            }
+        ).touch()
+        return self._finalize_step_failure(
+            state=state,
+            step_index=step_index,
+            call=last_call,
+            result=ToolResult.failure(failure_type.value, message),
+            failure_type=failure_type,
+            recovery_action=RecoveryAction.FAIL.value,
+        )
+
+    def _mark_interrupted_calls(
+        self, state: ExecutionState, step: PlanStep, tool_name: str
+    ) -> ExecutionState:
+        """A step left RUNNING means the process stopped mid-call; its outcome is unknown.
+
+        Dangling calls are recorded as failed (never as succeeded). The step is then
+        re-invoked with the same idempotency key, so a write that did commit is
+        replayed by the tool instead of being applied twice.
+        """
+        interrupted: list[str] = []
+        tool_calls = []
+        for call in state.tool_calls:
+            if call.step_id == step.step_id and call.status is ToolCallStatus.RUNNING:
+                interrupted.append(call.call_id)
+                call = call.model_copy(
+                    update={
+                        "status": ToolCallStatus.FAILED,
+                        "completed_at": utc_now(),
+                        "error_type": "interrupted",
+                        "error_message": (
+                            "Execution stopped before the call completed; "
+                            "re-invoking with the same idempotency key"
+                        ),
+                    }
+                )
+            tool_calls.append(call)
+        state = state.model_copy(update={"tool_calls": tool_calls}).touch()
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.STEP_RESUMED,
+                action="step_resumed",
+                tool=tool_name,
+                result={
+                    "step_id": step.step_id,
+                    "interrupted_call_ids": interrupted,
+                    "idempotency_key": idempotency_key_for(state.task_id, step.step_id),
+                },
+            )
+        )
+        logger.info(
+            "[RESUME] step=%s interrupted_calls=%s", step.step_id, len(interrupted)
         )
         return state
 
