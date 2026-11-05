@@ -3,6 +3,8 @@ name = "autonomous-ai-employee-runtime"
 version = "0.1.0"
 description = "Autonomous AI Employee Runtime — CentrAlign Founding Engineer challenge"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115.0",
@@ -25,7 +27,7 @@ aae-api = "app.main:run"
 aae = "app.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
