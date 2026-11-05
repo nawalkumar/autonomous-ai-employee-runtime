@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 aae-api = "app.main:run"
+aae = "app.cli:main"
 
 [build-system]
 requires = ["hatchling"]
