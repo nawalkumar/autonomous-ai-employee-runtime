@@ -51,3 +51,8 @@ Thumbs.db
 # Local workspace artifacts (keep directory via .gitkeep)
 workspace/*
 !workspace/.gitkeep
+
+# Runtime database directory (kept outside the FileTool workspace). The empty
+# directory is tracked so Docker bind mounts never create it as root.
+data/*
+!data/.gitkeep
