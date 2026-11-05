@@ -566,6 +566,7 @@
       font-family: var(--mono);
       font-size: 12.5px;
       font-weight: 650;
+      overflow-wrap: anywhere;
     }
 
     .active-banner {
@@ -638,7 +639,8 @@
 <body>
   <div class="wrap">
     <div class="disclaimer">
-      Interactive simulation of the autonomous runtime flow — backend execution is represented visually for demo purposes.
+      Scripted simulation — not connected to the runtime. It replays recorded results of real
+      <code>python -m app.cli</code> runs of the two supported goals; nothing here executes, persists or verifies anything.
     </div>
 
     <div class="topbar">
@@ -663,8 +665,8 @@
       <div class="card">
         <div class="card-hd"><h2>Goal</h2></div>
         <div class="card-bd">
-          <label for="goalInput">User goal</label>
-          <textarea id="goalInput" spellcheck="false"></textarea>
+          <label for="goalInput">Scenario goal (fixed; choose a scenario below)</label>
+          <textarea id="goalInput" spellcheck="false" readonly aria-readonly="true"></textarea>
           <div class="btn-row">
             <button class="primary" id="runBtn">Run Employee</button>
             <button id="resetBtn">Reset</button>
@@ -695,12 +697,12 @@
 
     <div class="approval-card" id="approvalCard">
       <h3>Human approval required</h3>
-      <div class="sub">Policy gate paused execution before a high-risk write. No mutation has occurred.</div>
+      <div class="sub">Policy gate paused execution before an employee record write. No mutation has occurred. (Simulated replay; in the real CLI use <code>approve</code> or <code>reject</code>.)</div>
       <div class="approval-grid">
-        <div class="box"><div class="k">Action</div><div class="v">company_api/update_employee</div></div>
-        <div class="box"><div class="k">Target</div><div class="v">Employee E-17</div></div>
-        <div class="box"><div class="k">Change</div><div class="v">Title → Senior Engineer</div></div>
-        <div class="box"><div class="k">Risk</div><div class="v">High-risk write operation</div></div>
+        <div class="box"><div class="k">Step / tool</div><div class="v">step_1 · company_api</div></div>
+        <div class="box"><div class="k">Arguments</div><div class="v">{"employee_id": "E-17", "fields": {"title": "Senior Engineer"}, "operation": "update_employee"}</div></div>
+        <div class="box"><div class="k">Risk</div><div class="v">write</div></div>
+        <div class="box"><div class="k">Reason</div><div class="v">Employee record mutation requires human approval.</div></div>
       </div>
       <div class="btn-row">
         <button class="success" id="approveBtn">Approve Action</button>
@@ -764,9 +766,11 @@
       };
 
       var NOTES = {
-        recovery: "Simulates transient HTTP 503 → bounded retry → independent verification → COMPLETED.",
-        approval: "Simulates policy gate → APPROVAL REQUIRED → approve/reject before mutation."
+        recovery: "Replays a real CLI run with one simulated (injected) 503 → bounded retry → independent verification → COMPLETED.",
+        approval: "Replays a real CLI run: policy gate → NEEDS_APPROVAL → approve or reject before any mutation."
       };
+
+      var SIMULATED_TASK_ID = "simulated (real IDs: task_ + 32 hex chars)";
 
       var state = {
         scenario: "recovery",
@@ -813,15 +817,10 @@
 
       function pad(n) { return n < 10 ? "0" + n : String(n); }
 
+      // Sequence numbers, not clock times: this replay has no real timestamps.
       function nextTimestamp() {
-        if (!state.clockBase) {
-          var now = new Date();
-          state.clockBase = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 18, 1, 2);
-          state.clockOffset = 0;
-        }
-        var d = new Date(state.clockBase.getTime() + state.clockOffset * 1000);
         state.clockOffset += 1;
-        return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+        return "#" + pad(state.clockOffset);
       }
 
       function clearTimers() {
@@ -929,20 +928,7 @@
       }
 
       function renderPlanIdle() {
-        if (state.scenario === "recovery") {
-          renderPlan([
-            { title: "Create support ticket", meta: "company_api / create_ticket", state: "" },
-            { title: "Save summary note", meta: "file / write", state: "" },
-            { title: "Verify ticket and evidence", meta: "OutcomeVerifier", state: "" }
-          ]);
-        } else {
-          renderPlan([
-            { title: "Read employee E-17", meta: "company_api / get_employee", state: "" },
-            { title: "Update employee title", meta: "company_api / update_employee · requires approval", state: "" },
-            { title: "Write confirmation note", meta: "file / write", state: "" },
-            { title: "Verify employee title + note", meta: "OutcomeVerifier", state: "" }
-          ]);
-        }
+        renderPlan(planWith(state.scenario === "recovery" ? RECOVERY_PLAN : APPROVAL_PLAN, []));
       }
 
       function renderEvidence(rows) {
@@ -960,7 +946,7 @@
           '<div class="k">objective</div><div class="v">—</div>' +
           '<div class="k">entities</div><div class="v">—</div>' +
           '<div class="k">tools</div><div class="v">company_api, file</div>' +
-          '<div class="k">llm</div><div class="v">provider-agnostic (mock)</div>';
+          '<div class="k">planner</div><div class="v">mock (deterministic, two supported goal formats)</div>';
       }
 
       function renderInterpreted(rows) {
@@ -1024,8 +1010,30 @@
         return map;
       }
 
+      // Plans, arguments, IDs, file names, messages and counts below are copied
+      // from real `python -m app.cli` runs of these exact goals on a freshly
+      // seeded database. This page replays them; it does not execute anything.
+      var RECOVERY_PLAN = [
+        { title: "step_1: Find customer Acme Corp", meta: "company_api / find_customer" },
+        { title: "step_2: Create billing discrepancy ticket", meta: "company_api / create_ticket" },
+        { title: "step_3: Save summary note", meta: "file / write · acme_billing_summary.txt" }
+      ];
+      var APPROVAL_PLAN = [
+        { title: "step_1: Update employee E-17 title to Senior Engineer", meta: "company_api / update_employee · requires approval" },
+        { title: "step_2: Write confirmation note", meta: "file / write · employee_update.txt" }
+      ];
+      var PENDING_ARGS = '{"employee_id": "E-17", "fields": {"title": "Senior Engineer"}, "operation": "update_employee"}';
+
+      function planWith(base, states) {
+        return base.map(function (s, i) {
+          var st = states[i] || "";
+          var label = { active: "RUNNING", done: "COMPLETED", blocked: "AWAITING APPROVAL", failed: "REJECTED" }[st];
+          return { title: s.title, meta: s.meta + (label ? " · " + label : ""), state: st };
+        });
+      }
+
       function runRecovery() {
-        state.taskId = "task_" + Math.random().toString(16).slice(2, 10);
+        state.taskId = SIMULATED_TASK_ID;
         state.recoveryAttempts = 0;
         state.retryCount = 0;
         state.verification = "PENDING";
@@ -1033,134 +1041,73 @@
         setControlsRunning(true);
         setStatus("running");
         els.explainBox.textContent =
-          "The runtime detected a transient failure, recovered with a bounded retry, then independently verified the outcome instead of trusting the tool response.";
+          "Replay of a real CLI run with --inject-transient create_ticket: one simulated 503, one bounded retry, then independent verification of the ticket and summary file.";
 
         var steps = [
           function () {
             renderPipeline(stageMap({ Goal: "active" }), "Goal");
             state.currentStep = "goal";
-            addTimeline("Goal received");
+            addTimeline("TASK_CREATED · goal accepted by the mock grammar");
             renderInterpreted([
-              ["objective", "Create Acme billing ticket + summary"],
-              ["entities", "Acme Corp, $240"],
-              ["tools", "company_api, file"],
-              ["llm", "provider-agnostic (mock)"]
-            ]);
-          },
-          function () {
-            renderPipeline(stageMap({ Goal: "success", Understand: "active" }), "Understand");
-            addTimeline("Goal interpreted → structured objective + success criteria", "ok");
-            renderInterpreted([
-              ["objective", "Open support ticket for Acme Corp billing discrepancy"],
-              ["entities", "customer=Acme Corp; amount=$240"],
-              ["success_criteria", "ticket exists; summary file present"],
-              ["llm", "mock planner (deterministic)"]
+              ["objective", "Create a support ticket for Acme Corp about a $240 billing discrepancy."],
+              ["entities", "company=Acme Corp; amount=$240; issue=billing discrepancy"],
+              ["success_criteria", "ticket_exists (Acme Corp, billing); file_exists acme_billing_summary.txt"],
+              ["planner", "mock (deterministic, two supported goal formats)"]
             ]);
           },
           function () {
             renderPipeline(stageMap({ Goal: "success", Understand: "success", Plan: "active" }), "Plan");
-            addTimeline("Structured plan generated (3 steps)", "ok");
-            state.currentStep = "plan";
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket", state: "" },
-              { title: "Save summary note", meta: "file / write", state: "" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier", state: "" }
-            ]);
+            addTimeline("Plan generated: find_customer → create_ticket → file.write", "ok");
+            renderPlan(planWith(RECOVERY_PLAN, []));
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success", Execute: "active"
             }), "Execute");
             state.currentStep = "step_1";
-            addTimeline("Tool selected via registry: <span class='tag'>company_api/create_ticket</span>");
-            addTimeline("Execution started · SQLite ExecutionState persisted");
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket · RUNNING", state: "active" },
-              { title: "Save summary note", meta: "file / write", state: "" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier", state: "" }
-            ]);
+            addTimeline("TOOL_CALLED <span class='tag'>company_api.find_customer</span> attempt 1");
+            addTimeline("TOOL_SUCCEEDED · customer C-1001 (Acme Corp)", "ok");
+            state.currentStep = "step_2";
+            addTimeline("TOOL_CALLED <span class='tag'>company_api.create_ticket</span> attempt 1");
+            renderPlan(planWith(RECOVERY_PLAN, ["done", "active"]));
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
               Execute: "failure", Observe: "active"
             }), "Observe");
-            addTimeline("Tool returned HTTP 503 · Mock company API temporarily unavailable", "fail");
-            addTimeline("Observe: classified as transient failure", "warn");
+            addTimeline("TOOL_FAILED · 503 Service Unavailable (simulated by --inject-transient)", "fail");
+            addTimeline("failure.detected · classified as transient", "warn");
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
               Execute: "warning", Observe: "success", Adapt: "active"
             }), "Adapt");
-            addTimeline("Recovery policy evaluated · retry allowed (bounded)", "warn");
+            addTimeline("recovery.evaluated · retry allowed (budget: 2 retries)", "warn");
+            addTimeline("recovery.retry_started · attempt 2", "warn");
             state.retryCount = 1;
             state.recoveryAttempts = 1;
             updateMetrics();
-            addTimeline("Retry #1 initiated", "warn");
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket · RETRYING", state: "active" },
-              { title: "Save summary note", meta: "file / write", state: "" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier", state: "" }
-            ]);
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
               Execute: "active", Observe: "success", Adapt: "success"
             }), "Execute");
-            addTimeline("Retry succeeded · ticket created TKT-1001", "ok");
-            state.currentStep = "step_2";
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket · COMPLETED", state: "done" },
-              { title: "Save summary note", meta: "file / write · RUNNING", state: "active" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier", state: "" }
-            ]);
-          },
-          function () {
-            addTimeline("Workspace summary written · workspace/support/acme-billing-summary.txt", "ok");
-            state.currentStep = "verify";
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket · COMPLETED", state: "done" },
-              { title: "Save summary note", meta: "file / write · COMPLETED", state: "done" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier · RUNNING", state: "active" }
-            ]);
+            addTimeline("recovery.retry_succeeded · ticket T-10001 created", "ok");
+            state.currentStep = "step_3";
+            addTimeline("TOOL_CALLED <span class='tag'>file.write</span> acme_billing_summary.txt");
+            renderPlan(planWith(RECOVERY_PLAN, ["done", "done", "active"]));
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
               Execute: "success", Observe: "success", Adapt: "success", Verify: "active"
             }), "Verify");
-            addTimeline("Independent verification started", "ok");
-            addTimeline("Check: ticket existence in mock company world", "ok");
-            addTimeline("Check: summary evidence on filesystem", "ok");
-            state.verification = "PENDING";
-            updateMetrics();
-          },
-          function () {
-            renderPipeline(stageMap({
-              Goal: "success", Understand: "success", Plan: "success",
-              Execute: "success", Observe: "success", Adapt: "success",
-              Verify: "success", Complete: "active"
-            }), "Complete");
-            addTimeline("Verification passed · evidence recorded", "ok");
-            state.verification = "PASSED";
-            state.evidenceRecorded = true;
-            updateMetrics();
-            renderEvidence([
-              ["Ticket ID", "TKT-1001"],
-              ["Customer", "Acme Corp"],
-              ["Issue", "Billing discrepancy"],
-              ["Amount", "$240"],
-              ["Recovery", "Retry succeeded"],
-              ["Verification", "Passed"],
-              ["Summary file", "workspace/support/acme-billing-summary.txt"]
-            ]);
-            renderPlan([
-              { title: "Create support ticket", meta: "company_api / create_ticket · COMPLETED", state: "done" },
-              { title: "Save summary note", meta: "file / write · COMPLETED", state: "done" },
-              { title: "Verify ticket and evidence", meta: "OutcomeVerifier · PASSED", state: "done" }
-            ]);
+            state.currentStep = "verify";
+            addTimeline("verification.started · independent checks against database and workspace", "ok");
+            renderPlan(planWith(RECOVERY_PLAN, ["done", "done", "done"]));
           },
           function () {
             renderPipeline(stageMap({
@@ -1168,8 +1115,18 @@
               Execute: "success", Observe: "success", Adapt: "success",
               Verify: "success", Complete: "success"
             }), "Complete");
-            addTimeline("Task completed · final_status=COMPLETED", "ok");
+            addTimeline("verification.passed · 6/6 checks · TASK_COMPLETED", "ok");
+            state.verification = "PASSED";
+            state.evidenceRecorded = true;
             state.currentStep = "done";
+            renderEvidence([
+              ["Ticket ID", "T-10001"],
+              ["Customer", "C-1001 (Acme Corp)"],
+              ["Subject", "Billing discrepancy $240"],
+              ["Recovery", "1 retry after simulated 503"],
+              ["Summary file", "acme_billing_summary.txt"],
+              ["Verification", "PASSED · 6/6 checks · 12 evidence items"]
+            ]);
             setStatus("completed");
             setControlsRunning(false);
           }
@@ -1183,7 +1140,7 @@
       }
 
       function runApprovalToGate() {
-        state.taskId = "task_" + Math.random().toString(16).slice(2, 10);
+        state.taskId = SIMULATED_TASK_ID;
         state.recoveryAttempts = 0;
         state.retryCount = 0;
         state.verification = "PENDING";
@@ -1192,69 +1149,43 @@
         setControlsRunning(true);
         setStatus("running");
         els.explainBox.textContent =
-          "High-risk employee mutation is gated by policy before tool invocation. Execution pauses until a human decision is recorded.";
+          "Replay of a real CLI run: the policy gate pauses before company_api.update_employee runs. Nothing is written until a human approves.";
 
         var steps = [
           function () {
             renderPipeline(stageMap({ Goal: "active" }), "Goal");
             state.currentStep = "goal";
-            addTimeline("Goal received");
-          },
-          function () {
-            renderPipeline(stageMap({ Goal: "success", Understand: "active" }), "Understand");
-            addTimeline("Goal interpreted → update employee title + confirmation note", "ok");
+            addTimeline("TASK_CREATED · goal accepted by the mock grammar");
             renderInterpreted([
-              ["objective", "Promote E-17 to Senior Engineer and confirm"],
+              ["objective", "Update employee E-17 title to Senior Engineer and create a confirmation note."],
               ["entities", "employee_id=E-17; title=Senior Engineer"],
-              ["constraints", "human approval required for employee mutation"],
-              ["llm", "mock planner (deterministic)"]
+              ["success_criteria", "employee_field E-17 title=Senior Engineer; file_exists employee_update.txt"],
+              ["planner", "mock (deterministic, two supported goal formats)"]
             ]);
           },
           function () {
             renderPipeline(stageMap({ Goal: "success", Understand: "success", Plan: "active" }), "Plan");
-            addTimeline("Structured plan generated (4 steps)", "ok");
-            renderPlan([
-              { title: "Read employee E-17", meta: "company_api / get_employee", state: "done" },
-              { title: "Update employee title", meta: "company_api / update_employee · PENDING", state: "active" },
-              { title: "Write confirmation note", meta: "file / write", state: "" },
-              { title: "Verify employee title + note", meta: "OutcomeVerifier", state: "" }
-            ]);
+            addTimeline("Plan generated: update_employee → file.write", "ok");
+            renderPlan(planWith(APPROVAL_PLAN, []));
           },
           function () {
             renderPipeline(stageMap({
-              Goal: "success", Understand: "success", Plan: "success", Execute: "active"
+              Goal: "success", Understand: "success", Plan: "success", Execute: "approval"
             }), "Execute");
             state.currentStep = "step_1";
-            addTimeline("Tool selected: <span class='tag'>company_api/get_employee</span>");
-            addTimeline("Read succeeded · current title=Software Engineer", "ok");
-          },
-          function () {
-            state.currentStep = "step_2";
-            addTimeline("Policy gate evaluated for next step", "warn");
-            addTimeline("Sensitive action detected: company_api/update_employee", "warn");
-          },
-          function () {
-            renderPipeline(stageMap({
-              Goal: "success", Understand: "success", Plan: "success",
-              Execute: "approval"
-            }), "Execute");
-            addTimeline("APPROVAL REQUIRED · PendingAction persisted to SQLite", "approval");
-            addTimeline("Audit event: approval.requested", "approval");
+            addTimeline("Policy gate: company_api.update_employee requires approval", "warn");
+            addTimeline("approval.requested · task status NEEDS_APPROVAL (CLI exit code 4)", "approval");
             setStatus("needs_approval");
             state.running = false;
             showApproval(true);
-            renderPlan([
-              { title: "Read employee E-17", meta: "company_api / get_employee · COMPLETED", state: "done" },
-              { title: "Update employee title", meta: "company_api / update_employee · AWAITING APPROVAL", state: "blocked" },
-              { title: "Write confirmation note", meta: "file / write", state: "" },
-              { title: "Verify employee title + note", meta: "OutcomeVerifier", state: "" }
-            ]);
+            renderPlan(planWith(APPROVAL_PLAN, ["blocked"]));
             renderEvidence([
-              ["Employee ID", "E-17"],
-              ["Current title", "Software Engineer"],
-              ["Pending mutation", "title → Senior Engineer"],
-              ["Mutation executed", "No"],
-              ["Approval status", "PENDING"]
+              ["Pending step", "step_1"],
+              ["Tool", "company_api"],
+              ["Arguments", PENDING_ARGS],
+              ["Risk", "write"],
+              ["Reason", "Employee record mutation requires human approval."],
+              ["Mutation executed", "No"]
             ]);
           }
         ];
@@ -1274,77 +1205,51 @@
         state.running = true;
         els.runBtn.disabled = true;
 
-        addTimeline("Approval granted by human", "ok");
-        addTimeline("Audit event: human_approval.granted", "ok");
+        addTimeline("approval.approved · actor human", "ok");
         setStatus("running");
         showApproval(false);
         state.awaitingApproval = false;
         els.explainBox.textContent =
-          "After human approval, the runtime resumed from the pending step, executed the mutation once, wrote confirmation evidence, and independently verified the outcome.";
+          "Equivalent CLI command: python -m app.cli approve <task_id> --step step_1 --yes. The runtime resumes from the pending step, runs it once, then verifies independently.";
 
         var steps = [
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success", Execute: "active"
             }), "Execute");
+            addTimeline("TOOL_CALLED <span class='tag'>company_api.update_employee</span> attempt 1");
+            addTimeline("TOOL_SUCCEEDED · E-17 title=Senior Engineer", "ok");
             state.currentStep = "step_2";
-            addTimeline("Resumed from pending step · company_api/update_employee", "ok");
-            renderPlan([
-              { title: "Read employee E-17", meta: "company_api / get_employee · COMPLETED", state: "done" },
-              { title: "Update employee title", meta: "company_api / update_employee · RUNNING", state: "active" },
-              { title: "Write confirmation note", meta: "file / write", state: "" },
-              { title: "Verify employee title + note", meta: "OutcomeVerifier", state: "" }
-            ]);
+            renderPlan(planWith(APPROVAL_PLAN, ["done", "active"]));
           },
           function () {
-            addTimeline("Employee E-17 updated · title=Senior Engineer", "ok");
-            state.currentStep = "step_3";
-            renderPlan([
-              { title: "Read employee E-17", meta: "company_api / get_employee · COMPLETED", state: "done" },
-              { title: "Update employee title", meta: "company_api / update_employee · COMPLETED", state: "done" },
-              { title: "Write confirmation note", meta: "file / write · RUNNING", state: "active" },
-              { title: "Verify employee title + note", meta: "OutcomeVerifier", state: "" }
-            ]);
+            addTimeline("TOOL_CALLED <span class='tag'>file.write</span> employee_update.txt", "ok");
+            renderPlan(planWith(APPROVAL_PLAN, ["done", "done"]));
           },
           function () {
-            addTimeline("Confirmation note written · workspace/employee_update.txt", "ok");
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
-              Execute: "success", Observe: "success", Adapt: "success", Verify: "active"
+              Execute: "success", Verify: "active"
             }), "Verify");
             state.currentStep = "verify";
-            addTimeline("Independent verification started", "ok");
-            addTimeline("Check: employee title == Senior Engineer", "ok");
-            addTimeline("Check: confirmation file exists", "ok");
-          },
-          function () {
-            state.verification = "PASSED";
-            state.evidenceRecorded = true;
-            updateMetrics();
-            addTimeline("Verification passed · evidence recorded", "ok");
-            renderEvidence([
-              ["Employee ID", "E-17"],
-              ["Title", "Senior Engineer"],
-              ["Mutation executed", "Yes (after approval)"],
-              ["Confirmation file", "workspace/employee_update.txt"],
-              ["Verification", "Passed"],
-              ["Audit", "human_approval.granted"]
-            ]);
-            renderPlan([
-              { title: "Read employee E-17", meta: "company_api / get_employee · COMPLETED", state: "done" },
-              { title: "Update employee title", meta: "company_api / update_employee · COMPLETED", state: "done" },
-              { title: "Write confirmation note", meta: "file / write · COMPLETED", state: "done" },
-              { title: "Verify employee title + note", meta: "OutcomeVerifier · PASSED", state: "done" }
-            ]);
+            addTimeline("verification.started · independent checks against database and workspace", "ok");
           },
           function () {
             renderPipeline(stageMap({
               Goal: "success", Understand: "success", Plan: "success",
-              Execute: "success", Observe: "success", Adapt: "success",
-              Verify: "success", Complete: "success"
+              Execute: "success", Verify: "success", Complete: "success"
             }), "Complete");
-            addTimeline("Task completed · final_status=COMPLETED", "ok");
+            addTimeline("verification.passed · 5/5 checks · TASK_COMPLETED", "ok");
+            state.verification = "PASSED";
+            state.evidenceRecorded = true;
             state.currentStep = "done";
+            renderEvidence([
+              ["Employee", "E-17"],
+              ["Title", "Senior Engineer"],
+              ["Confirmation file", "employee_update.txt"],
+              ["Audit", "approval.requested → approval.approved"],
+              ["Verification", "PASSED · 5/5 checks · 6 evidence items"]
+            ]);
             setStatus("completed");
             setControlsRunning(false);
           }
@@ -1363,12 +1268,10 @@
         els.approveBtn.disabled = true;
         els.rejectBtn.disabled = true;
 
-        addTimeline("Action rejected by human", "fail");
-        addTimeline("Audit event: human_approval.rejected", "fail");
-        addTimeline("No sensitive tool mutation occurred", "warn");
-        state.verification = "—";
+        addTimeline("approval.rejected · actor human", "fail");
+        addTimeline("Task ABORTED · update_employee was never invoked (0 tool calls)", "warn");
+        state.verification = "PENDING";
         state.evidenceRecorded = false;
-        state.currentStep = "step_2";
         setStatus("aborted");
         showApproval(false);
         state.awaitingApproval = false;
@@ -1378,25 +1281,17 @@
           Goal: "success", Understand: "success", Plan: "success",
           Execute: "failure", Complete: "failure"
         }), "Complete");
-
-        renderPlan([
-          { title: "Read employee E-17", meta: "company_api / get_employee · COMPLETED", state: "done" },
-          { title: "Update employee title", meta: "company_api / update_employee · REJECTED", state: "failed" },
-          { title: "Write confirmation note", meta: "file / write · SKIPPED", state: "" },
-          { title: "Verify employee title + note", meta: "OutcomeVerifier · SKIPPED", state: "" }
-        ]);
-
+        renderPlan(planWith(APPROVAL_PLAN, ["failed"]));
         renderEvidence([
-          ["Employee ID", "E-17"],
+          ["Employee", "E-17"],
           ["Title", "Software Engineer (unchanged)"],
-          ["Mutation executed", "No"],
-          ["Approval status", "REJECTED"],
-          ["Final status", "ABORTED"],
-          ["Audit", "human_approval.rejected"]
+          ["Tool calls", "0"],
+          ["Approval status", "rejected"],
+          ["Final status", "ABORTED (CLI exit code 1)"],
+          ["Audit", "approval.requested → approval.rejected"]
         ]);
-
         els.explainBox.textContent =
-          "Human rejection terminated the task cleanly. The pending high-risk write was never invoked, and the audit trail recorded the decision.";
+          "Equivalent CLI command: python -m app.cli reject <task_id> --reason \"...\". The pending write never runs and the reason is stored on the task.";
         updateMetrics();
       }
 

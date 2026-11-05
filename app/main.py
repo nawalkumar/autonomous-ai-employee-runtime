@@ -12,7 +12,10 @@ def create_app() -> FastAPI:
     application = FastAPI(
         title="Autonomous AI Employee Runtime",
         version=__version__,
-        description="Foundation setup — agent runtime not yet implemented.",
+        description=(
+            "Exposes only GET /health. Task submission, execution and approval are "
+            "not available over HTTP; use the local CLI (python -m app.cli)."
+        ),
     )
     application.include_router(health_router)
     return application
