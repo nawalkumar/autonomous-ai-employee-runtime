@@ -153,7 +153,8 @@ def test_file_tool_write_read_nested(file_tool: FileTool) -> None:
     listing = file_tool.invoke({"operation": "list", "path": ""})
     assert listing.ok is True
     assert listing.data is not None
-    assert "notes/summary.txt" in listing.data["files"]
+    files = [path.replace("\\", "/") for path in listing.data["files"]]
+    assert "notes/summary.txt" in files
 
 
 def test_file_tool_rejects_traversal(file_tool: FileTool, tmp_path: Path) -> None:
