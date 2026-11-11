@@ -9,15 +9,10 @@ from app.models.enums import ToolCallStatus
 from app.models.goal import SuccessCriterion
 from app.models.records import ToolCallRecord
 from app.models.state import ExecutionState
+from app.tools.capabilities import CAPABILITIES
 
 # (tool_name, operation) pairs that change world state and must be proven done.
-MUTATING_OPERATIONS: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("company_api", "create_ticket"),
-        ("company_api", "update_employee"),
-        ("file", "write"),
-    }
-)
+MUTATING_OPERATIONS: frozenset[tuple[str, str]] = CAPABILITIES.mutating_keys()
 
 
 def ticket_id_from_call(call: ToolCallRecord) -> str | None:

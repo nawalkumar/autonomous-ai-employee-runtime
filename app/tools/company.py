@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.models.enums import FailureType
 from app.tools.base import BaseTool, RiskLevel
+from app.tools.capabilities import CAPABILITIES, operation_of
 from app.tools.failures import FailureInjector
 from app.tools.result import ToolResult
 from app.world.models import TicketPriority
@@ -25,8 +26,6 @@ CompanyOperation = Literal[
     "create_ticket",
     "get_ticket",
 ]
-
-_WRITE_OPS = frozenset({"update_employee", "create_ticket"})
 
 
 def _write_result(
@@ -94,18 +93,6 @@ class CompanyAPIArgs(BaseModel):
         return self
 
 
-_RETRY_SAFE_OPS = frozenset(
-    {
-        "get_employee",
-        "find_customer",
-        "get_ticket",
-        # Write ops are retry-safe for pre-mutation injected transient failures.
-        "create_ticket",
-        "update_employee",
-    }
-)
-
-
 class CompanyAPITool(BaseTool):
     name = "company_api"
     description = (
@@ -124,27 +111,18 @@ class CompanyAPITool(BaseTool):
         self.failure_injector = failure_injector or FailureInjector()
 
     def risk_for(self, operation: CompanyOperation) -> RiskLevel:
-        return RiskLevel.WRITE if operation in _WRITE_OPS else RiskLevel.READ
+        """Raises UnknownCapabilityError for an unregistered operation."""
+        return CAPABILITIES.require(self.name, operation).risk
 
     def is_retry_safe(self, args: BaseModel | dict[str, Any] | None = None) -> bool:
-        if args is None:
-            return False
-        if isinstance(args, dict):
-            operation = args.get("operation")
-        else:
-            operation = getattr(args, "operation", None)
-        return operation in _RETRY_SAFE_OPS
+        capability = CAPABILITIES.find(self.name, operation_of(args))
+        return capability is not None and capability.retry_safe
 
     def metadata(self) -> dict[str, Any]:
         meta = super().metadata()
-        meta["operations"] = {
-            "get_employee": RiskLevel.READ.value,
-            "update_employee": RiskLevel.WRITE.value,
-            "find_customer": RiskLevel.READ.value,
-            "create_ticket": RiskLevel.WRITE.value,
-            "get_ticket": RiskLevel.READ.value,
-        }
-        meta["retry_safe_operations"] = sorted(_RETRY_SAFE_OPS)
+        capabilities = CAPABILITIES.for_tool(self.name)
+        meta["operations"] = {c.operation: c.risk.value for c in capabilities}
+        meta["retry_safe_operations"] = sorted(c.operation for c in capabilities if c.retry_safe)
         return meta
 
     def execute(

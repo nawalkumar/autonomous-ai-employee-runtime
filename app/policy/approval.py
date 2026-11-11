@@ -6,15 +6,17 @@ from typing import Any
 
 from app.policy.decisions import PolicyDecision
 from app.tools.base import BaseTool, RiskLevel
-
-# Explicit high-risk operations that always require human approval.
-_APPROVAL_REQUIRED: set[tuple[str, str]] = {
-    ("company_api", "update_employee"),
-}
+from app.tools.capabilities import CAPABILITIES
 
 
 class ApprovalPolicy:
-    """Decide whether a planned tool invocation requires human approval."""
+    """Decide whether a planned tool invocation requires human approval.
+
+    Operations that always need approval are declared in the capability
+    registry. Otherwise the tool's per-operation risk applies; tools raise for
+    unregistered operations, which then fall back to the tool's own (write)
+    risk level instead of being treated as reads.
+    """
 
     def evaluate(
         self,
@@ -24,15 +26,14 @@ class ApprovalPolicy:
         tool: BaseTool | None = None,
     ) -> PolicyDecision:
         operation = arguments.get("operation")
-        if isinstance(operation, str):
-            key = (tool_name, operation)
-            if key in _APPROVAL_REQUIRED:
-                return PolicyDecision(
-                    requires_approval=True,
-                    reason="Employee record mutation requires human approval.",
-                    risk=RiskLevel.WRITE,
-                    operation=operation,
-                )
+        capability = CAPABILITIES.find(tool_name, operation)
+        if capability is not None and capability.requires_approval:
+            return PolicyDecision(
+                requires_approval=True,
+                reason=capability.approval_reason or "This operation requires human approval.",
+                risk=capability.risk,
+                operation=operation,
+            )
 
         risk = RiskLevel.WRITE
         if tool is not None:
