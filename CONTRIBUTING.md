@@ -29,6 +29,7 @@ app/runtime/locking.py  per-task OS locks shared by the CLI and the API
 app/llm/mock.py         strict mock interpreter/planner (two goal formats)
 app/planning/           goal interpretation, planning, plan validation
 app/runtime/executor.py task lifecycle, approval gate, bounded retry, crash resume
+app/tools/capabilities.py  per-operation metadata: risk, approval, retry safety, verification
 app/policy/             which tool operations need human approval
 app/tools/              company API tool (idempotent writes), sandboxed file tool
 app/verify/             independent outcome verification against real state

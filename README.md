@@ -21,6 +21,7 @@ SQLite database and per-task locks. All company data is fictional.
 - [Dashboard](#dashboard)
 - [CLI walkthrough](#cli-walkthrough)
 - [HTTP API](#http-api)
+- [Capability registry](#capability-registry)
 - [Local mode and public demo mode](#local-mode-and-public-demo-mode)
 - [Security model](#security-model)
 - [Configuration](#configuration)
@@ -44,6 +45,20 @@ SQLite database and per-task locks. All company data is fictional.
   sandboxes of fictional data on ephemeral storage), plus a Render Free Blueprint.
 - Approval events record the approver (`local-dashboard`, `demo-session:<id>`, or
   `cli:<user>`).
+
+### Unreleased (v0.3.0 development)
+
+Safety hardening and an operation-level capability registry. These change no supported
+goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
+
+- `update_employee` rejects unsupported fields, empty updates and non-string or blank
+  values with `invalid_args` instead of silently ignoring them; nothing is written.
+- Verification fails criteria it cannot evaluate (`unsupported_criterion`), and a task
+  with nothing to verify is reported as `unverified` instead of `passed`.
+- Approvals are bound to a fingerprint of the exact action; if the action changes, the
+  approval is invalidated and a fresh one is requested (`stale_approval`).
+- Operation metadata (risk, approval, retry safety, idempotency, verification strategy)
+  lives in one registry, discoverable at `GET /api/v1/capabilities`.
 
 ## Platform support
 
@@ -219,14 +234,15 @@ or filesystem paths. In local mode interactive docs are at `/docs`.
 |--------|------|---------|
 | GET | `/health`, `/api/v1/health` | Liveness; v1 also returns mode, version, persistence and a per-process `boot_id` |
 | GET | `/api/v1/scenarios` | The supported goals |
+| GET | `/api/v1/capabilities` | Registered tool operations and their metadata ([below](#capability-registry)) |
 | GET / POST | `/api/v1/session` | Session status; start a public demo session |
 | POST | `/api/v1/tasks` | Plan and start a goal: `{"goal": "...", "inject_failure": "create_ticket"}` (injection optional) |
 | GET | `/api/v1/tasks` | Persisted tasks, newest first (`limit`, `offset`) |
 | GET | `/api/v1/tasks/{task_id}` | Task state: plan, tool calls, retries, failures, pending action, verification summary |
 | GET | `/api/v1/tasks/{task_id}/history` | Audit events in order |
 | GET | `/api/v1/tasks/{task_id}/verification` | Checks, failure reasons and evidence |
-| POST | `/api/v1/tasks/{task_id}/approve` | `{"step_id": "step_1", "confirm": true}` |
-| POST | `/api/v1/tasks/{task_id}/reject` | `{"step_id": "step_1", "reason": "...", "confirm": true}` |
+| POST | `/api/v1/tasks/{task_id}/approve` | `{"step_id": "step_1", "confirm": true}`, optionally `"fingerprint": "sha256:..."` |
+| POST | `/api/v1/tasks/{task_id}/reject` | `{"step_id": "step_1", "reason": "...", "confirm": true}`, optionally `"fingerprint"` |
 | POST | `/api/v1/tasks/{task_id}/resume` | `{"confirm": true}` for a queued or interrupted task |
 | GET | `/api/v1/company/employees`, `/customers`, `/tickets` | Mock company data (read-only) |
 | GET | `/api/v1/workspace/files`, `/api/v1/workspace/file?path=...` | Workspace files (read-only; only listed files can be read) |
@@ -240,12 +256,75 @@ Behaviour worth knowing:
   repeating it returns the same task (`200`); reusing it for a different body is `409`.
 - Approve, reject and resume take the task's lock (waiting up to 2 s). Concurrent or
   repeated approvals execute the write once; the others get `409`.
+- `pending_action.fingerprint` identifies the exact action awaiting approval (tool,
+  operation and canonical arguments). Sending it with approve or reject is optional; if
+  it does not match the pending action, nothing changes and the response is
+  `409 stale_approval`. Approve also returns `409 stale_approval` when the planned step
+  no longer matches the pending action; the server then records `approval.invalidated`
+  and requests a fresh approval for the current action. The dashboard always sends the
+  fingerprint it displayed.
+- `verification_status` is `pending`, `passed`, `failed` or `unverified`. `unverified`
+  means the task completed but had no outcome to check independently (for example a
+  read-only plan); it is never reported as `passed`.
 - Mutating requests must be `application/json`, at most 8 KiB, and same-origin.
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/health
 curl -s -X POST http://127.0.0.1:8000/api/v1/tasks -H 'Content-Type: application/json' -H 'Idempotency-Key: example-0001' -d '{"goal": "Update employee E-17 title to Senior Engineer."}'
+curl -s http://127.0.0.1:8000/api/v1/capabilities
 ```
+
+## Capability registry
+
+`app/tools/capabilities.py` holds one immutable `Capability` per registered tool
+operation. It is the single source of operation metadata: the approval policy, the
+tools' risk and retry-safety answers, the planner's tool catalog and the verifier's
+"mutating operation" set all read from it. The verifier still performs every
+independent check itself; a capability only names which strategy applies.
+
+Each capability declares:
+
+| Field | Meaning |
+|-------|---------|
+| `tool`, `operation`, `description` | Identity and a human-readable summary |
+| `input_schema` | JSON schema for this operation, derived from the tool's argument model (required inputs, at-least-one-of inputs, constraints) |
+| `output_schema` | JSON schema of the result data (checked against real tool results in tests) |
+| `risk` | `read` or `write` (`destructive` is reserved; no operation uses it) |
+| `requires_approval`, `approval_reason` | Whether the policy gate pauses before the operation |
+| `retry_safe` | Whether a transient failure may be retried within the per-step budget |
+| `idempotency` | `not_required` (reads), `keyed_transaction` (company writes keyed by `task_id:step_id` in the same SQLite transaction), `deterministic_overwrite` (file writes) |
+| `mutates` | `none`, `company` or `workspace` |
+| `verification` | `none`, `employee_fields`, `ticket_record` or `file_content` |
+| `preconditions` | Human-readable conditions the tool enforces |
+
+The eight registered operations:
+
+| Operation | Risk | Approval | Retry-safe | Idempotency | Mutates | Verification |
+|-----------|------|----------|------------|-------------|---------|--------------|
+| `company_api.get_employee` | read | no | yes | not_required | none | none |
+| `company_api.update_employee` | write | **yes** | yes | keyed_transaction | company | employee_fields |
+| `company_api.find_customer` | read | no | yes | not_required | none | none |
+| `company_api.create_ticket` | write | no | yes | keyed_transaction | company | ticket_record |
+| `company_api.get_ticket` | read | no | yes | not_required | none | none |
+| `file.read` | read | no | yes | not_required | none | none |
+| `file.write` | write | no | yes | deterministic_overwrite | workspace | file_content |
+| `file.list` | read | no | yes | not_required | none | none |
+
+An operation that is not registered has no capability and therefore no permissions:
+it is never classified as a read, never retry-safe, rejected by plan validation and by
+the tool's argument schema, and absent from discovery.
+
+`GET /api/v1/capabilities` returns `{"schema_version": "1", "capabilities": [...]}` with
+the fields above for the operations of the tools the runtime registers, in the order
+shown. The response is static: it is built from the tools' argument models, not from
+tool instances or settings, so it contains no filesystem paths, secrets, configuration
+or task data. Like `/api/v1/scenarios` it needs no demo session, and the `Host`
+allowlist and rate limits apply.
+
+**What it is not:** the registry describes the existing deterministic runtime. The mock
+planner still accepts only its two goal formats. LLM-based planning, new business
+operations, dynamic tool selection and replanning are planned future work and are not
+implemented.
 
 ## Local mode and public demo mode
 
@@ -271,7 +350,11 @@ Enforced on the server, in both modes:
 - Tasks come only from goals accepted by the strict mock grammar. There is no endpoint
   that runs a tool, plan, shell command or file write directly.
 - The approval policy pauses `company_api.update_employee` (and any destructive tool)
-  before it runs. Approval requires `confirm: true` and the exact pending `step_id`.
+  before it runs. Approval requires `confirm: true` and the exact pending `step_id`, and
+  is bound to a fingerprint of the exact action; it is re-checked immediately before
+  every tool call, so a changed action is never executed on an old approval.
+- Only operations in the capability registry have permissions; anything else is
+  rejected before it can run.
 - Workspace reads accept only plain relative names that the sandboxed file tool lists;
   traversal, absolute paths, escaping symlinks and database files are refused.
 - The `Host` header must be on the allowlist (blocks DNS rebinding of the localhost
@@ -409,11 +492,15 @@ Goal → mock interpreter (strict grammar) → plan validated against the tool r
      → independent verification of database + workspace → COMPLETED / FAILED
 ```
 
-- **Human-in-the-loop:** the pending action is persisted, so approval works across
-  restarts and processes. Approving twice, or after a rejection, is refused.
+- **Human-in-the-loop:** the pending action and its fingerprint are persisted, so
+  approval works across restarts and processes. Approving twice, after a rejection, or
+  for an action that has since changed is refused. Tasks persisted before fingerprints
+  existed are bound to the arguments recorded on their pending action.
 - **Independent verification:** completion is never based on tool responses alone. The
   verifier checks the requested and planned outcomes against the actual database and
-  files, and a task cannot complete while any step is unfinished.
+  files, and a task cannot complete while any step is unfinished. A criterion the
+  verifier cannot evaluate fails as `unsupported_criterion`; a task with no outcome to
+  check completes as `unverified`.
 - **Recovery:** failures are classified; only transient failures of retry-safe
   operations are retried, within the per-step budget.
 - **Idempotency:** company writes are recorded with a `task_id:step_id` key in the same
@@ -452,7 +539,7 @@ app/
   planning/   # goal interpreter, planner, plan validation
   runtime/    # ExecutionRuntime, recovery, audit event types, shared task locks
   policy/     # approval policy
-  tools/      # company API tool, file tool, registry, failure injection
+  tools/      # company API and file tools, capability registry, tool registry, failure injection
   verify/     # independent outcome verifier
   store/      # SQLite task state and audit events
   world/      # mock company database and seed data
