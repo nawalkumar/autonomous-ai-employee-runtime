@@ -92,7 +92,13 @@ def test_requests_without_a_session_are_refused(app, settings: Settings) -> None
     assert list(Path(settings.public_root).iterdir()) == []
 
 
-META_ROUTES = {"/health", "/api/v1/health", "/api/v1/scenarios", "/api/v1/session"}
+META_ROUTES = {
+    "/health",
+    "/api/v1/health",
+    "/api/v1/scenarios",
+    "/api/v1/capabilities",
+    "/api/v1/session",
+}
 EXPECTED_ROUTES = META_ROUTES | {
     "/api/v1/tasks",
     "/api/v1/tasks/{task_id}",

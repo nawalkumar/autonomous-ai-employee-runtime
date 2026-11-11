@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime
 from typing import Annotated
 
@@ -20,6 +21,8 @@ from app.api.errors import ApiError
 from app.api.schemas import (
     TASK_ID_PATTERN,
     ApproveRequest,
+    CapabilitiesResponse,
+    CapabilityOut,
     CustomersResponse,
     EmployeesResponse,
     ErrorResponse,
@@ -41,9 +44,11 @@ from app.api.schemas import (
 )
 from app.api.service import IDEMPOTENCY_KEY, TaskService, Tenant
 from app.api.sessions import SESSION_COOKIE, SessionManager
+from app.cli import RUNTIME_TOOLS
 from app.config import Settings
 from app.llm.mock import SUPPORTED_GOALS
 from app.planning import InterpretationError, PlanningError
+from app.tools.capabilities import CAPABILITIES
 
 LOCAL_APPROVER = "local-dashboard"
 
@@ -169,6 +174,23 @@ def scenarios(ctx: Ctx) -> ScenariosResponse:
         supported_formats=list(SUPPORTED_GOALS),
         failure_injection_enabled=ctx.settings.allow_failure_injection,
     )
+
+
+@lru_cache(maxsize=1)
+def _capabilities() -> CapabilitiesResponse:
+    # Static metadata: registered operations only, built from the tools'
+    # argument models (classes), never from tool instances or settings, so no
+    # paths, secrets or per-tenant state can appear in it.
+    described = CAPABILITIES.describe({tool.name: tool.args_schema for tool in RUNTIME_TOOLS})
+    return CapabilitiesResponse(
+        schema_version="1",
+        capabilities=[CapabilityOut(**item) for item in described],
+    )
+
+
+@router.get("/capabilities", response_model=CapabilitiesResponse, tags=["meta"])
+def capabilities() -> CapabilitiesResponse:
+    return _capabilities()
 
 
 def _session_response(ctx: AppContext, current: Tenant | None) -> SessionResponse:

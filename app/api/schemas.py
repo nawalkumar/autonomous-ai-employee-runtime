@@ -84,6 +84,27 @@ class ScenariosResponse(BaseModel):
     failure_injection_enabled: bool
 
 
+class CapabilityOut(BaseModel):
+    tool: str
+    operation: str
+    description: str
+    risk: Literal["read", "write", "destructive"]
+    requires_approval: bool
+    approval_reason: str | None
+    retry_safe: bool
+    idempotency: Literal["not_required", "keyed_transaction", "deterministic_overwrite"]
+    mutates: Literal["none", "company", "workspace"]
+    verification: Literal["none", "employee_fields", "ticket_record", "file_content"]
+    preconditions: list[str]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+
+
+class CapabilitiesResponse(BaseModel):
+    schema_version: Literal["1"]
+    capabilities: list[CapabilityOut]
+
+
 class SessionResponse(BaseModel):
     mode: Literal["local", "public"]
     authenticated: bool

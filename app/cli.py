@@ -46,7 +46,7 @@ from app.planning import InterpretationError, PlanningError, PlanningPipeline
 from app.runtime import ApprovalError, ExecutionRuntime, pending_fingerprint
 from app.runtime.locking import LOCK_BACKEND, LockBusyError, TaskLock  # noqa: F401
 from app.store import SQLiteStore
-from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
+from app.tools import BaseTool, CompanyAPITool, FailureInjector, FileTool, ToolRegistry
 from app.world import CompanyRepository
 
 EXIT_OK = 0
@@ -151,6 +151,10 @@ def _require_writable_file(path: Path, label: str) -> None:
             f"{path}",
             EXIT_USAGE,
         )
+
+
+# Tool classes that build_runtime registers; capability discovery lists only these.
+RUNTIME_TOOLS: tuple[type[BaseTool], ...] = (CompanyAPITool, FileTool)
 
 
 def build_runtime(settings: Settings) -> CliRuntime:
