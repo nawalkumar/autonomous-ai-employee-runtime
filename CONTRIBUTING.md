@@ -27,7 +27,9 @@ app/main.py, app/api/   HTTP API v1, request guard, public-demo sessions
 app/web/                live dashboard (static HTML/CSS/JS served by the API)
 app/runtime/locking.py  per-task OS locks shared by the CLI and the API
 app/llm/mock.py         strict mock interpreter/planner (two goal formats)
-app/planning/           goal interpretation, planning, plan validation
+app/planning/           goal interpretation, planning, plan validation (incl. $ref checks)
+app/models/references.py  typed step-output reference syntax and path reads
+app/runtime/binding.py  resolve $ref arguments before approval and each attempt
 app/runtime/executor.py task lifecycle, approval gate, bounded retry, crash resume
 app/tools/capabilities.py  per-operation metadata: risk, approval, retry safety, verification
 app/policy/             which tool operations need human approval

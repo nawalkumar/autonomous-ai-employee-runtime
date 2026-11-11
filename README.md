@@ -22,6 +22,7 @@ SQLite database and per-task locks. All company data is fictional.
 - [CLI walkthrough](#cli-walkthrough)
 - [HTTP API](#http-api)
 - [Capability registry](#capability-registry)
+- [Step-output references](#step-output-references)
 - [Company data model and demo company](#company-data-model-and-demo-company)
 - [Local mode and public demo mode](#local-mode-and-public-demo-mode)
 - [Security model](#security-model)
@@ -65,6 +66,10 @@ goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
   schema migration, and a separately seeded demo company
   ([details](#company-data-model-and-demo-company)). They are available to explicit
   plans; the mock planner's two goal formats are unchanged.
+- Explicit plans may bind later steps to earlier tool outputs with typed
+  [`$ref`](#step-output-references) objects. Resolution happens before approval and
+  invocation; approval fingerprints and verification use the concrete resolved
+  arguments. The mock planner still emits only literal plans.
 
 ## Platform support
 
@@ -339,8 +344,115 @@ allowlist and rate limits apply.
 
 **What it is not:** the registry describes the existing deterministic runtime. The mock
 planner still accepts only its two goal formats. LLM-based planning, dynamic tool
-selection, step-output references and replanning are planned future work and are not
-implemented.
+selection and replanning are planned future work and are not implemented. Step-output
+references (below) are for explicit plans only.
+
+## Step-output references
+
+Later plan steps can consume earlier tool results with an explicit typed reference
+object. There is no string templating, JSONPath, expression language or iteration.
+
+### Syntax
+
+Anywhere inside a step's `arguments` except the `operation` key:
+
+```json
+{
+  "$ref": {
+    "step_id": "create_customer",
+    "path": ["customer", "customer_id"]
+  }
+}
+```
+
+- The object has exactly one key, `$ref`. Its value has exactly `step_id` and `path`.
+  Any other shape that contains `$ref` is rejected, so `$ref` is reserved as a
+  dictionary key in arguments.
+- `path` addresses the producer step's successful tool result `data`: 1–8 segments.
+  Each segment is either an identifier (`[A-Za-z][A-Za-z0-9_]{0,63}`, never starting
+  with `_`) for a dictionary key, or an integer `0`–`99` for a list index.
+- Strings are never interpreted: `"$ref"` or `"{{step_1.customer}}"` stay literal text.
+- The substituted value keeps its JSON type (string, number, object, array, boolean).
+
+### Example (customer → welcome ticket)
+
+```json
+[
+  {
+    "step_id": "create_customer",
+    "tool_name": "company_api",
+    "arguments": {
+      "operation": "create_customer",
+      "name": "Iris Novak",
+      "company": "Lumen Studios",
+      "email": "iris@lumen.example"
+    }
+  },
+  {
+    "step_id": "welcome",
+    "tool_name": "company_api",
+    "arguments": {
+      "operation": "create_ticket",
+      "customer_id": {
+        "$ref": { "step_id": "create_customer", "path": ["customer", "customer_id"] }
+      },
+      "subject": "Welcome to CentrAlign",
+      "description": "Onboarding call and account setup.",
+      "priority": "low"
+    }
+  }
+]
+```
+
+`create_customer` still pauses for approval. After it succeeds, the runtime reads the
+persisted `customer.customer_id` and runs `create_ticket` with that concrete value. The
+plan itself is never rewritten.
+
+### Static validation
+
+At plan creation the validator rejects missing / forward / self references, circular
+dependencies, malformed paths, `$ref` on `operation`, and destinations whose input
+schema cannot accept the producer capability's declared output type when that type is
+known. When the output schema is free-form, type checks are deferred to execution.
+Literal-only plans (including both mock-planner scenarios) are unchanged.
+
+### Runtime resolution
+
+Before the approval gate and before every tool attempt (including retries):
+
+1. Load the step's declared arguments (with any `$ref` objects still in place).
+2. Resolve each reference from exactly one successful tool call of a completed earlier
+   step. Failed, pending, interrupted or missing outputs are typed failures
+   (`missing_info` / `invalid_args` / `environment_unexpected`); null and empty strings
+   are never substituted.
+3. Validate the fully resolved arguments against the tool's argument schema.
+4. Persist the resolved arguments (and a description of which references were used) on
+   the tool-call record. The original plan stays immutable.
+
+### Approval, fingerprints and idempotency
+
+- Approval is evaluated on resolved arguments. The pending-action fingerprint covers
+  the exact tool and resolved arguments the human saw.
+- If a re-resolve would change the action (for example after a producer output was
+  altered), a stale approval is replaced and a changed prior attempt refuses to reuse
+  the step's `task_id:step_id` idempotency key.
+- Retries and crash recovery keep the same key and the same resolved arguments when
+  producer outputs are unchanged.
+
+### Verification
+
+For mutating steps that used references, the verifier checks that the world change
+matches the resolved arguments (for example the ticket's `customer_id` is the one
+produced by the earlier step) and that required approval covered that exact action.
+Unsupported criteria still fail; read-only tasks remain `unverified`.
+
+### Limits
+
+- Explicit plans only; the mock planner does not emit references.
+- No generic iteration over a listing (W6 still needs the caller to pick concrete
+  tickets).
+- No filesystem, environment, private-attribute or code access through paths.
+- No public HTTP endpoint for submitting arbitrary plans.
 
 ## Company data model and demo company
 
@@ -447,15 +559,16 @@ mock goals work on it.
 | W3 Transfer an employee between departments | Operations supported | Explicit `update_employee` plan with approval | Natural-language planning |
 | W4 Correct an employee email | Operations supported | Explicit plan; a duplicate email fails with no change | Natural-language planning |
 | W5 Resolve or close a ticket | Operations supported | Allowed transitions; closing paused for approval | Natural-language planning |
-| W6 Escalate matching customer tickets | Partial | `list_tickets` and per-ticket `update_ticket` | Iterating over a listing's output |
+| W6 Escalate matching customer tickets | Partial | `list_tickets` and per-ticket `update_ticket`; `$ref` can bind one listed ticket | Generic iteration over a listing's output |
 | W7 Assign a ticket to a support engineer | Operations supported | Eligibility rules enforced and verified | Natural-language planning |
-| W8 Create a customer and welcome ticket | Partial | `create_customer` (approval) and `create_ticket` | Passing the new customer ID to the next step |
+| W8 Create a customer and welcome ticket | Supported (explicit plan) | `$ref` binds the new `customer_id` into `create_ticket`; approval and verification | Natural-language planning |
 | W9 Produce a daily ticket summary | Partial | Counts match an independent recount; summary file verified | Writing content derived from a listing |
 | W10 Deactivate an employee safely | Partial | Refusal with open tickets; reassign, then deactivate with approval | Finding and reassigning blocking tickets automatically |
 
-In the partial workflows the test passes earlier results to later steps itself; the
-runtime has no step-output references yet. There is no natural-language handler for
-W3–W10.
+W8 is covered end-to-end by `tests/test_reference_execution.py` (demo fixture and fresh
+DB). Other partial workflows may still pass earlier results between steps in the test
+harness when the scenario needs iteration the runtime does not provide. There is no
+natural-language handler for W3–W10.
 
 ## Local mode and public demo mode
 
@@ -619,10 +732,13 @@ one instance.
 
 ```text
 Goal → mock interpreter (strict grammar) → plan validated against the tool registry
-     → policy gate (approval for employee writes) → tool calls with bounded retry
+     → resolve $ref arguments from earlier step outputs (explicit plans)
+     → policy gate (approval for sensitive writes) → tool calls with bounded retry
      → independent verification of database + workspace → COMPLETED / FAILED
 ```
 
+- **Step-output references:** explicit plans may declare `$ref` bindings; they are
+  resolved before approval and every attempt. See [Step-output references](#step-output-references).
 - **Human-in-the-loop:** the pending action and its fingerprint are persisted, so
   approval works across restarts and processes. Approving twice, after a rejection, or
   for an action that has since changed is refused. Tasks persisted before fingerprints
