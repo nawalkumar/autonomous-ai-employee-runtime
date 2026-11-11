@@ -198,8 +198,12 @@ class ExecutionRuntime:
 
         return self._execute_step(state, step_index)
 
-    def approve_task(self, task_id: str) -> ExecutionState:
-        """Approve the pending action and resume execution from that step."""
+    def approve_task(self, task_id: str, *, approver: str | None = None) -> ExecutionState:
+        """Approve the pending action and resume execution from that step.
+
+        ``approver`` is recorded on the approval event when the caller knows who
+        approved (for example an authenticated dashboard session).
+        """
         state = self.load(task_id)
         if (
             state.final_status is not TaskStatus.NEEDS_APPROVAL
@@ -229,13 +233,20 @@ class ExecutionRuntime:
                 result={
                     "step_id": pending.step_id,
                     "risk": pending.risk,
+                    **({"approver": approver} if approver else {}),
                 },
                 actor=Actor.HUMAN,
             )
         )
         return self.run(task_id)
 
-    def reject_task(self, task_id: str, reason: str = "Rejected by human") -> ExecutionState:
+    def reject_task(
+        self,
+        task_id: str,
+        reason: str = "Rejected by human",
+        *,
+        approver: str | None = None,
+    ) -> ExecutionState:
         """Reject the pending action and terminate without executing the tool."""
         state = self.load(task_id)
         if (
@@ -268,6 +279,7 @@ class ExecutionRuntime:
                     "step_id": pending.step_id,
                     "risk": pending.risk,
                     "reason": reason,
+                    **({"approver": approver} if approver else {}),
                 },
                 actor=Actor.HUMAN,
             )
