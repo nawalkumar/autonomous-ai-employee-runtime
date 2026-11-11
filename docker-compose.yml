@@ -8,13 +8,15 @@ services:
     # Same UID/GID as the host user, so files in ./data and ./workspace stay
     # owned by that user. Create both directories before the first run.
     user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    # Local mode: published on the loopback interface only.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     env_file:
       - path: .env
         required: false
     environment:
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      APP_MODE: local
     volumes:
       - ./workspace:/app/workspace
       - ./data:/app/data

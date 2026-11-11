@@ -1,9 +1,11 @@
 .git
+.github
 .venv
 __pycache__
 .pytest_cache
 *.pyc
 .env
+.env.*
 *.db
 *.sqlite
 *.sqlite3
@@ -11,6 +13,9 @@ tests
 workspace/*
 !workspace/.gitkeep
 data
+dist
+demo-ui
 .dockerignore
 Dockerfile
 docker-compose.yml
+render.yaml

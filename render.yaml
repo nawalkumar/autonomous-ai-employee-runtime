@@ -1,0 +1,30 @@
+# Render Blueprint for the public demo (Render Free web service).
+#
+# Public demo mode keeps every browser session in its own sandbox of fictional
+# data on the instance's ephemeral disk. Render Free spins the service down after
+# 15 idle minutes and may restart it at any time; each restart erases all demo
+# state, and the dashboard reports that instead of showing old results.
+services:
+  - type: web
+    name: autonomous-ai-employee-demo
+    runtime: docker
+    plan: free # must be explicit: the Blueprint default is a paid plan
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    autoDeployTrigger: "off"
+    envVars:
+      - key: APP_MODE
+        value: public
+      - key: PORT
+        value: 10000
+      - key: LLM_PROVIDER
+        value: mock
+      # Render's proxy appends the client address to X-Forwarded-For.
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      - key: LOG_LEVEL
+        value: info
+      # Optional. When set, visitors need this code to start a demo session.
+      # Share it out of band; it is never sent to the browser.
+      - key: PUBLIC_ACCESS_CODE
+        sync: false
