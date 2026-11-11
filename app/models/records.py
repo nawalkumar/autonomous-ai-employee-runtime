@@ -78,5 +78,9 @@ class PendingAction(BaseModel):
     idempotency_key: str | None = None
     reason: str | None = None
     risk: str = "write"
+    # sha256 of tool, operation and canonical arguments (see
+    # app.runtime.transitions.action_fingerprint). None on records persisted
+    # before v0.3.0; those are bound to their recorded arguments instead.
+    fingerprint: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     resolved_at: datetime | None = None

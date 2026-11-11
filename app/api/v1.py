@@ -313,14 +313,14 @@ def task_verification(task_id: TaskId, ctx: Ctx, current: CurrentTenant) -> Veri
 def approve_task(
     task_id: TaskId, body: ApproveRequest, ctx: Ctx, current: CurrentTenant
 ) -> TaskDetail:
-    return ctx.service.approve(current, task_id, body.step_id)
+    return ctx.service.approve(current, task_id, body.step_id, body.fingerprint)
 
 
 @router.post("/tasks/{task_id}/reject", response_model=TaskDetail, tags=["approval"])
 def reject_task(
     task_id: TaskId, body: RejectRequest, ctx: Ctx, current: CurrentTenant
 ) -> TaskDetail:
-    return ctx.service.reject(current, task_id, body.step_id, body.reason)
+    return ctx.service.reject(current, task_id, body.step_id, body.reason, body.fingerprint)
 
 
 @router.post("/tasks/{task_id}/resume", response_model=TaskDetail, tags=["tasks"])

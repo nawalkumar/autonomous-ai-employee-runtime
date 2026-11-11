@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 STEP_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
+FINGERPRINT_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
 class _Strict(BaseModel):
@@ -27,12 +28,15 @@ class TaskCreateRequest(_Strict):
 class ApproveRequest(_Strict):
     step_id: str = Field(pattern=STEP_ID_PATTERN)
     confirm: Literal[True]
+    # Optional: the pending action's fingerprint as shown to the approver.
+    fingerprint: str | None = Field(default=None, pattern=FINGERPRINT_PATTERN)
 
 
 class RejectRequest(_Strict):
     step_id: str = Field(pattern=STEP_ID_PATTERN)
     reason: str = Field(default="Rejected via dashboard", min_length=1, max_length=300)
     confirm: Literal[True]
+    fingerprint: str | None = Field(default=None, pattern=FINGERPRINT_PATTERN)
 
 
 class ResumeRequest(_Strict):
@@ -138,6 +142,7 @@ class PendingActionOut(BaseModel):
     arguments: dict[str, Any]
     risk: str
     reason: str | None
+    fingerprint: str
     created_at: datetime
 
 

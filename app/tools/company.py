@@ -11,7 +11,12 @@ from app.tools.base import BaseTool, RiskLevel
 from app.tools.failures import FailureInjector
 from app.tools.result import ToolResult
 from app.world.models import TicketPriority
-from app.world.repository import CompanyRepository, IdempotencyConflictError
+from app.world.repository import (
+    CompanyRepository,
+    IdempotencyConflictError,
+    InvalidEmployeeUpdateError,
+    validate_employee_update,
+)
 
 CompanyOperation = Literal[
     "get_employee",
@@ -70,6 +75,7 @@ class CompanyAPIArgs(BaseModel):
                 raise ValueError("employee_id is required for update_employee")
             if not self.fields:
                 raise ValueError("fields is required for update_employee")
+            validate_employee_update(self.fields)
         if op == "find_customer" and not any(
             [self.customer_id, self.company, self.email]
         ):
@@ -186,7 +192,7 @@ class CompanyAPITool(BaseTool):
             updated, replayed = self.repository.update_employee_idempotent(
                 args.employee_id or "", args.fields, idempotency_key=idempotency_key
             )
-        except IdempotencyConflictError as exc:
+        except (IdempotencyConflictError, InvalidEmployeeUpdateError) as exc:
             return ToolResult.failure(FailureType.INVALID_ARGS.value, str(exc))
         if updated is None:
             return ToolResult.failure(

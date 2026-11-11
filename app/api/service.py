@@ -58,7 +58,7 @@ from app.models.ids import new_id
 from app.models.records import PendingAction
 from app.models.state import ExecutionState
 from app.planning.pipeline import PlanningResult
-from app.runtime import ApprovalError
+from app.runtime import ApprovalError, StaleApprovalError, pending_fingerprint
 from app.runtime.locking import LockBusyError, TaskLock, hold_task_lock
 from app.runtime.transitions import make_event
 
@@ -370,24 +370,44 @@ class TaskService:
                 "nothing was changed.",
             )
 
-    def approve(self, tenant: Tenant, task_id: str, step_id: str) -> TaskDetail:
+    def approve(
+        self, tenant: Tenant, task_id: str, step_id: str, fingerprint: str | None = None
+    ) -> TaskDetail:
         rt = self.open(tenant)
         self._load(rt, task_id)
         with self._task_lock(rt, task_id):
             self._check_step(self._load(rt, task_id), step_id)
             try:
-                state = rt.runtime.approve_task(task_id, approver=tenant.approver)
+                state = rt.runtime.approve_task(
+                    task_id, approver=tenant.approver, expected_fingerprint=fingerprint
+                )
+            except StaleApprovalError as exc:
+                raise ApiError(409, "stale_approval", str(exc)) from None
             except ApprovalError:
                 raise ApiError(409, "no_pending_approval", "No pending approval.") from None
         return self.detail(tenant, state)
 
-    def reject(self, tenant: Tenant, task_id: str, step_id: str, reason: str) -> TaskDetail:
+    def reject(
+        self,
+        tenant: Tenant,
+        task_id: str,
+        step_id: str,
+        reason: str,
+        fingerprint: str | None = None,
+    ) -> TaskDetail:
         rt = self.open(tenant)
         self._load(rt, task_id)
         with self._task_lock(rt, task_id):
             self._check_step(self._load(rt, task_id), step_id)
             try:
-                state = rt.runtime.reject_task(task_id, reason=reason, approver=tenant.approver)
+                state = rt.runtime.reject_task(
+                    task_id,
+                    reason=reason,
+                    approver=tenant.approver,
+                    expected_fingerprint=fingerprint,
+                )
+            except StaleApprovalError as exc:
+                raise ApiError(409, "stale_approval", str(exc)) from None
             except ApprovalError:
                 raise ApiError(409, "no_pending_approval", "No pending approval.") from None
         return self.detail(tenant, state)
@@ -593,6 +613,7 @@ class TaskService:
                     arguments=self.redact(pending.arguments),
                     risk=pending.risk,
                     reason=pending.reason,
+                    fingerprint=pending_fingerprint(pending),
                     created_at=pending.created_at,
                 )
                 if pending is not None and state.approval_status is ApprovalStatus.PENDING

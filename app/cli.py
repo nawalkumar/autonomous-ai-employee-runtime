@@ -43,7 +43,7 @@ from app.models.enums import ApprovalStatus, FailureType, PlanStepStatus, TaskSt
 from app.models.ids import new_id
 from app.models.state import ExecutionState
 from app.planning import InterpretationError, PlanningError, PlanningPipeline
-from app.runtime import ApprovalError, ExecutionRuntime
+from app.runtime import ApprovalError, ExecutionRuntime, pending_fingerprint
 from app.runtime.locking import LOCK_BACKEND, LockBusyError, TaskLock  # noqa: F401
 from app.store import SQLiteStore
 from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
@@ -425,7 +425,11 @@ def cmd_approve(
             ):
                 raise CliError("Approval declined. Nothing was changed.", EXIT_INVALID_TASK)
         try:
-            state = cli.runtime.approve_task(task_id, approver=_cli_approver())
+            state = cli.runtime.approve_task(
+                task_id,
+                approver=_cli_approver(),
+                expected_fingerprint=pending_fingerprint(state.pending_action),
+            )
         except ApprovalError as exc:
             raise CliError(f"Approval failed: {exc}", EXIT_INVALID_TASK) from None
     _report(out, cli, state)

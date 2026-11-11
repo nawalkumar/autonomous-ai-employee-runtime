@@ -18,6 +18,7 @@ from app.llm.mock import parse_supported_goal
 from app.main import create_app
 from app.planning import PlanningPipeline
 from app.llm import MockLLMClient
+from app.runtime import action_fingerprint
 from app.runtime.locking import hold_task_lock
 from app.runtime.transitions import make_event
 from tests.api_support import (
@@ -137,17 +138,19 @@ def test_employee_goal_requires_approval_and_approve_executes_once(
     paused = paused_employee_task(client, EMPLOYEE_NOTE_GOAL)
     task_id = paused["task_id"]
     pending = paused["pending_action"]
+    arguments = {
+        "operation": "update_employee",
+        "employee_id": "E-17",
+        "fields": {"title": "Senior Engineer"},
+    }
     assert pending == {
         "step_id": "step_1",
         "tool": "company_api",
         "operation": "update_employee",
-        "arguments": {
-            "operation": "update_employee",
-            "employee_id": "E-17",
-            "fields": {"title": "Senior Engineer"},
-        },
+        "arguments": arguments,
         "risk": "write",
         "reason": "Employee record mutation requires human approval.",
+        "fingerprint": action_fingerprint("company_api", arguments),
         "created_at": pending["created_at"],
     }
     assert paused["tool_calls"] == []

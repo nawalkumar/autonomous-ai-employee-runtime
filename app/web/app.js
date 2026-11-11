@@ -194,11 +194,11 @@
     verification: function (id, signal) {
       return request("GET", "/api/v1/tasks/" + encodeURIComponent(id) + "/verification", undefined, { signal: signal });
     },
-    approve: function (id, stepId) {
-      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/approve", { step_id: stepId, confirm: true });
+    approve: function (id, stepId, fingerprint) {
+      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/approve", { step_id: stepId, fingerprint: fingerprint, confirm: true });
     },
-    reject: function (id, stepId, reason) {
-      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/reject", { step_id: stepId, reason: reason, confirm: true });
+    reject: function (id, stepId, reason, fingerprint) {
+      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/reject", { step_id: stepId, reason: reason, fingerprint: fingerprint, confirm: true });
     },
     resume: function (id) {
       return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/resume", { confirm: true });
@@ -629,7 +629,8 @@
       verification += " " + t.verification_checks_passed + "/" + t.verification_checks_total;
     }
     els.mVerify.textContent = verification;
-    els.mVerify.className = "v" + (t.verification_status === "passed" ? " ok" : t.verification_status === "failed" ? " bad" : "");
+    els.mVerify.className =
+      "v" + (t.verification_status === "passed" ? " ok" : t.verification_status === "failed" ? " bad" : t.verification_status === "unverified" ? " warn" : "");
     els.mStatus.textContent = t.status.toUpperCase();
     els.mStatus.className =
       "v" + (t.status === "completed" ? " ok" : t.status === "failed" || t.status === "aborted" ? " bad" : t.status === "needs_approval" ? " warn" : "");
@@ -678,6 +679,10 @@
     } else s.Adapt = TERMINAL[t.status] ? "skipped" : "pending";
     if (c["verification.passed"]) s.Verify = "success";
     else if (c["verification.failed"]) s.Verify = "failure";
+    else if (c["verification.unverified"]) {
+      s.Verify = "warning";
+      labels.Verify = "nothing to verify";
+    }
     else if (c["verification.started"]) s.Verify = "active";
     else s.Verify = TERMINAL[t.status] ? "skipped" : "pending";
     if (t.status === "completed") s.Complete = "success";
@@ -886,7 +891,7 @@
     panel.appendChild(
       el("div", { className: "kv" }, [
         el("div", { className: "k", text: "result" }),
-        el("div", { className: "v " + (v.status === "passed" ? "ok" : "bad"), text: v.status.toUpperCase() + " · " + v.checks_passed + "/" + v.checks_total + " checks", attrs: { "data-field": "verification_result" } }),
+        el("div", { className: "v " + (v.status === "passed" ? "ok" : v.status === "unverified" ? "warn" : "bad"), text: v.status.toUpperCase() + " · " + v.checks_passed + "/" + v.checks_total + " checks", attrs: { "data-field": "verification_result" } }),
         el("div", { className: "k", text: "summary" }),
         el("div", { className: "v", text: str(v.summary) })
       ])
@@ -1010,7 +1015,7 @@
     updateControls();
     setMsg(els.approvalMsg, "Sending approval…");
     try {
-      var res = await api.approve(t.task_id, pending.step_id);
+      var res = await api.approve(t.task_id, pending.step_id, pending.fingerprint);
       afterAction(res.data, "Approved. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
@@ -1041,7 +1046,7 @@
     updateControls();
     setMsg(els.approvalMsg, "Sending rejection…");
     try {
-      var res = await api.reject(t.task_id, pending.step_id, reason);
+      var res = await api.reject(t.task_id, pending.step_id, reason, pending.fingerprint);
       afterAction(res.data, "Rejected. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);

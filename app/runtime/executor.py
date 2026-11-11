@@ -36,9 +36,12 @@ from app.runtime.recovery import (
 )
 from app.runtime.transitions import (
     EventType,
+    action_fingerprint,
     idempotency_key_for,
     make_event,
     observe_tool_result,
+    pending_fingerprint,
+    pending_matches,
 )
 from app.store.sqlite_store import SQLiteStore
 from app.tools.base import BaseTool
@@ -58,6 +61,10 @@ _TERMINAL = {
 
 class ApprovalError(ValueError):
     """Raised for invalid approval/rejection operations."""
+
+
+class StaleApprovalError(ApprovalError):
+    """The approval does not match the exact action that would run."""
 
 
 class ExecutionRuntime:
@@ -198,22 +205,43 @@ class ExecutionRuntime:
 
         return self._execute_step(state, step_index)
 
-    def approve_task(self, task_id: str, *, approver: str | None = None) -> ExecutionState:
+    def approve_task(
+        self,
+        task_id: str,
+        *,
+        approver: str | None = None,
+        expected_fingerprint: str | None = None,
+    ) -> ExecutionState:
         """Approve the pending action and resume execution from that step.
 
         ``approver`` is recorded on the approval event when the caller knows who
         approved (for example an authenticated dashboard session).
+        ``expected_fingerprint`` is the action the approver was shown; approval
+        is refused without changes if the pending action is a different one.
+        If the planned step no longer matches the pending action, the stale
+        request is replaced by a fresh one and StaleApprovalError is raised.
         """
         state = self.load(task_id)
-        if (
-            state.final_status is not TaskStatus.NEEDS_APPROVAL
-            or state.approval_status is not ApprovalStatus.PENDING
-            or state.pending_action is None
-        ):
-            raise ApprovalError("no pending approval")
+        pending = self._require_pending(state, expected_fingerprint)
 
-        pending = state.pending_action.model_copy(
-            update={"resolved_at": utc_now()}
+        located = self._pending_step(state)
+        if located is not None:
+            step_index, step = located
+            tool_name = step.resolved_tool_name() or ""
+            if not pending_matches(pending, tool_name, step.arguments):
+                decision = self.policy.evaluate(
+                    tool_name=tool_name, arguments=dict(step.arguments), tool=self._tool(tool_name)
+                )
+                self._request_approval(
+                    state, step_index, step, tool_name, decision, stale=pending
+                )
+                raise StaleApprovalError(
+                    "The pending action no longer matches the planned step; a new "
+                    "approval was requested for the current action. Nothing was executed."
+                )
+
+        pending = pending.model_copy(
+            update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
         )
         state = state.model_copy(
             update={
@@ -233,6 +261,7 @@ class ExecutionRuntime:
                 result={
                     "step_id": pending.step_id,
                     "risk": pending.risk,
+                    "fingerprint": pending.fingerprint,
                     **({"approver": approver} if approver else {}),
                 },
                 actor=Actor.HUMAN,
@@ -246,18 +275,18 @@ class ExecutionRuntime:
         reason: str = "Rejected by human",
         *,
         approver: str | None = None,
+        expected_fingerprint: str | None = None,
     ) -> ExecutionState:
-        """Reject the pending action and terminate without executing the tool."""
-        state = self.load(task_id)
-        if (
-            state.final_status is not TaskStatus.NEEDS_APPROVAL
-            or state.approval_status is not ApprovalStatus.PENDING
-            or state.pending_action is None
-        ):
-            raise ApprovalError("no pending approval")
+        """Reject the pending action and terminate without executing the tool.
 
-        pending = state.pending_action.model_copy(
-            update={"resolved_at": utc_now()}
+        Rejection never executes anything, so it is allowed for a stale pending
+        action; ``expected_fingerprint`` only guards against rejecting an action
+        other than the one the caller was shown.
+        """
+        state = self.load(task_id)
+        pending = self._require_pending(state, expected_fingerprint)
+        pending = pending.model_copy(
+            update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
         )
         state = state.model_copy(
             update={
@@ -279,12 +308,66 @@ class ExecutionRuntime:
                     "step_id": pending.step_id,
                     "risk": pending.risk,
                     "reason": reason,
+                    "fingerprint": pending.fingerprint,
                     **({"approver": approver} if approver else {}),
                 },
                 actor=Actor.HUMAN,
             )
         )
         return state
+
+    @staticmethod
+    def _require_pending(
+        state: ExecutionState, expected_fingerprint: str | None
+    ) -> PendingAction:
+        if (
+            state.final_status is not TaskStatus.NEEDS_APPROVAL
+            or state.approval_status is not ApprovalStatus.PENDING
+            or state.pending_action is None
+        ):
+            raise ApprovalError("no pending approval")
+        pending = state.pending_action
+        if expected_fingerprint is not None and expected_fingerprint != pending_fingerprint(
+            pending
+        ):
+            raise StaleApprovalError(
+                "The pending action is not the one that was reviewed; nothing was changed."
+            )
+        return pending
+
+    @staticmethod
+    def _pending_step(state: ExecutionState) -> tuple[int, PlanStep] | None:
+        pending = state.pending_action
+        if pending is None:
+            return None
+        for index, step in enumerate(state.plan):
+            if step.step_id == pending.step_id:
+                return index, step
+        return None
+
+    def _tool(self, tool_name: str) -> BaseTool | None:
+        try:
+            return self.registry.get(tool_name)
+        except KeyError:
+            return None
+
+    def _approval_still_valid(
+        self, state: ExecutionState, step: PlanStep, tool_name: str, tool: BaseTool | None
+    ) -> tuple[bool, Any]:
+        """Re-check, immediately before a tool call, that a gated action is approved."""
+        decision = self.policy.evaluate(
+            tool_name=tool_name, arguments=dict(step.arguments), tool=tool
+        )
+        if not decision.requires_approval:
+            return True, decision
+        pending = state.pending_action
+        valid = (
+            state.approval_status is ApprovalStatus.APPROVED
+            and pending is not None
+            and pending.step_id == step.step_id
+            and pending_matches(pending, tool_name, step.arguments)
+        )
+        return valid, decision
 
     def _mark_running(self, state: ExecutionState) -> ExecutionState:
         state = state.model_copy(update={"final_status": TaskStatus.RUNNING}).touch()
@@ -362,6 +445,13 @@ class ExecutionRuntime:
 
         attempt = prior_attempts
         while True:
+            # Immediately before each invocation (retries included): the approved
+            # action must still be exactly the action about to run.
+            approved, decision = self._approval_still_valid(state, step, tool_name, tool)
+            if not approved:
+                return self._request_approval(
+                    state, step_index, step, tool_name, decision, stale=state.pending_action
+                )
             attempt += 1
             key = idempotency_key_for(state.task_id, step.step_id)
             logger.info(
@@ -918,23 +1008,29 @@ class ExecutionRuntime:
             )
 
         if result.passed:
+            verified = result.status is VerificationStatus.PASSED
+            outcome = "verification passed" if verified else "not independently verified"
             summary = (
                 f"Completed {len(state.completed_steps)} plan step(s); "
-                f"verification passed. {result.summary}"
+                f"{outcome}. {result.summary}"
             )
             state = state.model_copy(
                 update={
                     "final_status": TaskStatus.COMPLETED,
                     "completion_summary": summary,
-                    "verification_status": VerificationStatus.PASSED,
+                    "verification_status": result.status,
                 }
             ).touch()
             self._save(state)
             self._emit(
                 make_event(
                     task_id=state.task_id,
-                    event_type=EventType.VERIFICATION_PASSED,
-                    action="verification_passed",
+                    event_type=(
+                        EventType.VERIFICATION_PASSED
+                        if verified
+                        else EventType.VERIFICATION_UNVERIFIED
+                    ),
+                    action="verification_passed" if verified else "verification_unverified",
                     verification_result=result.model_dump(mode="json"),
                     result={"summary": result.summary},
                 )
@@ -947,7 +1043,7 @@ class ExecutionRuntime:
                     result={
                         "completed_steps": state.completed_steps,
                         "summary": summary,
-                        "verification": "passed",
+                        "verification": result.status.value,
                     },
                 )
             )
@@ -1011,25 +1107,70 @@ class ExecutionRuntime:
         if not decision.requires_approval:
             return state
 
-        # Human already approved this exact pending step — allow tool execution.
-        # Keep pending_action until the step succeeds so a crash mid-resume
-        # still remembers the approval and does not re-prompt or re-mutate twice.
-        if (
-            state.approval_status is ApprovalStatus.APPROVED
-            and state.pending_action is not None
-            and state.pending_action.step_id == step.step_id
-            and state.pending_action.tool_name == tool_name
-        ):
-            return state.model_copy(update={"current_step": step_index}).touch()
+        pending = state.pending_action
+        if pending is not None and pending.step_id == step.step_id:
+            # Human already approved this exact action — allow tool execution.
+            # Keep pending_action until the step succeeds so a crash mid-resume
+            # still remembers the approval and does not re-prompt or re-mutate twice.
+            if state.approval_status is ApprovalStatus.APPROVED:
+                if pending_matches(pending, tool_name, step.arguments):
+                    return state.model_copy(update={"current_step": step_index}).touch()
+                return self._request_approval(
+                    state, step_index, step, tool_name, decision, stale=pending
+                )
+            # Already waiting on this step.
+            if (
+                state.final_status is TaskStatus.NEEDS_APPROVAL
+                and state.approval_status is ApprovalStatus.PENDING
+            ):
+                if pending_matches(pending, tool_name, step.arguments):
+                    return state
+                return self._request_approval(
+                    state, step_index, step, tool_name, decision, stale=pending
+                )
 
-        # Already waiting on this step.
-        if (
-            state.final_status is TaskStatus.NEEDS_APPROVAL
-            and state.approval_status is ApprovalStatus.PENDING
-            and state.pending_action is not None
-            and state.pending_action.step_id == step.step_id
-        ):
-            return state
+        return self._request_approval(state, step_index, step, tool_name, decision)
+
+    def _request_approval(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        tool_name: str,
+        decision: Any,
+        *,
+        stale: PendingAction | None = None,
+    ) -> ExecutionState:
+        """Persist a pending approval for exactly this step's current action.
+
+        ``stale`` is a previous request or approval for the step that no longer
+        matches its action; it is recorded as invalidated, never executed.
+        """
+        fingerprint = action_fingerprint(tool_name, dict(step.arguments))
+        if stale is not None:
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.APPROVAL_INVALIDATED,
+                    action="approval_invalidated",
+                    tool=tool_name,
+                    arguments=dict(step.arguments),
+                    result={
+                        "step_id": step.step_id,
+                        "previous_status": state.approval_status.value,
+                        "previous_fingerprint": pending_fingerprint(stale),
+                        "current_fingerprint": fingerprint,
+                        "reason": (
+                            "The action changed after approval was requested or "
+                            "granted; a fresh approval is required."
+                        ),
+                    },
+                    actor=Actor.SYSTEM,
+                )
+            )
+            logger.warning(
+                "[POLICY] stale approval invalidated step=%s tool=%s", step.step_id, tool_name
+            )
 
         key = idempotency_key_for(state.task_id, step.step_id)
         pending = PendingAction(
@@ -1039,6 +1180,7 @@ class ExecutionRuntime:
             idempotency_key=key,
             reason=decision.reason,
             risk=decision.risk.value,
+            fingerprint=fingerprint,
         )
         # Keep the plan step PENDING — sensitive tool must not run yet.
         plan = list(state.plan)
@@ -1066,6 +1208,7 @@ class ExecutionRuntime:
                     "risk": decision.risk.value,
                     "reason": decision.reason,
                     "operation": decision.operation,
+                    "fingerprint": fingerprint,
                 },
                 actor=Actor.SYSTEM,
             )

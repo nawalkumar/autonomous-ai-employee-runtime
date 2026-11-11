@@ -24,6 +24,41 @@ class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is reused for a different request."""
 
 
+class InvalidEmployeeUpdateError(ValueError):
+    """Raised for an employee update that cannot be applied exactly as requested."""
+
+
+EMPLOYEE_UPDATE_FIELDS = frozenset({"name", "email", "title", "department"})
+
+
+def validate_employee_update(fields: Any) -> dict[str, str]:
+    """Return the update unchanged, or raise if any part of it would be ignored.
+
+    The whole update is rejected when a field is unsupported or a value is not
+    a non-empty string, so a request can never succeed while silently dropping
+    part of what was asked.
+    """
+    if not isinstance(fields, dict) or not fields:
+        raise InvalidEmployeeUpdateError(
+            "Employee update requires a non-empty mapping of fields "
+            f"(supported: {', '.join(sorted(EMPLOYEE_UPDATE_FIELDS))})"
+        )
+    unknown = sorted(str(key) for key in fields if key not in EMPLOYEE_UPDATE_FIELDS)
+    if unknown:
+        raise InvalidEmployeeUpdateError(
+            f"Unsupported employee field(s): {', '.join(unknown)} "
+            f"(supported: {', '.join(sorted(EMPLOYEE_UPDATE_FIELDS))})"
+        )
+    blank = sorted(
+        key for key, value in fields.items() if not isinstance(value, str) or not value.strip()
+    )
+    if blank:
+        raise InvalidEmployeeUpdateError(
+            f"Employee field value(s) must be non-empty strings: {', '.join(blank)}"
+        )
+    return dict(fields)
+
+
 def _request_hash(operation: str, payload: dict[str, Any]) -> str:
     blob = json.dumps({"operation": operation, **payload}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -157,9 +192,12 @@ class CompanyRepository:
         *,
         idempotency_key: str | None = None,
     ) -> tuple[Employee | None, bool]:
-        """Apply an update at most once per key. Returns (employee, replayed)."""
-        allowed = {"name", "email", "title", "department"}
-        updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        """Apply an update at most once per key. Returns (employee, replayed).
+
+        Raises InvalidEmployeeUpdateError before any write for an update that
+        validate_employee_update rejects.
+        """
+        updates = validate_employee_update(fields)
         request_hash = _request_hash(
             "update_employee", {"employee_id": employee_id, "fields": updates}
         )
@@ -177,8 +215,6 @@ class CompanyRepository:
             ).fetchone()
             if row is None:
                 return None, False
-            if not updates:
-                return Employee.model_validate(dict(row)), False
 
             now = utc_now().isoformat()
             assignments = ", ".join(f"{col} = ?" for col in updates)
