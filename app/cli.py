@@ -11,8 +11,9 @@ SQLite store, approval workflow, and independent outcome verifier.
     python -m app.cli history <task_id>
 
 The planner is always the deterministic mock, which accepts only its supported
-goal formats. Mutating commands hold an exclusive, OS-backed per-task lock; this
-protects cooperating CLI processes, not code that uses ExecutionRuntime directly.
+goal formats. Mutating commands hold an exclusive, OS-backed per-task lock shared
+with the HTTP API; this protects cooperating CLI and API processes, not code that
+uses ExecutionRuntime directly.
 
 Exit codes: 0 completed / successful read, 1 failed or aborted, 2 usage,
 configuration or file-permission error, 3 goal rejected, 4 awaiting approval, 5 unknown task or
@@ -22,6 +23,7 @@ invalid approval, 6 task locked by another process, 70 unexpected internal error
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -42,6 +44,7 @@ from app.models.ids import new_id
 from app.models.state import ExecutionState
 from app.planning import InterpretationError, PlanningError, PlanningPipeline
 from app.runtime import ApprovalError, ExecutionRuntime
+from app.runtime.locking import LOCK_BACKEND, LockBusyError, TaskLock  # noqa: F401
 from app.store import SQLiteStore
 from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
 from app.world import CompanyRepository
@@ -71,36 +74,15 @@ class CliError(Exception):
 class TaskLockedError(CliError):
     def __init__(self, task_id: str) -> None:
         super().__init__(
-            f"Task {task_id} is locked by another CLI process; nothing was changed.",
+            f"Task {task_id} is locked by another CLI process or API request; "
+            "nothing was changed.",
             EXIT_LOCKED,
         )
 
 
 # --- Per-task locking ---------------------------------------------------------
-
-if os.name == "nt":  # pragma: no cover - exercised on Windows only
-    import msvcrt
-
-    LOCK_BACKEND = "msvcrt"
-
-    def _try_lock(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-
-    def _unlock(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-
-else:
-    import fcntl
-
-    LOCK_BACKEND = "fcntl"
-
-    def _try_lock(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def _unlock(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+# Shared with the HTTP API (app.runtime.locking), so CLI and API processes that
+# use the same DATABASE_PATH exclude each other.
 
 
 def validate_task_id(task_id: str) -> str:
@@ -111,33 +93,23 @@ def validate_task_id(task_id: str) -> str:
 
 @contextmanager
 def task_lock(lock_dir: Path, task_id: str) -> Iterator[None]:
-    """Exclusive, non-blocking OS lock for one task.
-
-    The OS releases the lock when the descriptor closes, including on process
-    termination, so a leftover lock file never blocks a later command.
-    """
+    """Exclusive, non-blocking OS lock for one task."""
     validate_task_id(task_id)
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"lock-{task_id}.lock"
+    lock = TaskLock(lock_dir, task_id)
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        lock.acquire()
     except PermissionError:
         raise CliError(
-            f"Permission denied opening lock file {lock_path}. "
+            f"Permission denied opening lock file {lock.path}. "
             "Check that it is owned by the user running the CLI.",
             EXIT_USAGE,
         ) from None
+    except LockBusyError as exc:
+        raise TaskLockedError(task_id) from exc
     try:
-        try:
-            _try_lock(fd)
-        except OSError as exc:
-            raise TaskLockedError(task_id) from exc
-        try:
-            yield
-        finally:
-            _unlock(fd)
+        yield
     finally:
-        os.close(fd)
+        lock.release()
 
 
 # --- Runtime assembly ---------------------------------------------------------
@@ -403,6 +375,13 @@ def cmd_status(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
     return EXIT_OK
 
 
+def _cli_approver() -> str:
+    try:
+        return f"cli:{getpass.getuser()}"
+    except Exception:  # noqa: BLE001 - no passwd entry (e.g. arbitrary container UID)
+        return "cli"
+
+
 def _pending_or_fail(state: ExecutionState) -> None:
     if (
         state.final_status is not TaskStatus.NEEDS_APPROVAL
@@ -446,7 +425,7 @@ def cmd_approve(
             ):
                 raise CliError("Approval declined. Nothing was changed.", EXIT_INVALID_TASK)
         try:
-            state = cli.runtime.approve_task(task_id)
+            state = cli.runtime.approve_task(task_id, approver=_cli_approver())
         except ApprovalError as exc:
             raise CliError(f"Approval failed: {exc}", EXIT_INVALID_TASK) from None
     _report(out, cli, state)
@@ -460,7 +439,9 @@ def cmd_reject(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
         state = _load(cli, task_id)
         _pending_or_fail(state)
         try:
-            state = cli.runtime.reject_task(task_id, reason=args.reason)
+            state = cli.runtime.reject_task(
+                task_id, reason=args.reason, approver=_cli_approver()
+            )
         except ApprovalError as exc:
             raise CliError(f"Rejection failed: {exc}", EXIT_INVALID_TASK) from None
     _report(out, cli, state)
