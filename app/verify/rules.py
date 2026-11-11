@@ -24,6 +24,50 @@ def ticket_id_from_call(call: ToolCallRecord) -> str | None:
     return ticket_id if isinstance(ticket_id, str) and ticket_id else None
 
 
+def entity_id_from_call(call: ToolCallRecord, entity: str, id_field: str) -> str | None:
+    """ID of ``entity`` reported by this call's own result, or None if absent/malformed."""
+    result = call.result if isinstance(call.result, dict) else {}
+    data = result.get("data")
+    record = data.get(entity) if isinstance(data, dict) else None
+    value = record.get(id_field) if isinstance(record, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+# Criteria for the v0.3.0 mutating operations. Each is bound to the call that
+# made the change (source_call_id) so the verifier can compare against the
+# before-state that call recorded.
+_V3_CRITERIA: dict[str, tuple[str, str]] = {
+    "update_ticket": ("ticket_fields", "Ticket status/priority match the requested change"),
+    "assign_ticket": ("ticket_assignment", "Ticket is assigned to the requested eligible employee"),
+    "create_customer": ("customer_record", "Customer record exists with the requested identity"),
+    "deactivate_employee": ("employee_status", "Employee is inactive with no open tickets"),
+}
+
+
+def _v3_criterion(op: str, args: dict[str, Any], call: ToolCallRecord) -> SuccessCriterion:
+    ctype, description = _V3_CRITERIA[op]
+    expected: dict[str, Any] = {"source_call_id": call.call_id, "source_step_id": call.step_id}
+    if op == "update_ticket":
+        expected.update({"ticket_id": args.get("ticket_id"), **(args.get("fields") or {})})
+    elif op == "assign_ticket":
+        expected.update({"ticket_id": args.get("ticket_id"), "employee_id": args.get("employee_id")})
+    elif op == "create_customer":
+        # Bound to this call's own result; a missing ID fails verification.
+        expected.update(
+            {
+                "customer_id": entity_id_from_call(call, "customer", "customer_id"),
+                "name": args.get("name"),
+                "company": args.get("company"),
+                "email": args.get("email"),
+            }
+        )
+    else:
+        expected.update({"employee_id": args.get("employee_id"), "status": "inactive"})
+    return SuccessCriterion(
+        description=description, criterion_type=ctype, target="company", expected_value=expected
+    )
+
+
 def is_successful_create_ticket(call: ToolCallRecord) -> bool:
     return (
         call.tool_name == "company_api"
@@ -132,6 +176,8 @@ def derive_criteria_from_execution(state: ExecutionState) -> list[SuccessCriteri
                         },
                     )
                 )
+            elif op in _V3_CRITERIA:
+                criteria.append(_v3_criterion(op, args, call))
         elif call.tool_name == "file" and args.get("operation") == "write":
             criteria.append(
                 SuccessCriterion(

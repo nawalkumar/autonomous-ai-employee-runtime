@@ -13,7 +13,7 @@ therefore no permissions: lookups fail instead of falling back to defaults.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -22,8 +22,24 @@ from typing import Any
 from pydantic import BaseModel
 
 from app.tools.base import RiskLevel
-from app.world.models import Customer, Employee, Ticket
-from app.world.repository import EMPLOYEE_UPDATE_FIELDS
+from app.world.models import (
+    ASSIGNABLE_DEPARTMENT,
+    CUSTOMER_ID_PATTERN,
+    EMPLOYEE_ID_PATTERN,
+    OPEN_TICKET_STATUSES,
+    TICKET_ID_PATTERN,
+    TICKET_TRANSITIONS,
+    Customer,
+    Employee,
+    Ticket,
+    TicketFilters,
+)
+from app.world.repository import (
+    EMPLOYEE_UPDATE_FIELDS,
+    MAX_TEXT_LENGTH,
+    MAX_TICKET_PAGE,
+    TICKET_UPDATE_FIELDS,
+)
 
 
 class IdempotencyStrategy(str, Enum):
@@ -45,6 +61,14 @@ class VerificationStrategy(str, Enum):
     TICKET_RECORD = "ticket_record"
     # The file re-read from the workspace, including expected content.
     FILE_CONTENT = "file_content"
+    # The ticket's status/priority re-read; other fields compared to the before-state.
+    TICKET_FIELDS = "ticket_fields"
+    # The stored assignee re-read, and its eligibility (active, Support) re-checked.
+    TICKET_ASSIGNMENT = "ticket_assignment"
+    # The customer created by this call re-read; its email must be unique.
+    CUSTOMER_RECORD = "customer_record"
+    # The employee's status re-read; an inactive employee has no open tickets.
+    EMPLOYEE_STATUS = "employee_status"
 
 
 class StateScope(str, Enum):
@@ -92,6 +116,32 @@ class FileListOutput(BaseModel):
     count: int
 
 
+class TicketListOutput(BaseModel):
+    tickets: list[Ticket]
+    count: int
+    total: int
+    limit: int
+    offset: int
+    filters: dict[str, Any]
+
+
+class TicketChangeOutput(BaseModel):
+    ticket: Ticket
+    previous: Ticket
+    idempotent_replay: bool | None = None
+
+
+class CustomerWriteOutput(BaseModel):
+    customer: Customer
+    idempotent_replay: bool | None = None
+
+
+class EmployeeChangeOutput(BaseModel):
+    employee: Employee
+    previous: Employee
+    idempotent_replay: bool | None = None
+
+
 @dataclass(frozen=True)
 class Capability:
     tool: str
@@ -109,11 +159,25 @@ class Capability:
     any_of_inputs: tuple[str, ...] = ()
     preconditions: tuple[str, ...] = ()
     approval_reason: str | None = None
+    # Approval that depends on the arguments: returns the reason when approval
+    # is required for these arguments, else None. Described by approval_condition.
+    approval_rule: Callable[[Mapping[str, Any]], str | None] | None = None
+    approval_condition: str | None = None
     output_model: type[BaseModel] | None = None
     # JSON-schema refinements for input properties the args model types loosely.
     input_constraints: Mapping[str, Mapping[str, Any]] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    # Inputs other than the declared ones are rejected (v0.3.0 operations).
+    strict_inputs: bool = False
+
+    def approval_reason_for(self, arguments: Mapping[str, Any]) -> str | None:
+        """Why these exact arguments need human approval, or None if they don't."""
+        if self.requires_approval:
+            return self.approval_reason or "This operation requires human approval."
+        if self.approval_rule is not None:
+            return self.approval_rule(arguments)
+        return None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -140,6 +204,8 @@ class Capability:
         }
         if self.any_of_inputs:
             schema["anyOf"] = [{"required": [name]} for name in self.any_of_inputs]
+        if self.strict_inputs:
+            schema["additionalProperties"] = False
         return schema
 
     def output_schema(self) -> dict[str, Any] | None:
@@ -207,6 +273,7 @@ class CapabilityRegistry:
                 "risk": c.risk.value,
                 "requires_approval": c.requires_approval,
                 "approval_reason": c.approval_reason,
+                "approval_condition": c.approval_condition,
                 "retry_safe": c.retry_safe,
                 "idempotency": c.idempotency.value,
                 "mutates": c.mutates.value,
@@ -218,6 +285,20 @@ class CapabilityRegistry:
             for c in self._ordered
             if c.tool in args_models
         ]
+
+
+_CLOSE_REASON = "Closing a ticket (status -> closed) requires human approval."
+_TRANSITION_TEXT = "; ".join(
+    f"{source} -> {', '.join(sorted(targets)) or 'none'}"
+    for source, targets in TICKET_TRANSITIONS.items()
+)
+
+
+def _closing_requires_approval(arguments: Mapping[str, Any]) -> str | None:
+    fields = arguments.get("fields")
+    if isinstance(fields, Mapping) and fields.get("status") == "closed":
+        return _CLOSE_REASON
+    return None
 
 
 _WORKSPACE_PATH = (
@@ -316,6 +397,159 @@ CAPABILITIES = CapabilityRegistry(
             required_inputs=("ticket_id",),
             preconditions=("ticket exists",),
             output_model=TicketOutput,
+        ),
+        Capability(
+            tool="company_api",
+            operation="list_tickets",
+            description=(
+                "List tickets matching optional status, priority, customer and assignee "
+                "filters, in ticket-number order, one bounded page at a time."
+            ),
+            risk=RiskLevel.READ,
+            requires_approval=False,
+            retry_safe=True,
+            idempotency=IdempotencyStrategy.NOT_REQUIRED,
+            mutates=StateScope.NONE,
+            verification=VerificationStrategy.NONE,
+            optional_inputs=("filters", "limit", "offset"),
+            preconditions=(
+                "filters only: assignee_id, customer_id, priority, status, unassigned",
+                f"limit 1-{MAX_TICKET_PAGE} (default 50); offset >= 0",
+            ),
+            output_model=TicketListOutput,
+            strict_inputs=True,
+            input_constraints=MappingProxyType(
+                {
+                    "filters": MappingProxyType(
+                        {**TicketFilters.model_json_schema(), "title": "Filters"}
+                    ),
+                    "limit": MappingProxyType(
+                        {"type": "integer", "minimum": 1, "maximum": MAX_TICKET_PAGE, "default": 50}
+                    ),
+                    "offset": MappingProxyType({"type": "integer", "minimum": 0, "default": 0}),
+                }
+            ),
+        ),
+        Capability(
+            tool="company_api",
+            operation="update_ticket",
+            description="Change a ticket's status and/or priority.",
+            risk=RiskLevel.WRITE,
+            requires_approval=False,
+            approval_rule=_closing_requires_approval,
+            approval_condition=_CLOSE_REASON,
+            retry_safe=True,
+            idempotency=IdempotencyStrategy.KEYED_TRANSACTION,
+            mutates=StateScope.COMPANY,
+            verification=VerificationStrategy.TICKET_FIELDS,
+            required_inputs=("ticket_id", "fields"),
+            preconditions=(
+                "ticket exists",
+                "fields only: " + ", ".join(sorted(TICKET_UPDATE_FIELDS)),
+                "status changes follow: " + _TRANSITION_TEXT,
+                "closing requires human approval bound to the exact action",
+            ),
+            output_model=TicketChangeOutput,
+            strict_inputs=True,
+            input_constraints=MappingProxyType(
+                {
+                    "ticket_id": MappingProxyType({"type": "string", "pattern": TICKET_ID_PATTERN}),
+                    "fields": MappingProxyType(
+                        {
+                            "type": "object",
+                            "minProperties": 1,
+                            "additionalProperties": False,
+                            "properties": {
+                                "status": {"enum": sorted(TICKET_TRANSITIONS)},
+                                "priority": {"enum": ["high", "low", "medium", "urgent"]},
+                            },
+                        }
+                    ),
+                }
+            ),
+        ),
+        Capability(
+            tool="company_api",
+            operation="assign_ticket",
+            description="Assign an open ticket to an active Support employee.",
+            risk=RiskLevel.WRITE,
+            requires_approval=False,
+            retry_safe=True,
+            idempotency=IdempotencyStrategy.KEYED_TRANSACTION,
+            mutates=StateScope.COMPANY,
+            verification=VerificationStrategy.TICKET_ASSIGNMENT,
+            required_inputs=("ticket_id", "employee_id"),
+            preconditions=(
+                "ticket exists and is " + " or ".join(sorted(OPEN_TICKET_STATUSES)),
+                "employee exists, is active and belongs to " + ASSIGNABLE_DEPARTMENT,
+                "reassigning replaces the previous assignee",
+            ),
+            output_model=TicketChangeOutput,
+            strict_inputs=True,
+            input_constraints=MappingProxyType(
+                {
+                    "ticket_id": MappingProxyType({"type": "string", "pattern": TICKET_ID_PATTERN}),
+                    "employee_id": MappingProxyType(
+                        {"type": "string", "pattern": EMPLOYEE_ID_PATTERN}
+                    ),
+                }
+            ),
+        ),
+        Capability(
+            tool="company_api",
+            operation="create_customer",
+            description="Create a customer record with the next C-<n> identifier.",
+            risk=RiskLevel.WRITE,
+            requires_approval=True,
+            approval_reason="Creating a customer record requires human approval.",
+            # Keyed: a retry replays the committed customer instead of creating another.
+            retry_safe=True,
+            idempotency=IdempotencyStrategy.KEYED_TRANSACTION,
+            mutates=StateScope.COMPANY,
+            verification=VerificationStrategy.CUSTOMER_RECORD,
+            required_inputs=("name", "company", "email"),
+            preconditions=(
+                f"name, company and email are non-empty, at most {MAX_TEXT_LENGTH} characters",
+                "email is a valid address, stored in lower case",
+                "no existing customer has the same email (case-insensitive)",
+                "human approval bound to the exact action",
+            ),
+            output_model=CustomerWriteOutput,
+            strict_inputs=True,
+            input_constraints=MappingProxyType(
+                {
+                    name: MappingProxyType(
+                        {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_LENGTH}
+                    )
+                    for name in ("name", "company", "email")
+                }
+            ),
+        ),
+        Capability(
+            tool="company_api",
+            operation="deactivate_employee",
+            description="Mark an employee inactive so they can no longer be assigned tickets.",
+            # Nothing in the runtime can reactivate an employee.
+            risk=RiskLevel.DESTRUCTIVE,
+            requires_approval=True,
+            approval_reason="Deactivating an employee requires human approval.",
+            retry_safe=True,
+            idempotency=IdempotencyStrategy.KEYED_TRANSACTION,
+            mutates=StateScope.COMPANY,
+            verification=VerificationStrategy.EMPLOYEE_STATUS,
+            required_inputs=("employee_id",),
+            preconditions=(
+                "employee exists",
+                "no open or in-progress ticket is assigned to the employee "
+                "(reassign them first; nothing else is changed)",
+                "deactivating an inactive employee changes nothing",
+                "human approval bound to the exact action",
+            ),
+            output_model=EmployeeChangeOutput,
+            strict_inputs=True,
+            input_constraints=MappingProxyType(
+                {"employee_id": MappingProxyType({"type": "string", "pattern": EMPLOYEE_ID_PATTERN})}
+            ),
         ),
         Capability(
             tool="file",

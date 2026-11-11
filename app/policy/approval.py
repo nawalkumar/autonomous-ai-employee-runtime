@@ -27,10 +27,11 @@ class ApprovalPolicy:
     ) -> PolicyDecision:
         operation = arguments.get("operation")
         capability = CAPABILITIES.find(tool_name, operation)
-        if capability is not None and capability.requires_approval:
+        reason = capability.approval_reason_for(arguments) if capability is not None else None
+        if reason is not None:
             return PolicyDecision(
                 requires_approval=True,
-                reason=capability.approval_reason or "This operation requires human approval.",
+                reason=reason,
                 risk=capability.risk,
                 operation=operation,
             )

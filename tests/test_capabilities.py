@@ -37,7 +37,8 @@ from app.tools.file import FileOperation, FileToolArgs
 from app.verify.rules import MUTATING_OPERATIONS, derive_criteria_from_execution
 from app.world import EMPLOYEE_UPDATE_FIELDS
 
-ALL_OPERATIONS = [
+# The eight operations that existed before the registry (v0.3.0 milestone 1).
+ORIGINAL_OPERATIONS = [
     ("company_api", "get_employee"),
     ("company_api", "update_employee"),
     ("company_api", "find_customer"),
@@ -47,6 +48,15 @@ ALL_OPERATIONS = [
     ("file", "write"),
     ("file", "list"),
 ]
+# Added in milestone 2.
+NEW_OPERATIONS = [
+    ("company_api", "list_tickets"),
+    ("company_api", "update_ticket"),
+    ("company_api", "assign_ticket"),
+    ("company_api", "create_customer"),
+    ("company_api", "deactivate_employee"),
+]
+ALL_OPERATIONS = ORIGINAL_OPERATIONS[:5] + NEW_OPERATIONS + ORIGINAL_OPERATIONS[5:]
 ARGS_MODELS = {"company_api": CompanyAPIArgs, "file": FileToolArgs}
 SAMPLE_INPUTS: dict[str, Any] = {
     "employee_id": "E-17",
@@ -60,6 +70,16 @@ SAMPLE_INPUTS: dict[str, Any] = {
     "ticket_id": "T-10001",
     "path": "note.txt",
     "content": "hello",
+    "filters": {"status": "open"},
+    "limit": 10,
+    "offset": 0,
+    "name": "Pat Lee",
+}
+SAMPLE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "update_ticket": {"fields": {"status": "in_progress"}},
+    "assign_ticket": {"employee_id": "E-31"},
+    "create_customer": {"company": "Nimbus Labs", "email": "pat.lee@nimbus.example"},
+    "deactivate_employee": {"employee_id": "E-23"},
 }
 
 # Decisions recorded on commit 03124a6, before the registry existed:
@@ -121,11 +141,17 @@ def tools(registry: ToolRegistry) -> dict[str, Any]:
 # --- Coverage and structure ------------------------------------------------------------
 
 
-def test_registry_covers_exactly_the_eight_operations() -> None:
+def test_registry_covers_exactly_the_registered_operations() -> None:
     assert [c.key for c in CAPABILITIES] == ALL_OPERATIONS
-    assert len(CAPABILITIES) == 8
+    assert len(CAPABILITIES) == 13
     assert {op for t, op in ALL_OPERATIONS if t == "company_api"} == set(get_args(CompanyOperation))
     assert {op for t, op in ALL_OPERATIONS if t == "file"} == set(get_args(FileOperation))
+
+
+def test_original_operations_keep_their_positions() -> None:
+    for tool in ("company_api", "file"):
+        original = [op for t, op in ORIGINAL_OPERATIONS if t == tool]
+        assert [c.operation for c in CAPABILITIES.for_tool(tool)][: len(original)] == original
 
 
 def test_every_capability_is_fully_described() -> None:
@@ -136,6 +162,9 @@ def test_every_capability_is_fully_described() -> None:
         assert isinstance(c.verification, VerificationStrategy)
         assert isinstance(c.mutates, StateScope)
         assert (c.approval_reason is not None) == c.requires_approval
+        assert (c.approval_rule is None) == (c.approval_condition is None)
+        assert not (c.requires_approval and c.approval_rule is not None)
+        assert c.strict_inputs == (c.key in NEW_OPERATIONS)
         assert c.mutating == (c.verification is not VerificationStrategy.NONE)
         assert c.mutating == (c.idempotency is not IdempotencyStrategy.NOT_REQUIRED)
         assert c.mutating == (c.risk is not RiskLevel.READ)
@@ -162,10 +191,26 @@ def test_duplicate_capabilities_are_rejected() -> None:
 
 
 def minimal_input(c: Capability) -> dict[str, Any]:
-    payload = {"operation": c.operation, **{f: SAMPLE_INPUTS[f] for f in c.required_inputs}}
+    samples = {**SAMPLE_INPUTS, **SAMPLE_OVERRIDES.get(c.operation, {})}
+    payload = {"operation": c.operation, **{f: samples[f] for f in c.required_inputs}}
     if c.any_of_inputs:
-        payload[c.any_of_inputs[0]] = SAMPLE_INPUTS[c.any_of_inputs[0]]
+        payload[c.any_of_inputs[0]] = samples[c.any_of_inputs[0]]
     return payload
+
+
+@pytest.mark.parametrize("key", NEW_OPERATIONS, ids=lambda k: k[1])
+def test_new_operations_reject_undeclared_arguments(key: tuple[str, str]) -> None:
+    capability = CAPABILITIES.require(*key)
+    payload = {**minimal_input(capability), "subject": "not an input of this operation"}
+    if "subject" in capability.input_fields:
+        payload = {**minimal_input(capability), "sql": "1=1"}
+    with pytest.raises(ValidationError, match="Unsupported argument"):
+        CompanyAPIArgs.model_validate(payload)
+    assert capability.input_schema(CompanyAPIArgs)["additionalProperties"] is False
+
+
+def test_original_operations_still_ignore_undeclared_arguments() -> None:
+    CompanyAPIArgs.model_validate({"operation": "get_employee", "employee_id": "E-17", "limit": 9999})
 
 
 @pytest.mark.parametrize("capability", list(CAPABILITIES), ids=lambda c: f"{c.tool}.{c.operation}")
@@ -213,6 +258,11 @@ def test_real_tool_outputs_match_the_output_schemas(tools: dict[str, Any]) -> No
         ("file", {"operation": "write", "path": "note.txt", "content": "hello"}),
         ("file", {"operation": "read", "path": "note.txt"}),
         ("file", {"operation": "list"}),
+        ("company_api", {"operation": "list_tickets", "filters": {"status": "open"}, "limit": 5}),
+        ("company_api", minimal_input(CAPABILITIES.require("company_api", "assign_ticket"))),
+        ("company_api", minimal_input(CAPABILITIES.require("company_api", "update_ticket"))),
+        ("company_api", minimal_input(CAPABILITIES.require("company_api", "create_customer"))),
+        ("company_api", minimal_input(CAPABILITIES.require("company_api", "deactivate_employee"))),
     ]
     seen = set()
     for tool_name, args in sequence:
@@ -227,7 +277,7 @@ def test_real_tool_outputs_match_the_output_schemas(tools: dict[str, Any]) -> No
 # --- Equivalence with the pre-migration behaviour ---------------------------------------
 
 
-@pytest.mark.parametrize("key", ALL_OPERATIONS, ids=lambda k: ".".join(k))
+@pytest.mark.parametrize("key", ORIGINAL_OPERATIONS, ids=lambda k: ".".join(k))
 def test_decisions_match_pre_migration_behaviour(key: tuple[str, str], tools: dict[str, Any]) -> None:
     tool_name, operation = key
     with_tool, without_tool, risk, retry_safe = PRE_MIGRATION[key]
@@ -247,27 +297,40 @@ def test_decisions_match_pre_migration_behaviour(key: tuple[str, str], tools: di
     assert capability.retry_safe is retry_safe
 
 
-def test_mutating_operations_match_pre_migration() -> None:
-    assert MUTATING_OPERATIONS == PRE_MIGRATION_MUTATING
-    assert CAPABILITIES.mutating_keys() == PRE_MIGRATION_MUTATING
+NEW_MUTATING = {
+    ("company_api", "update_ticket"),
+    ("company_api", "assign_ticket"),
+    ("company_api", "create_customer"),
+    ("company_api", "deactivate_employee"),
+}
 
 
-def test_tool_metadata_and_planner_catalog_match_pre_migration(
+def test_mutating_operations_extend_pre_migration() -> None:
+    assert MUTATING_OPERATIONS == CAPABILITIES.mutating_keys() == PRE_MIGRATION_MUTATING | NEW_MUTATING
+    assert {k for k in MUTATING_OPERATIONS if k in ORIGINAL_OPERATIONS} == PRE_MIGRATION_MUTATING
+
+
+def test_tool_metadata_and_planner_catalog_extend_pre_migration(
     registry: ToolRegistry, tools: dict[str, Any]
 ) -> None:
+    """The original operations keep their entries and order; new ones follow."""
+    catalog = compact_tool_catalog(registry)
     for name, expected in PRE_MIGRATION_METADATA.items():
         meta = tools[name].metadata()
-        assert list(meta["operations"].items()) == expected["operations"]
+        original = expected["operations"]
+        assert list(meta["operations"].items())[: len(original)] == original
+        assert list(catalog[name]["operations"].items())[: len(original)] == original
+        added = [(c.operation, c.risk.value) for c in CAPABILITIES.for_tool(name)][len(original):]
+        assert list(meta["operations"].items())[len(original):] == added
         assert meta["risk_level"] == expected["risk_level"]
         assert meta["retry_safe"] is expected["retry_safe"]
         if "retry_safe_operations" in expected:
-            assert meta["retry_safe_operations"] == expected["retry_safe_operations"]
+            originals = {op for op, _ in original}
+            assert [
+                op for op in meta["retry_safe_operations"] if op in originals
+            ] == expected["retry_safe_operations"]
         else:
             assert "retry_safe_operations" not in meta
-    catalog = compact_tool_catalog(registry)
-    assert {n: list(c["operations"].items()) for n, c in catalog.items()} == {
-        n: e["operations"] for n, e in PRE_MIGRATION_METADATA.items()
-    }
 
 
 def test_verification_strategies_match_the_criteria_the_rules_derive() -> None:
@@ -275,6 +338,10 @@ def test_verification_strategies_match_the_criteria_the_rules_derive() -> None:
         VerificationStrategy.EMPLOYEE_FIELDS: "employee_field",
         VerificationStrategy.TICKET_RECORD: "ticket_exists",
         VerificationStrategy.FILE_CONTENT: "file_exists",
+        VerificationStrategy.TICKET_FIELDS: "ticket_fields",
+        VerificationStrategy.TICKET_ASSIGNMENT: "ticket_assignment",
+        VerificationStrategy.CUSTOMER_RECORD: "customer_record",
+        VerificationStrategy.EMPLOYEE_STATUS: "employee_status",
     }
     for capability in CAPABILITIES:
         call = ToolCallRecord(
@@ -370,7 +437,9 @@ def test_runtime_tools_are_exactly_the_registered_tools(tmp_path: Path) -> None:
 
 def test_describe_lists_only_registered_tools() -> None:
     described = CAPABILITIES.describe({"file": FileToolArgs})
-    assert [(d["tool"], d["operation"]) for d in described] == ALL_OPERATIONS[5:]
+    assert [(d["tool"], d["operation"]) for d in described] == [
+        k for k in ALL_OPERATIONS if k[0] == "file"
+    ]
 
 
 def local_settings(tmp_path: Path) -> Settings:

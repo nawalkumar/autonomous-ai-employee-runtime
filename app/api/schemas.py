@@ -89,12 +89,24 @@ class CapabilityOut(BaseModel):
     operation: str
     description: str
     risk: Literal["read", "write", "destructive"]
+    # Always required before the operation runs.
     requires_approval: bool
     approval_reason: str | None
+    # Approval required only for some arguments (e.g. closing a ticket), described here.
+    approval_condition: str | None
     retry_safe: bool
     idempotency: Literal["not_required", "keyed_transaction", "deterministic_overwrite"]
     mutates: Literal["none", "company", "workspace"]
-    verification: Literal["none", "employee_fields", "ticket_record", "file_content"]
+    verification: Literal[
+        "none",
+        "employee_fields",
+        "ticket_record",
+        "file_content",
+        "ticket_fields",
+        "ticket_assignment",
+        "customer_record",
+        "employee_status",
+    ]
     preconditions: list[str]
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None
@@ -278,6 +290,7 @@ class EmployeeOut(BaseModel):
     email: str
     title: str
     department: str
+    status: str
     updated_at: datetime
 
 
@@ -296,6 +309,7 @@ class TicketOut(BaseModel):
     description: str
     status: str
     priority: str
+    assignee_id: str | None
     created_at: datetime
     updated_at: datetime
 

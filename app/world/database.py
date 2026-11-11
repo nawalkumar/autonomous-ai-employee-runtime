@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 _COMPANY_SCHEMA = """
@@ -92,3 +92,77 @@ def write_transaction(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 def init_company_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_COMPANY_SCHEMA)
+
+
+# --- Additive migrations (v0.3.0) ---------------------------------------------------
+#
+# The CREATE TABLE statements above are the v0.2.0 schema and never change, so a
+# fresh database and an upgraded v0.2.0 database go through the same steps and
+# end up identical. Every step only adds: existing rows, identifiers and columns
+# are untouched, and new columns have defaults that describe existing rows
+# correctly (every existing employee is active; no existing ticket is assigned).
+#
+# Rollback: there is no down-migration. The v0.2.0 code can still open an
+# upgraded database (it selects named columns or ignores unknown ones), but it
+# would not enforce employee status or ticket assignment rules.
+
+_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "company_employees",
+        "status",
+        "status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive'))",
+    ),
+    (
+        # Employees are deactivated, never deleted, so a plain reference
+        # (no ON DELETE action) keeps every assignment pointing at a real row.
+        "company_tickets",
+        "assignee_id",
+        "assignee_id TEXT DEFAULT NULL REFERENCES company_employees (employee_id)",
+    ),
+)
+
+_MIGRATION_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_company_tickets_status ON company_tickets (status);
+CREATE INDEX IF NOT EXISTS idx_company_tickets_assignee ON company_tickets (assignee_id);
+"""
+
+CUSTOMER_SEQ_FLOOR = 1004
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _missing_columns(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    return [m for m in _COLUMN_MIGRATIONS if m[1] not in _columns(conn, m[0])]
+
+
+def _next_customer_number(conn: sqlite3.Connection) -> int:
+    highest = CUSTOMER_SEQ_FLOOR - 1
+    for (customer_id,) in conn.execute("SELECT customer_id FROM company_customers"):
+        prefix, _, number = str(customer_id).partition("-")
+        if prefix == "C" and number.isdigit():
+            highest = max(highest, int(number))
+    return highest + 1
+
+
+def migrate_company_schema(db_path: Path) -> None:
+    """Apply the additive v0.3.0 migrations; safe to run any number of times."""
+    with closing(sqlite3.connect(db_path, timeout=30.0)) as probe:
+        has_customer_seq = probe.execute(
+            "SELECT 1 FROM company_ticket_seq WHERE name = 'customer'"
+        ).fetchone()
+        if not _missing_columns(probe) and has_customer_seq:
+            return
+    # Re-checked under the write lock so concurrent processes migrate once.
+    with write_transaction(db_path) as conn:
+        for table, _column, definition in _missing_columns(conn):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+        for statement in filter(None, (s.strip() for s in _MIGRATION_INDEXES.split(";"))):
+            conn.execute(statement)
+        # company_ticket_seq is the sequence table (one row per sequence, despite
+        # its name). Customer IDs continue after the highest existing C-<n>.
+        conn.execute(
+            "INSERT OR IGNORE INTO company_ticket_seq (name, next_value) VALUES ('customer', ?)",
+            (_next_customer_number(conn),),
+        )

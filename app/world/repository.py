@@ -4,15 +4,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import BaseModel
 
-from app.world.database import connect, init_company_schema, write_transaction
-from app.world.models import Customer, Employee, Ticket, TicketPriority, TicketStatus
+from app.world.database import (
+    connect,
+    init_company_schema,
+    migrate_company_schema,
+    write_transaction,
+)
+from app.world.models import (
+    ASSIGNABLE_DEPARTMENT,
+    OPEN_TICKET_STATUSES,
+    TICKET_TRANSITIONS,
+    Customer,
+    Employee,
+    Ticket,
+    TicketPriority,
+    TicketStatus,
+)
 from app.world.seed import SEED_CUSTOMERS, SEED_EMPLOYEES, TICKET_SEQ_START
 
 
@@ -57,6 +72,85 @@ def validate_employee_update(fields: Any) -> dict[str, str]:
             f"Employee field value(s) must be non-empty strings: {', '.join(blank)}"
         )
     return dict(fields)
+
+
+class TicketUpdateError(ValueError):
+    """An unsupported ticket field or value, or a status change that is not allowed."""
+
+
+class RecordNotFoundError(LookupError):
+    """A referenced company record does not exist."""
+
+
+class BusinessRuleError(ValueError):
+    """A valid request that the company's rules do not allow in the current state."""
+
+
+TICKET_UPDATE_FIELDS = frozenset({"status", "priority"})
+_TICKET_FIELD_VALUES = {
+    "status": frozenset(get_args(TicketStatus)),
+    "priority": frozenset(get_args(TicketPriority)),
+}
+CUSTOMER_EMAIL_PATTERN = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+MAX_TEXT_LENGTH = 200
+MAX_TICKET_PAGE = 100
+
+
+def validate_ticket_update(fields: Any) -> dict[str, str]:
+    """Return the update unchanged, or raise if any part of it is not supported."""
+    if not isinstance(fields, dict) or not fields:
+        raise TicketUpdateError(
+            "Ticket update requires a non-empty mapping of fields "
+            f"(supported: {', '.join(sorted(TICKET_UPDATE_FIELDS))})"
+        )
+    unknown = sorted(str(key) for key in fields if key not in TICKET_UPDATE_FIELDS)
+    if unknown:
+        raise TicketUpdateError(
+            f"Unsupported ticket field(s): {', '.join(unknown)} "
+            f"(supported: {', '.join(sorted(TICKET_UPDATE_FIELDS))})"
+        )
+    for key, value in fields.items():
+        if value not in _TICKET_FIELD_VALUES[key]:
+            raise TicketUpdateError(
+                f"Invalid ticket {key} {value!r} "
+                f"(allowed: {', '.join(sorted(_TICKET_FIELD_VALUES[key]))})"
+            )
+    return dict(fields)
+
+
+def validate_new_customer(name: Any, company: Any, email: Any) -> tuple[str, str, str]:
+    """Normalised (name, company, email) or InvalidCustomerError."""
+    values = []
+    for label, value in (("name", name), ("company", company), ("email", email)):
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidCustomerError(f"Customer {label} must be a non-empty string")
+        if len(value.strip()) > MAX_TEXT_LENGTH:
+            raise InvalidCustomerError(f"Customer {label} exceeds {MAX_TEXT_LENGTH} characters")
+        values.append(value.strip())
+    name, company, email = values
+    email = email.lower()
+    if not CUSTOMER_EMAIL_PATTERN.fullmatch(email):
+        raise InvalidCustomerError(f"Customer email is not a valid address: {email!r}")
+    return name, company, email
+
+
+class InvalidCustomerError(ValueError):
+    """Customer fields that do not satisfy the customer data model."""
+
+
+class TicketChange(BaseModel):
+    ticket: Ticket
+    previous: Ticket
+
+
+class EmployeeChange(BaseModel):
+    employee: Employee
+    previous: Employee
+
+
+def _ticket_order_sql() -> str:
+    # Numeric order of T-<n> identifiers, ties broken by the full identifier.
+    return "CAST(SUBSTR(ticket_id, 3) AS INTEGER), ticket_id"
 
 
 def _request_hash(operation: str, payload: dict[str, Any]) -> str:
@@ -112,6 +206,35 @@ def _record_idempotent(
     )
 
 
+def _placeholders(values: frozenset[str]) -> str:
+    return ", ".join("?" for _ in values)
+
+
+def _select_ticket(conn: sqlite3.Connection, ticket_id: str) -> Ticket | None:
+    row = conn.execute("SELECT * FROM company_tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
+    return Ticket.model_validate(dict(row)) if row else None
+
+
+def _select_employee(conn: sqlite3.Connection, employee_id: str) -> Employee | None:
+    row = conn.execute(
+        "SELECT * FROM company_employees WHERE employee_id = ?", (employee_id,)
+    ).fetchone()
+    return Employee.model_validate(dict(row)) if row else None
+
+
+_TICKET_WRITABLE = frozenset({"status", "priority", "assignee_id"})
+
+
+def _update_ticket_columns(conn: sqlite3.Connection, ticket_id: str, values: dict[str, Any]) -> None:
+    columns = sorted(values)
+    assert set(columns) <= _TICKET_WRITABLE
+    assignments = ", ".join(f"{column} = ?" for column in columns)
+    conn.execute(
+        f"UPDATE company_tickets SET {assignments}, updated_at = ? WHERE ticket_id = ?",
+        [*(values[c] for c in columns), utc_now().isoformat(), ticket_id],
+    )
+
+
 class CompanyRepository:
     """CRUD over company_* tables in the shared SQLite database file."""
 
@@ -124,6 +247,7 @@ class CompanyRepository:
             init_company_schema(conn)
             if seed:
                 self._seed(conn)
+        migrate_company_schema(self.db_path)
 
     def _seed(self, conn: Any) -> None:
         for employee in SEED_EMPLOYEES:
@@ -407,6 +531,276 @@ class CompanyRepository:
                 "SELECT * FROM company_customers ORDER BY customer_id ASC"
             ).fetchall()
         return [Customer.model_validate(dict(row)) for row in rows]
+
+    # --- v0.3.0 operations -----------------------------------------------------------
+
+    def get_customer(self, customer_id: str) -> Customer | None:
+        with connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM company_customers WHERE customer_id = ?", (customer_id,)
+            ).fetchone()
+        return Customer.model_validate(dict(row)) if row else None
+
+    def customers_with_email(self, email: str) -> list[Customer]:
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM company_customers WHERE LOWER(email) = LOWER(?) "
+                "ORDER BY customer_id",
+                (email,),
+            ).fetchall()
+        return [Customer.model_validate(dict(row)) for row in rows]
+
+    def open_tickets_assigned_to(self, employee_id: str) -> list[str]:
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ticket_id FROM company_tickets
+                WHERE assignee_id = ? AND status IN ({_placeholders(OPEN_TICKET_STATUSES)})
+                ORDER BY {_ticket_order_sql()}
+                """,
+                (employee_id, *sorted(OPEN_TICKET_STATUSES)),
+            ).fetchall()
+        return [row["ticket_id"] for row in rows]
+
+    def query_tickets(
+        self,
+        *,
+        status: str | None = None,
+        priority: str | None = None,
+        customer_id: str | None = None,
+        assignee_id: str | None = None,
+        unassigned: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[Ticket], int]:
+        """Filtered, stably ordered page of tickets and the total match count.
+
+        Filters are fixed columns compared by equality with bound parameters.
+        """
+        if not 1 <= limit <= MAX_TICKET_PAGE or offset < 0:
+            raise ValueError(f"limit must be 1-{MAX_TICKET_PAGE} and offset >= 0")
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("status", status),
+            ("priority", priority),
+            ("customer_id", customer_id),
+            ("assignee_id", assignee_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if unassigned:
+            clauses.append("assignee_id IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with connect(self.db_path) as conn:
+            total = conn.execute(
+                f"SELECT COUNT(*) AS c FROM company_tickets {where}", params
+            ).fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM company_tickets {where} "
+                f"ORDER BY {_ticket_order_sql()} LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
+        return [Ticket.model_validate(dict(row)) for row in rows], int(total)
+
+    def update_ticket_idempotent(
+        self,
+        ticket_id: str,
+        fields: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[Ticket | None, Ticket | None, bool]:
+        """Change status and/or priority at most once per key.
+
+        Returns (ticket, previous, replayed); (None, None, False) if the ticket
+        does not exist. Raises TicketUpdateError for an invalid field, value or
+        status transition, before anything is written.
+        """
+        updates = validate_ticket_update(fields)
+        request_hash = _request_hash("update_ticket", {"ticket_id": ticket_id, "fields": updates})
+        with write_transaction(self.db_path) as conn:
+            prior = _load_idempotent(conn, idempotency_key, "update_ticket", request_hash)
+            if prior is not None:
+                change = TicketChange.model_validate(prior)
+                return change.ticket, change.previous, True
+            previous = _select_ticket(conn, ticket_id)
+            if previous is None:
+                return None, None, False
+            target = updates.get("status", previous.status)
+            if target != previous.status and target not in TICKET_TRANSITIONS[previous.status]:
+                allowed = ", ".join(sorted(TICKET_TRANSITIONS[previous.status])) or "none"
+                raise TicketUpdateError(
+                    f"Ticket {ticket_id} cannot change from {previous.status} to {target} "
+                    f"(allowed from {previous.status}: {allowed})"
+                )
+            changes = {k: v for k, v in updates.items() if getattr(previous, k) != v}
+            if changes:
+                _update_ticket_columns(conn, ticket_id, changes)
+            ticket = _select_ticket(conn, ticket_id)
+            assert ticket is not None
+            _record_idempotent(
+                conn, idempotency_key, "update_ticket", request_hash,
+                TicketChange(ticket=ticket, previous=previous),
+            )
+        return ticket, previous, False
+
+    def assign_ticket_idempotent(
+        self,
+        ticket_id: str,
+        employee_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[Ticket, Ticket, bool]:
+        """Assign an open ticket to an active Support employee, at most once per key.
+
+        Raises RecordNotFoundError or BusinessRuleError before anything is written.
+        """
+        request_hash = _request_hash(
+            "assign_ticket", {"ticket_id": ticket_id, "employee_id": employee_id}
+        )
+        with write_transaction(self.db_path) as conn:
+            prior = _load_idempotent(conn, idempotency_key, "assign_ticket", request_hash)
+            if prior is not None:
+                change = TicketChange.model_validate(prior)
+                return change.ticket, change.previous, True
+            previous = _select_ticket(conn, ticket_id)
+            if previous is None:
+                raise RecordNotFoundError(f"Ticket not found: {ticket_id}")
+            if previous.status not in OPEN_TICKET_STATUSES:
+                raise BusinessRuleError(
+                    f"Ticket {ticket_id} is {previous.status}; only open or in-progress "
+                    "tickets can be assigned"
+                )
+            employee = _select_employee(conn, employee_id)
+            if employee is None:
+                raise RecordNotFoundError(f"Employee not found: {employee_id}")
+            if employee.status != "active":
+                raise BusinessRuleError(f"Employee {employee_id} is inactive and cannot be assigned")
+            if employee.department != ASSIGNABLE_DEPARTMENT:
+                raise BusinessRuleError(
+                    f"Employee {employee_id} is in {employee.department}; tickets can only be "
+                    f"assigned to {ASSIGNABLE_DEPARTMENT}"
+                )
+            if previous.assignee_id != employee_id:
+                _update_ticket_columns(conn, ticket_id, {"assignee_id": employee_id})
+            ticket = _select_ticket(conn, ticket_id)
+            assert ticket is not None
+            _record_idempotent(
+                conn, idempotency_key, "assign_ticket", request_hash,
+                TicketChange(ticket=ticket, previous=previous),
+            )
+        return ticket, previous, False
+
+    def create_customer_idempotent(
+        self,
+        *,
+        name: str,
+        company: str,
+        email: str,
+        idempotency_key: str | None = None,
+    ) -> tuple[Customer, bool]:
+        """Create a customer with the next C-<n> identifier, at most once per key.
+
+        Emails are unique case-insensitively; a duplicate raises BusinessRuleError.
+        """
+        name, company, email = validate_new_customer(name, company, email)
+        request_hash = _request_hash(
+            "create_customer", {"name": name, "company": company, "email": email}
+        )
+        with write_transaction(self.db_path) as conn:
+            prior = _load_idempotent(conn, idempotency_key, "create_customer", request_hash)
+            if prior is not None:
+                return Customer.model_validate(prior), True
+            existing = conn.execute(
+                "SELECT customer_id FROM company_customers WHERE LOWER(email) = LOWER(?)",
+                (email,),
+            ).fetchone()
+            if existing is not None:
+                raise BusinessRuleError(
+                    f"A customer with email {email} already exists ({existing['customer_id']})"
+                )
+            row = conn.execute(
+                "SELECT next_value FROM company_ticket_seq WHERE name = 'customer'"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Customer sequence not initialized")
+            number = int(row["next_value"])
+            while conn.execute(
+                "SELECT 1 FROM company_customers WHERE customer_id = ?", (f"C-{number}",)
+            ).fetchone():
+                number += 1
+            customer = Customer(
+                customer_id=f"C-{number}", name=name, email=email, company=company
+            )
+            conn.execute(
+                "UPDATE company_ticket_seq SET next_value = ? WHERE name = 'customer'",
+                (number + 1,),
+            )
+            conn.execute(
+                "INSERT INTO company_customers (customer_id, name, email, company, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    customer.customer_id,
+                    customer.name,
+                    customer.email,
+                    customer.company,
+                    customer.created_at.isoformat(),
+                ),
+            )
+            _record_idempotent(conn, idempotency_key, "create_customer", request_hash, customer)
+        return customer, False
+
+    def deactivate_employee_idempotent(
+        self,
+        employee_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[Employee | None, Employee | None, bool]:
+        """Mark an employee inactive; refuses while open tickets are assigned to them.
+
+        Deactivating an already inactive employee changes nothing and succeeds.
+        Returns (employee, previous, replayed); (None, None, False) if not found.
+        """
+        request_hash = _request_hash("deactivate_employee", {"employee_id": employee_id})
+        with write_transaction(self.db_path) as conn:
+            prior = _load_idempotent(conn, idempotency_key, "deactivate_employee", request_hash)
+            if prior is not None:
+                change = EmployeeChange.model_validate(prior)
+                return change.employee, change.previous, True
+            previous = _select_employee(conn, employee_id)
+            if previous is None:
+                return None, None, False
+            if previous.status != "inactive":
+                blocking = [
+                    row["ticket_id"]
+                    for row in conn.execute(
+                        f"""
+                        SELECT ticket_id FROM company_tickets
+                        WHERE assignee_id = ?
+                          AND status IN ({_placeholders(OPEN_TICKET_STATUSES)})
+                        ORDER BY {_ticket_order_sql()}
+                        """,
+                        (employee_id, *sorted(OPEN_TICKET_STATUSES)),
+                    )
+                ]
+                if blocking:
+                    raise BusinessRuleError(
+                        f"Employee {employee_id} still has {len(blocking)} open ticket(s) "
+                        f"assigned ({', '.join(blocking)}); reassign them before deactivating"
+                    )
+                conn.execute(
+                    "UPDATE company_employees SET status = 'inactive', updated_at = ? "
+                    "WHERE employee_id = ?",
+                    (utc_now().isoformat(), employee_id),
+                )
+            employee = _select_employee(conn, employee_id)
+            assert employee is not None
+            _record_idempotent(
+                conn, idempotency_key, "deactivate_employee", request_hash,
+                EmployeeChange(employee=employee, previous=previous),
+            )
+        return employee, previous, False
 
     def count_employees(self) -> int:
         with connect(self.db_path) as conn:

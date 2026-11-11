@@ -73,6 +73,26 @@ def observe_tool_result(tool_name: str, result: ToolResult) -> str:
     if result.ok:
         data = result.data or {}
         if tool_name == "company_api":
+            if "tickets" in data:
+                return (
+                    f"Company API listed {data.get('count', 0)} of {data.get('total', 0)} "
+                    "matching ticket(s)."
+                )
+            if "customer" in data:
+                return f"Company API created customer {data['customer'].get('customer_id')}."
+            if "previous" in data and "ticket" in data:
+                ticket = data["ticket"]
+                return (
+                    f"Company API updated ticket {ticket.get('ticket_id')} "
+                    f"(status {ticket.get('status')}, priority {ticket.get('priority')}, "
+                    f"assignee {ticket.get('assignee_id')})."
+                )
+            if "previous" in data and "employee" in data:
+                employee = data["employee"]
+                return (
+                    f"Company API set employee {employee.get('employee_id')} "
+                    f"status to {employee.get('status')}."
+                )
             if "ticket" in data:
                 ticket = data["ticket"]
                 return (
