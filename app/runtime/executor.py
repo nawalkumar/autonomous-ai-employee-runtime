@@ -29,6 +29,8 @@ from app.models.records import (
 )
 from app.models.state import ExecutionState
 from app.policy import ApprovalPolicy
+from app.models.references import BindingError, contains_reference
+from app.runtime.binding import prepare_arguments
 from app.runtime.recovery import (
     RecoveryAction,
     classify_failure,
@@ -228,12 +230,19 @@ class ExecutionRuntime:
         if located is not None:
             step_index, step = located
             tool_name = step.resolved_tool_name() or ""
-            if not pending_matches(pending, tool_name, step.arguments):
+            try:
+                arguments = prepare_arguments(state, step, self._tool(tool_name)).arguments
+            except BindingError as exc:
+                raise ApprovalError(
+                    f"The pending step's arguments cannot be resolved ({exc.message}); "
+                    "nothing was approved."
+                ) from None
+            if not pending_matches(pending, tool_name, arguments):
                 decision = self.policy.evaluate(
-                    tool_name=tool_name, arguments=dict(step.arguments), tool=self._tool(tool_name)
+                    tool_name=tool_name, arguments=arguments, tool=self._tool(tool_name)
                 )
                 self._request_approval(
-                    state, step_index, step, tool_name, decision, stale=pending
+                    state, step_index, step, tool_name, decision, arguments, stale=pending
                 )
                 raise StaleApprovalError(
                     "The pending action no longer matches the planned step; a new "
@@ -352,12 +361,15 @@ class ExecutionRuntime:
             return None
 
     def _approval_still_valid(
-        self, state: ExecutionState, step: PlanStep, tool_name: str, tool: BaseTool | None
+        self,
+        state: ExecutionState,
+        step: PlanStep,
+        tool_name: str,
+        tool: BaseTool | None,
+        arguments: dict[str, Any],
     ) -> tuple[bool, Any]:
         """Re-check, immediately before a tool call, that a gated action is approved."""
-        decision = self.policy.evaluate(
-            tool_name=tool_name, arguments=dict(step.arguments), tool=tool
-        )
+        decision = self.policy.evaluate(tool_name=tool_name, arguments=arguments, tool=tool)
         if not decision.requires_approval:
             return True, decision
         pending = state.pending_action
@@ -365,9 +377,78 @@ class ExecutionRuntime:
             state.approval_status is ApprovalStatus.APPROVED
             and pending is not None
             and pending.step_id == step.step_id
-            and pending_matches(pending, tool_name, step.arguments)
+            and pending_matches(pending, tool_name, arguments)
         )
         return valid, decision
+
+    @staticmethod
+    def _changed_action(
+        state: ExecutionState, step: PlanStep, tool_name: str, arguments: dict[str, Any]
+    ) -> str | None:
+        """Why running ``arguments`` now would reuse the step's idempotency key for a
+        different action than an earlier attempt, or None if it would not."""
+        current = action_fingerprint(tool_name, arguments)
+        for call in state.tool_calls:
+            if call.step_id == step.step_id and action_fingerprint(
+                call.tool_name, call.arguments
+            ) != current:
+                return (
+                    f"Step '{step.step_id}' would now run a different action than its "
+                    f"earlier attempt {call.attempt or '?'} ({call.call_id}); refusing to "
+                    f"reuse idempotency key {idempotency_key_for(state.task_id, step.step_id)}"
+                )
+        return None
+
+    def _fail_before_call(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        tool_name: str | None,
+        *,
+        failure_type: FailureType,
+        message: str,
+        event_type: str,
+    ) -> ExecutionState:
+        """Fail a step whose tool must not be invoked (nothing is executed)."""
+        plan = list(state.plan)
+        plan[step_index] = step.model_copy(update={"status": PlanStepStatus.FAILED})
+        state = state.model_copy(
+            update={
+                "plan": plan,
+                "current_step": step_index,
+                "final_status": TaskStatus.FAILED,
+                "completion_summary": message,
+                "failures": [
+                    *state.failures,
+                    FailureRecord(
+                        task_id=state.task_id,
+                        step_id=step.step_id,
+                        failure_type=failure_type,
+                        message=message,
+                        retryable=False,
+                        recovery_action=RecoveryAction.FAIL.value,
+                    ),
+                ],
+            }
+        ).touch()
+        self._save(state)
+        failure = {"failure_type": failure_type.value, "message": message, "step_id": step.step_id}
+        for kind, action in (
+            (event_type, event_type.replace(".", "_")),
+            (EventType.STEP_FAILED, "step_failed"),
+            (EventType.TASK_FAILED, "task_failed"),
+        ):
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=kind,
+                    action=action,
+                    tool=tool_name,
+                    failure=failure,
+                )
+            )
+        return state
 
     def _mark_running(self, state: ExecutionState) -> ExecutionState:
         state = state.model_copy(update={"final_status": TaskStatus.RUNNING}).touch()
@@ -401,9 +482,20 @@ class ExecutionRuntime:
         except KeyError:
             tool = None
 
+        # References are resolved before the policy gate, so approval, its
+        # fingerprint and the tool call all see the concrete action.
+        try:
+            prepared = prepare_arguments(state, step, tool)
+        except BindingError as exc:
+            return self._fail_before_call(
+                state, step_index, step, tool_name,
+                failure_type=exc.failure_type, message=exc.message,
+                event_type=EventType.ARGUMENTS_UNRESOLVED,
+            )
+
         # Policy gate BEFORE any tool mutation or step RUNNING transition.
         paused_or_ready = self._apply_approval_gate(
-            state, step_index, step, tool_name, tool
+            state, step_index, step, tool_name, tool, prepared.arguments
         )
         if paused_or_ready.final_status is TaskStatus.NEEDS_APPROVAL:
             return paused_or_ready
@@ -442,15 +534,51 @@ class ExecutionRuntime:
                 },
             )
         )
+        if prepared.references:
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.ARGUMENTS_RESOLVED,
+                    action="arguments_resolved",
+                    tool=tool_name,
+                    arguments=dict(prepared.arguments),
+                    result={
+                        "step_id": step.step_id,
+                        "references": prepared.references,
+                        "fingerprint": action_fingerprint(tool_name, prepared.arguments),
+                    },
+                )
+            )
 
         attempt = prior_attempts
         while True:
-            # Immediately before each invocation (retries included): the approved
-            # action must still be exactly the action about to run.
-            approved, decision = self._approval_still_valid(state, step, tool_name, tool)
+            # Re-resolved before every attempt (retries included) from the persisted
+            # outputs of completed steps; unchanged outputs give identical arguments.
+            try:
+                prepared = prepare_arguments(state, step, tool)
+            except BindingError as exc:
+                return self._fail_before_call(
+                    state, step_index, step, tool_name,
+                    failure_type=exc.failure_type, message=exc.message,
+                    event_type=EventType.ARGUMENTS_UNRESOLVED,
+                )
+            arguments = prepared.arguments
+            # Immediately before each invocation: the approved action must still
+            # be exactly the action about to run.
+            approved, decision = self._approval_still_valid(
+                state, step, tool_name, tool, arguments
+            )
             if not approved:
                 return self._request_approval(
-                    state, step_index, step, tool_name, decision, stale=state.pending_action
+                    state, step_index, step, tool_name, decision, arguments,
+                    stale=state.pending_action,
+                )
+            changed = self._changed_action(state, step, tool_name, arguments)
+            if changed:
+                return self._fail_before_call(
+                    state, step_index, step, tool_name,
+                    failure_type=FailureType.ENVIRONMENT_UNEXPECTED, message=changed,
+                    event_type=EventType.ACTION_CHANGED,
                 )
             attempt += 1
             key = idempotency_key_for(state.task_id, step.step_id)
@@ -465,10 +593,17 @@ class ExecutionRuntime:
                 task_id=state.task_id,
                 step_id=step.step_id,
                 tool_name=tool_name,
-                arguments=dict(step.arguments),
+                arguments=dict(arguments),
                 status=ToolCallStatus.RUNNING,
                 idempotency_key=key,
                 attempt=attempt,
+                references=prepared.references or None,
+                approval_required=decision.requires_approval,
+                approval_fingerprint=(
+                    pending_fingerprint(state.pending_action)
+                    if decision.requires_approval and state.pending_action is not None
+                    else None
+                ),
             )
             state = state.model_copy(
                 update={"tool_calls": [*state.tool_calls, call]}
@@ -480,7 +615,7 @@ class ExecutionRuntime:
                     event_type=EventType.TOOL_CALLED,
                     action="tool_called",
                     tool=tool_name,
-                    arguments=dict(step.arguments),
+                    arguments=dict(arguments),
                     result={
                         "idempotency_key": key,
                         "step_id": step.step_id,
@@ -497,7 +632,7 @@ class ExecutionRuntime:
                 )
             else:
                 try:
-                    result = tool.invoke(step.arguments, idempotency_key=key)
+                    result = tool.invoke(arguments, idempotency_key=key)
                 except Exception as exc:
                     result = ToolResult.failure(
                         FailureType.ENVIRONMENT_UNEXPECTED.value,
@@ -1097,11 +1232,12 @@ class ExecutionRuntime:
         step: PlanStep,
         tool_name: str,
         tool: BaseTool | None,
+        arguments: dict[str, Any],
     ) -> ExecutionState:
-        """Pause before sensitive tools unless this step was already approved."""
+        """Pause before sensitive tools unless this exact (resolved) action was approved."""
         decision = self.policy.evaluate(
             tool_name=tool_name,
-            arguments=dict(step.arguments),
+            arguments=arguments,
             tool=tool,
         )
         if not decision.requires_approval:
@@ -1113,23 +1249,23 @@ class ExecutionRuntime:
             # Keep pending_action until the step succeeds so a crash mid-resume
             # still remembers the approval and does not re-prompt or re-mutate twice.
             if state.approval_status is ApprovalStatus.APPROVED:
-                if pending_matches(pending, tool_name, step.arguments):
+                if pending_matches(pending, tool_name, arguments):
                     return state.model_copy(update={"current_step": step_index}).touch()
                 return self._request_approval(
-                    state, step_index, step, tool_name, decision, stale=pending
+                    state, step_index, step, tool_name, decision, arguments, stale=pending
                 )
             # Already waiting on this step.
             if (
                 state.final_status is TaskStatus.NEEDS_APPROVAL
                 and state.approval_status is ApprovalStatus.PENDING
             ):
-                if pending_matches(pending, tool_name, step.arguments):
+                if pending_matches(pending, tool_name, arguments):
                     return state
                 return self._request_approval(
-                    state, step_index, step, tool_name, decision, stale=pending
+                    state, step_index, step, tool_name, decision, arguments, stale=pending
                 )
 
-        return self._request_approval(state, step_index, step, tool_name, decision)
+        return self._request_approval(state, step_index, step, tool_name, decision, arguments)
 
     def _request_approval(
         self,
@@ -1138,15 +1274,19 @@ class ExecutionRuntime:
         step: PlanStep,
         tool_name: str,
         decision: Any,
+        arguments: dict[str, Any],
         *,
         stale: PendingAction | None = None,
     ) -> ExecutionState:
-        """Persist a pending approval for exactly this step's current action.
+        """Persist a pending approval for exactly this step's current (resolved) action.
 
         ``stale`` is a previous request or approval for the step that no longer
         matches its action; it is recorded as invalidated, never executed.
         """
-        fingerprint = action_fingerprint(tool_name, dict(step.arguments))
+        if contains_reference(arguments):
+            raise ValueError("Refusing to request approval for unresolved references")
+        arguments = dict(arguments)
+        fingerprint = action_fingerprint(tool_name, arguments)
         if stale is not None:
             self._emit(
                 make_event(
@@ -1154,7 +1294,7 @@ class ExecutionRuntime:
                     event_type=EventType.APPROVAL_INVALIDATED,
                     action="approval_invalidated",
                     tool=tool_name,
-                    arguments=dict(step.arguments),
+                    arguments=arguments,
                     result={
                         "step_id": step.step_id,
                         "previous_status": state.approval_status.value,
@@ -1175,7 +1315,7 @@ class ExecutionRuntime:
         key = idempotency_key_for(state.task_id, step.step_id)
         pending = PendingAction(
             tool_name=tool_name,
-            arguments=dict(step.arguments),
+            arguments=arguments,
             step_id=step.step_id,
             idempotency_key=key,
             reason=decision.reason,
@@ -1202,7 +1342,7 @@ class ExecutionRuntime:
                 event_type=EventType.APPROVAL_REQUESTED,
                 action="approval_requested",
                 tool=tool_name,
-                arguments=dict(step.arguments),
+                arguments=arguments,
                 result={
                     "step_id": step.step_id,
                     "risk": decision.risk.value,

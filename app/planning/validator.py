@@ -5,6 +5,8 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from app.models.plan import Plan, PlanStep
+from app.models.references import ReferenceSyntaxError, contains_reference
+from app.planning.references import PlanReferenceError, validate_plan_references
 from app.tools.registry import ToolRegistry
 
 
@@ -38,12 +40,19 @@ def validate_plan(plan: Plan, registry: ToolRegistry) -> Plan:
 
         tool = registry.get(tool_name)
         try:
-            tool.args_schema.model_validate(step.arguments)
-        except ValidationError as exc:
-            raise PlanValidationError(
-                f"Invalid arguments for tool '{tool_name}' in step '{step_id}': "
-                f"{exc.errors()}"
-            ) from exc
+            has_references = contains_reference(step.arguments)
+        except ReferenceSyntaxError as exc:
+            raise PlanValidationError(f"Step '{step_id}': {exc}") from exc
+        if not has_references:
+            try:
+                tool.args_schema.model_validate(step.arguments)
+            except ValidationError as exc:
+                raise PlanValidationError(
+                    f"Invalid arguments for tool '{tool_name}' in step '{step_id}': "
+                    f"{exc.errors()}"
+                ) from exc
+        # A step with references is checked by validate_plan_references below;
+        # its complete arguments are validated after resolution, before it runs.
 
         normalized_steps.append(
             step.model_copy(
@@ -54,6 +63,10 @@ def validate_plan(plan: Plan, registry: ToolRegistry) -> Plan:
             )
         )
 
+    try:
+        validate_plan_references(normalized_steps, registry)
+    except PlanReferenceError as exc:
+        raise PlanValidationError(str(exc)) from exc
     return Plan(steps=normalized_steps)
 
 
