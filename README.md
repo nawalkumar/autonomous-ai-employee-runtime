@@ -22,6 +22,7 @@ SQLite database and per-task locks. All company data is fictional.
 - [CLI walkthrough](#cli-walkthrough)
 - [HTTP API](#http-api)
 - [Capability registry](#capability-registry)
+- [Company data model and demo company](#company-data-model-and-demo-company)
 - [Local mode and public demo mode](#local-mode-and-public-demo-mode)
 - [Security model](#security-model)
 - [Configuration](#configuration)
@@ -59,6 +60,11 @@ goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
   approval is invalidated and a fresh one is requested (`stale_approval`).
 - Operation metadata (risk, approval, retry safety, idempotency, verification strategy)
   lives in one registry, discoverable at `GET /api/v1/capabilities`.
+- Five new company operations (`list_tickets`, `update_ticket`, `assign_ticket`,
+  `create_customer`, `deactivate_employee`) with independent verification, an additive
+  schema migration, and a separately seeded demo company
+  ([details](#company-data-model-and-demo-company)). They are available to explicit
+  plans; the mock planner's two goal formats are unchanged.
 
 ## Platform support
 
@@ -289,15 +295,16 @@ Each capability declares:
 | `tool`, `operation`, `description` | Identity and a human-readable summary |
 | `input_schema` | JSON schema for this operation, derived from the tool's argument model (required inputs, at-least-one-of inputs, constraints) |
 | `output_schema` | JSON schema of the result data (checked against real tool results in tests) |
-| `risk` | `read` or `write` (`destructive` is reserved; no operation uses it) |
-| `requires_approval`, `approval_reason` | Whether the policy gate pauses before the operation |
+| `risk` | `read`, `write` or `destructive` (destructive operations always need approval) |
+| `requires_approval`, `approval_reason` | Whether the policy gate always pauses before the operation |
+| `approval_condition` | Approval required only for some arguments, described in words (for example closing a ticket) |
 | `retry_safe` | Whether a transient failure may be retried within the per-step budget |
 | `idempotency` | `not_required` (reads), `keyed_transaction` (company writes keyed by `task_id:step_id` in the same SQLite transaction), `deterministic_overwrite` (file writes) |
 | `mutates` | `none`, `company` or `workspace` |
-| `verification` | `none`, `employee_fields`, `ticket_record` or `file_content` |
+| `verification` | `none`, `employee_fields`, `ticket_record`, `file_content`, `ticket_fields`, `ticket_assignment`, `customer_record` or `employee_status` |
 | `preconditions` | Human-readable conditions the tool enforces |
 
-The eight registered operations:
+The thirteen registered operations:
 
 | Operation | Risk | Approval | Retry-safe | Idempotency | Mutates | Verification |
 |-----------|------|----------|------------|-------------|---------|--------------|
@@ -306,9 +313,18 @@ The eight registered operations:
 | `company_api.find_customer` | read | no | yes | not_required | none | none |
 | `company_api.create_ticket` | write | no | yes | keyed_transaction | company | ticket_record |
 | `company_api.get_ticket` | read | no | yes | not_required | none | none |
+| `company_api.list_tickets` | read | no | yes | not_required | none | none |
+| `company_api.update_ticket` | write | **when closing** | yes | keyed_transaction | company | ticket_fields |
+| `company_api.assign_ticket` | write | no | yes | keyed_transaction | company | ticket_assignment |
+| `company_api.create_customer` | write | **yes** | yes | keyed_transaction | company | customer_record |
+| `company_api.deactivate_employee` | destructive | **yes** | yes | keyed_transaction | company | employee_status |
 | `file.read` | read | no | yes | not_required | none | none |
 | `file.write` | write | no | yes | deterministic_overwrite | workspace | file_content |
 | `file.list` | read | no | yes | not_required | none | none |
+
+The five operations added in v0.3.0 reject any argument they do not declare (their
+input schemas set `additionalProperties: false`) and validate identifier formats
+(`T-<n>`, `E-<n>`, `C-<n>`). The original eight keep their v0.2.0 argument handling.
 
 An operation that is not registered has no capability and therefore no permissions:
 it is never classified as a read, never retry-safe, rejected by plan validation and by
@@ -322,9 +338,124 @@ or task data. Like `/api/v1/scenarios` it needs no demo session, and the `Host`
 allowlist and rate limits apply.
 
 **What it is not:** the registry describes the existing deterministic runtime. The mock
-planner still accepts only its two goal formats. LLM-based planning, new business
-operations, dynamic tool selection and replanning are planned future work and are not
+planner still accepts only its two goal formats. LLM-based planning, dynamic tool
+selection, step-output references and replanning are planned future work and are not
 implemented.
+
+## Company data model and demo company
+
+### Schema and migration
+
+The v0.3.0 company schema adds two columns to the v0.2.0 tables:
+
+- `company_employees.status`: `active` or `inactive` (default `active`, `CHECK`
+  constraint).
+- `company_tickets.assignee_id`: the assigned employee, or `NULL` (default). It
+  references `company_employees.employee_id`; employees are deactivated, never deleted,
+  so the reference never dangles.
+
+The sequence table `company_ticket_seq` gains a `customer` row, starting after the
+highest existing `C-<n>` (at least `C-1004`).
+
+The migration runs automatically whenever a database is opened and is additive and
+idempotent:
+- It never drops or rewrites columns, rows or identifiers, and it never re-seeds.
+- Existing employees become `active`; existing tickets stay unassigned.
+- Concurrent processes migrate once: the column check is repeated under an exclusive
+  write lock.
+
+Rollback limitations: there is no down-migration. v0.2.0 can still open an upgraded
+database, but it ignores employee status and assignments. Data written by v0.3.0 (new
+customers, assignments, inactive employees) is not undone.
+
+### Business rules
+
+| From status | Allowed new status |
+|-------------|--------------------|
+| `open` | `in_progress`, `resolved` |
+| `in_progress` | `open`, `resolved` |
+| `resolved` | `in_progress`, `closed` (closing needs approval) |
+| `closed` | none (terminal) |
+
+- **Ticket status:** setting a ticket's current status again is a no-op. Only status
+  and priority can be updated; any other field rejects the whole request.
+- **Assignment:** only `open` or `in_progress` tickets can be assigned, and only to an
+  active employee in Support. Reassigning replaces the previous assignee.
+- **New customers:** customers get the next `C-<n>`. Name, company and email are
+  required. The email is stored in lower case and must be unique, compared
+  case-insensitively.
+- **Deactivation:** an employee with any `open` or `in_progress` ticket assigned cannot
+  be deactivated. The error lists the tickets to reassign; nothing else is changed.
+  Deactivating an inactive employee changes nothing.
+- **Failure types:**
+  - Rule violations fail as `policy_blocked`; they are never retried.
+  - Invalid input or a disallowed transition fails as `invalid_args`.
+  - Unknown records fail as `environment_unexpected`.
+- **Verification:** each change re-reads the database. Ticket updates, assignments and
+  deactivations also compare every field that should not have changed against the
+  before-state recorded in the same transaction.
+
+### Demo company
+
+A deterministic, fictional company for exercising these operations, seeded into a
+separate database:
+
+```bash
+uv run python -m app.world.demo_fixture --database data/demo.db
+DATABASE_PATH=data/demo.db uv run aae-api
+uv run python -m app.world.demo_fixture --database data/demo.db --reset
+```
+
+Safety rules:
+- The seeder only writes to a new or empty file, or to a database it created itself
+  (marked by a `demo_fixture_meta` table).
+- It refuses any other database, including your normal `data/runtime.db`, even with
+  `--reset`.
+- Re-running it changes nothing; `--reset` recreates a marked demo database.
+- There is no HTTP endpoint for seeding or resetting.
+
+Contents: 20 employees, 10 customers and 60 tickets; the next ticket is `T-10061` and
+the next customer `C-1011`. Totals by group:
+
+| Group | Breakdown |
+|-------|-----------|
+| Departments | Support 7, Engineering 4, Product 3, Finance 3, Operations 3 |
+| Ticket status | open 22, in_progress 11, resolved 16, closed 11 |
+| Ticket priority | low 15, medium 18, high 14, urgent 13 |
+
+The default records (E-17, E-23, E-31, C-1001–C-1003) are included unchanged, so both
+mock goals work on it.
+
+| Scenario | Records |
+|----------|---------|
+| High-priority unassigned open tickets | `T-10001`–`T-10004` |
+| Globex (`C-1002`) open low/medium tickets to escalate | `T-10005`–`T-10008` |
+| Resolved tickets eligible for closing | `T-10009`–`T-10012` |
+| Offboarding candidate with open tickets | `E-44` Rina Patel: `T-10013`–`T-10015` |
+| Duplicate-looking tickets (review only) | `T-10016`, `T-10017` |
+| Eligible assignees (active Support) | `E-31`, `E-40`–`E-44` |
+| Ineligible assignees | `E-45` (inactive; only a closed ticket), everyone outside Support |
+
+### Workflow readiness
+
+`tests/test_business_workflows.py` exercises ten workflows on the demo company.
+
+| Workflow | Status | What works today | Blocked until later milestones |
+|----------|--------|------------------|--------------------------------|
+| W1 Change an employee title | Supported | Natural-language goal (mock format A), approval, verification | — |
+| W2 Create a billing discrepancy ticket | Supported | Natural-language goal (mock format B), verification | — |
+| W3 Transfer an employee between departments | Operations supported | Explicit `update_employee` plan with approval | Natural-language planning |
+| W4 Correct an employee email | Operations supported | Explicit plan; a duplicate email fails with no change | Natural-language planning |
+| W5 Resolve or close a ticket | Operations supported | Allowed transitions; closing paused for approval | Natural-language planning |
+| W6 Escalate matching customer tickets | Partial | `list_tickets` and per-ticket `update_ticket` | Iterating over a listing's output |
+| W7 Assign a ticket to a support engineer | Operations supported | Eligibility rules enforced and verified | Natural-language planning |
+| W8 Create a customer and welcome ticket | Partial | `create_customer` (approval) and `create_ticket` | Passing the new customer ID to the next step |
+| W9 Produce a daily ticket summary | Partial | Counts match an independent recount; summary file verified | Writing content derived from a listing |
+| W10 Deactivate an employee safely | Partial | Refusal with open tickets; reassign, then deactivate with approval | Finding and reassigning blocking tickets automatically |
+
+In the partial workflows the test passes earlier results to later steps itself; the
+runtime has no step-output references yet. There is no natural-language handler for
+W3–W10.
 
 ## Local mode and public demo mode
 
@@ -542,7 +673,7 @@ app/
   tools/      # company API and file tools, capability registry, tool registry, failure injection
   verify/     # independent outcome verifier
   store/      # SQLite task state and audit events
-  world/      # mock company database and seed data
+  world/      # mock company database, additive migrations, seed data, demo_fixture.py
   models/     # domain models
 demo-ui/      # scripted simulation page (offline presentations only)
 docs/images/  # dashboard screenshots
