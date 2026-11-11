@@ -83,6 +83,39 @@ def make_world(tmp_path: Path, *, demo: bool) -> World:
     return World(db, workspace, repo, injector, registry, store, runtime)
 
 
+def reopen(world: World) -> World:
+    """A new runtime over the same database and workspace (a process restart)."""
+    repo = CompanyRepository(world.db)
+    injector = FailureInjector()
+    registry = ToolRegistry()
+    registry.register(CompanyAPITool(repo, failure_injector=injector))
+    registry.register(FileTool(world.workspace, protected_paths=[world.db]))
+    store = SQLiteStore(world.db)
+    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=world.workspace)
+    return World(world.db, world.workspace, repo, injector, registry, store, runtime)
+
+
+class SimulatedCrash(BaseException):
+    """Escapes the executor's exception handling, like a killed process."""
+
+
+def crash_during(world: World, operation: str, *, after_commit: bool) -> None:
+    """Make the next ``operation`` call crash, before or after its database commit."""
+    tool = world.company
+    original = tool.execute
+    pending = {"crash": True}
+
+    def execute(args, *, idempotency_key=None):
+        if args.operation == operation and pending["crash"]:
+            pending["crash"] = False
+            if after_commit:
+                original(args, idempotency_key=idempotency_key)
+            raise SimulatedCrash(operation)
+        return original(args, idempotency_key=idempotency_key)
+
+    tool.execute = execute  # type: ignore[method-assign]
+
+
 def step(step_id: str, operation: str, **arguments: Any) -> PlanStep:
     tool = "file" if operation in ("read", "write", "list") else "company_api"
     return PlanStep(

@@ -134,6 +134,26 @@ def derive_criteria_from_execution(state: ExecutionState) -> list[SuccessCriteri
         if call.status is not ToolCallStatus.SUCCEEDED:
             continue
         args = call.arguments or {}
+        # Dataflow is checked for state-changing calls only, so a read-only task
+        # stays "unverified" even when it used references.
+        mutating = (call.tool_name, args.get("operation")) in MUTATING_OPERATIONS
+        for reference in (call.references or []) if mutating else []:
+            criteria.append(
+                SuccessCriterion(
+                    description=(
+                        f"Step '{call.step_id}' used the output of step '{reference.get('step_id')}'"
+                    ),
+                    criterion_type="reference_binding",
+                    target="plan",
+                    expected_value={
+                        "source_call_id": call.call_id,
+                        "source_step_id": call.step_id,
+                        "location": reference.get("location"),
+                        "producer_step_id": reference.get("step_id"),
+                        "path": reference.get("path"),
+                    },
+                )
+            )
         if call.tool_name == "company_api":
             op = args.get("operation")
             if op == "create_ticket":

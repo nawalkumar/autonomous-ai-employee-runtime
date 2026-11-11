@@ -10,7 +10,7 @@ from app.models.goal import SuccessCriterion
 from app.models.records import EvidenceItem
 from app.models.state import ExecutionState
 from app.tools.file import is_protected_file
-from app.verify import company_checks
+from app.verify import binding_checks, company_checks
 from app.verify.results import VerificationCheckResult, VerificationResult
 from app.verify.rules import collect_criteria, created_ticket_ids
 from app.world.repository import EMPLOYEE_UPDATE_FIELDS, CompanyRepository
@@ -25,6 +25,7 @@ _CRITERION_KINDS = {
     "file": "file",
     # v0.3.0 company operations; selected only by explicit criterion_type.
     **{name: name for name in company_checks.CHECKS},
+    "reference_binding": "reference_binding",
 }
 
 # Every key of an expected_value must be one the check actually evaluates (or a
@@ -46,6 +47,7 @@ _EVALUABLE_KEYS: dict[str, frozenset[str]] = {
     "employee": frozenset({"employee_id"}) | EMPLOYEE_UPDATE_FIELDS,
     "file": frozenset({"path", "content_contains"}),
     **company_checks.EVALUABLE_KEYS,
+    "reference_binding": binding_checks.EVALUABLE_KEYS,
 }
 
 
@@ -165,6 +167,8 @@ class OutcomeVerifier:
             return self._verify_employee(criterion, expected, require_field=ctype == "employee_field")
         if kind in company_checks.CHECKS:
             return company_checks.CHECKS[kind](self.repository, state, expected)
+        if kind == "reference_binding":
+            return binding_checks.verify_reference_binding(state, expected)
         return self._verify_file(criterion, expected)
 
     def _verify_step_completed(
@@ -209,11 +213,30 @@ class OutcomeVerifier:
             )
             return check, []
 
+        call = next(
+            c
+            for c in reversed(state.tool_calls)
+            if c.step_id == step_id and c.status is ToolCallStatus.SUCCEEDED
+        )
+        problem = binding_checks.approval_problem(call)
+        if problem:
+            check = VerificationCheckResult(
+                name="step_completed",
+                passed=False,
+                expected=expected,
+                actual={"step_status": step.status.value, "approval_fingerprint": call.approval_fingerprint},
+                message=f"Step '{step_id}' completed but {problem}",
+            )
+            return check, []
+
+        actual: dict[str, Any] = {"step_status": step.status.value, "successful_tool_call": True}
+        if call.approval_required:
+            actual["approval_fingerprint"] = call.approval_fingerprint
         check = VerificationCheckResult(
             name="step_completed",
             passed=True,
             expected=expected,
-            actual={"step_status": step.status.value, "successful_tool_call": True},
+            actual=actual,
             message=f"Planned step '{step_id}' completed with a successful tool call",
         )
         return check, []
