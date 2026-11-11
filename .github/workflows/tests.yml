@@ -15,6 +15,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    env:
+      # Browser end-to-end tests must run in CI; a missing browser is a failure.
+      AAE_REQUIRE_BROWSER_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
 
@@ -26,8 +29,47 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --frozen
 
+      - name: Install Chromium for browser tests (Linux)
+        if: runner.os == 'Linux'
+        run: uv run playwright install --with-deps chromium
+
+      - name: Install Chromium for browser tests (Windows)
+        if: runner.os == 'Windows'
+        run: uv run playwright install chromium
+
       - name: Compile
-        run: uv run python -m compileall -q app tests
+        run: uv run python -m compileall -q app tests scripts
 
       - name: Test
         run: uv run pytest -q -rs
+
+  docker:
+    name: docker image (public demo smoke test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.12.0"
+          python-version: "3.10"
+
+      - name: Build image
+        run: docker build -t aae-runtime:ci .
+
+      - name: Run like Render Free (public mode, PORT, 512 MB, read-only root)
+        run: >
+          docker run -d --name aae -p 127.0.0.1:10000:10000
+          --memory 512m --read-only --tmpfs /tmp:rw,size=64m
+          --cap-drop ALL --security-opt no-new-privileges
+          -e APP_MODE=public -e PORT=10000 -e ALLOWED_HOSTS=127.0.0.1
+          -e SESSION_COOKIE_SECURE=false aae-runtime:ci
+
+      - name: Smoke test
+        run: |
+          uv sync --frozen
+          uv run python scripts/smoke_demo.py http://127.0.0.1:10000
+
+      - name: Container logs
+        if: always()
+        run: docker logs aae

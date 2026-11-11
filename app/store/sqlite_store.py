@@ -5,10 +5,22 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+from pydantic import ValidationError
 
 from app.models.events import AuditEvent
 from app.models.state import ExecutionState
+
+
+class StoredTask(NamedTuple):
+    """One persisted task row; ``state`` is None if its snapshot cannot be parsed."""
+
+    task_id: str
+    status: str
+    created_at: str
+    updated_at: str
+    state: ExecutionState | None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -67,9 +79,52 @@ class SQLiteStore:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    def _connect_read_only(self) -> sqlite3.Connection:
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+
+    def count_tasks(self) -> int:
+        conn = self._connect_read_only()
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        finally:
+            conn.close()
+
+    def list_tasks(self, *, limit: int = 50, offset: int = 0) -> list[StoredTask]:
+        """Newest-first task snapshots over a read-only connection (never writes)."""
+        conn = self._connect_read_only()
+        try:
+            rows = conn.execute(
+                """
+                SELECT task_id, status, created_at, updated_at, state_json
+                FROM tasks
+                ORDER BY created_at DESC, task_id ASC
+                LIMIT ? OFFSET ?
+                """,
+                (max(0, int(limit)), max(0, int(offset))),
+            ).fetchall()
+        finally:
+            conn.close()
+        tasks: list[StoredTask] = []
+        for row in rows:
+            try:
+                state: ExecutionState | None = ExecutionState.model_validate_json(
+                    row["state_json"]
+                )
+            except ValidationError:
+                state = None
+            tasks.append(
+                StoredTask(
+                    row["task_id"], row["status"], row["created_at"], row["updated_at"], state
+                )
+            )
+        return tasks
 
     def save_state(self, state: ExecutionState) -> None:
         """Upsert a full ExecutionState snapshot for a task."""

@@ -1,5 +1,5 @@
 """Persistence layer."""
 
-from app.store.sqlite_store import SQLiteStore
+from app.store.sqlite_store import SQLiteStore, StoredTask
 
-__all__ = ["SQLiteStore"]
+__all__ = ["SQLiteStore", "StoredTask"]

@@ -358,6 +358,20 @@ class CompanyRepository:
             ).fetchall()
         return [Ticket.model_validate(dict(row)) for row in rows]
 
+    def list_employees(self) -> list[Employee]:
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM company_employees ORDER BY employee_id ASC"
+            ).fetchall()
+        return [Employee.model_validate(dict(row)) for row in rows]
+
+    def list_customers(self) -> list[Customer]:
+        with connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM company_customers ORDER BY customer_id ASC"
+            ).fetchall()
+        return [Customer.model_validate(dict(row)) for row in rows]
+
     def count_employees(self) -> int:
         with connect(self.db_path) as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM company_employees").fetchone()

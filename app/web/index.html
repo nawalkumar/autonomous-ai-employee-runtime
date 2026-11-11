@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Autonomous AI Employee — Live Dashboard</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="disclaimer" id="modeNotice" role="note">Connecting to the runtime…</div>
+    <div class="banner error" id="connectionBanner" role="alert" hidden></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="badges">
+          <span class="badge accent">CentrAlign AI Challenge</span>
+          <span class="badge live" id="modeBadge">Connecting</span>
+          <span class="badge" id="versionBadge" hidden></span>
+        </div>
+        <h1>Autonomous AI Employee</h1>
+        <div class="subtitle">Goal-driven execution runtime — live dashboard</div>
+      </div>
+      <div class="active-banner">
+        <div>
+          <div class="label">Active stage</div>
+          <div class="value" id="activeStageLabel">Idle</div>
+        </div>
+        <div class="status-pill idle" id="statusPill" role="status" aria-live="polite">idle</div>
+      </div>
+    </header>
+
+    <section class="card session-card" id="sessionCard" aria-labelledby="sessionTitle" hidden>
+      <div class="card-hd"><h2 id="sessionTitle">Start a demo session</h2></div>
+      <div class="card-bd">
+        <p class="session-text" id="sessionText"></p>
+        <form id="sessionForm" class="session-form" novalidate>
+          <div id="accessCodeRow" hidden>
+            <label for="accessCode">Access code</label>
+            <input type="password" id="accessCode" maxlength="128" autocomplete="off" />
+          </div>
+          <div class="btn-row">
+            <button class="primary" type="submit" id="sessionBtn">Start demo session</button>
+          </div>
+          <div class="form-msg" id="sessionMsg" role="status" aria-live="polite"></div>
+        </form>
+      </div>
+    </section>
+
+    <main id="dashboard">
+      <div class="controls">
+        <section class="card" aria-labelledby="goalTitle">
+          <div class="card-hd"><h2 id="goalTitle">Goal</h2></div>
+          <div class="card-bd">
+            <form id="goalForm" novalidate>
+              <div class="scenario-row" id="scenarioButtons" role="group" aria-label="Supported scenarios"></div>
+              <label for="goalInput">Goal (only the supported formats are accepted)</label>
+              <textarea id="goalInput" maxlength="300" spellcheck="false" aria-describedby="goalHint"></textarea>
+              <div class="hint" id="goalHint"></div>
+              <div class="inject-row" id="injectRow" hidden>
+                <label class="check" for="injectToggle">
+                  <input type="checkbox" id="injectToggle" />
+                  <span>Inject one <strong>simulated</strong> 503 into <code>company_api.create_ticket</code> (demo control, not a real outage)</span>
+                </label>
+              </div>
+              <div class="btn-row">
+                <button class="primary" type="submit" id="runBtn">Run Employee</button>
+                <button type="button" id="newTaskBtn">New goal</button>
+              </div>
+              <div class="form-msg" id="formMsg" role="status" aria-live="polite"></div>
+            </form>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="metricsTitle">
+          <div class="card-hd"><h2 id="metricsTitle">Runtime metrics</h2></div>
+          <div class="card-bd">
+            <div class="metrics">
+              <div class="metric"><div class="k">Recovery retries</div><div class="v" id="mRecovery">—</div></div>
+              <div class="metric"><div class="k">Verification</div><div class="v" id="mVerify">—</div></div>
+              <div class="metric"><div class="k">Final status</div><div class="v" id="mStatus">IDLE</div></div>
+              <div class="metric"><div class="k">Evidence</div><div class="v" id="mEvidence">—</div></div>
+            </div>
+            <div class="explain" id="explainBox">Choose a scenario and click Run Employee. The task runs on the real runtime; this page shows the persisted state.</div>
+          </div>
+        </section>
+      </div>
+
+      <div class="pipeline" id="pipeline" aria-label="Execution stages derived from persisted events"></div>
+
+      <section class="approval-card" id="approvalCard" aria-labelledby="approvalTitle">
+        <h3 id="approvalTitle">Human approval required</h3>
+        <div class="sub">The policy gate paused execution before this write. Nothing has been written yet. Your decision is sent to the server, which enforces it.</div>
+        <div class="approval-grid">
+          <div class="box"><div class="k">Step / tool</div><div class="v" id="apStep">—</div></div>
+          <div class="box"><div class="k">Operation</div><div class="v" id="apOperation">—</div></div>
+          <div class="box"><div class="k">Risk</div><div class="v" id="apRisk">—</div></div>
+          <div class="box"><div class="k">Reason</div><div class="v" id="apReason">—</div></div>
+        </div>
+        <div class="box args-box"><div class="k">Arguments</div><pre class="v" id="apArgs">—</pre></div>
+        <label for="rejectReason">Rejection reason (stored on the task if you reject)</label>
+        <input type="text" id="rejectReason" maxlength="300" value="Rejected via dashboard" />
+        <div class="btn-row">
+          <button class="success" type="button" id="approveBtn">Approve action…</button>
+          <button class="danger" type="button" id="rejectBtn">Reject action…</button>
+        </div>
+        <div class="form-msg" id="approvalMsg" role="status" aria-live="polite"></div>
+      </section>
+
+      <div class="grid">
+        <section class="card" aria-labelledby="timelineTitle">
+          <div class="card-hd"><h2 id="timelineTitle">Execution timeline</h2><span class="count" id="eventCount"></span></div>
+          <div class="card-bd">
+            <div class="timeline" id="timeline" aria-live="polite"></div>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="planTitle">
+          <div class="card-hd"><h2 id="planTitle">Plan</h2></div>
+          <div class="card-bd">
+            <ul class="plan-list" id="planList"></ul>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="stateTitle">
+          <div class="card-hd"><h2 id="stateTitle">Runtime state</h2></div>
+          <div class="card-bd">
+            <div class="kv" id="runtimeState"></div>
+            <div class="btn-row">
+              <button type="button" id="refreshTaskBtn">Refresh</button>
+              <button type="button" id="resumeBtn" hidden>Resume task…</button>
+            </div>
+            <div class="form-msg" id="taskMsg" role="status" aria-live="polite"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="grid-bottom">
+        <section class="card" aria-labelledby="verifyTitle">
+          <div class="card-hd"><h2 id="verifyTitle">Verification &amp; evidence</h2></div>
+          <div class="card-bd">
+            <div id="verificationPanel"></div>
+          </div>
+        </section>
+        <section class="card" aria-labelledby="goalInterpTitle">
+          <div class="card-hd"><h2 id="goalInterpTitle">Interpreted goal</h2></div>
+          <div class="card-bd">
+            <div class="kv" id="interpretedGoal"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="grid-bottom">
+        <section class="card" aria-labelledby="historyTitle">
+          <div class="card-hd">
+            <h2 id="historyTitle">Task history</h2>
+            <button type="button" class="small" id="refreshListBtn">Refresh</button>
+          </div>
+          <div class="card-bd">
+            <ul class="task-list" id="taskList"></ul>
+          </div>
+        </section>
+        <section class="card" aria-labelledby="worldTitle">
+          <div class="card-hd">
+            <h2 id="worldTitle">Company &amp; workspace (read-only)</h2>
+            <button type="button" class="small" id="refreshWorldBtn">Refresh</button>
+          </div>
+          <div class="card-bd">
+            <div class="tabs" role="tablist" aria-label="Mock company data">
+              <button type="button" role="tab" id="tab-employees" aria-controls="worldPanel" aria-selected="true" data-tab="employees">Employees</button>
+              <button type="button" role="tab" id="tab-tickets" aria-controls="worldPanel" aria-selected="false" data-tab="tickets">Tickets</button>
+              <button type="button" role="tab" id="tab-customers" aria-controls="worldPanel" aria-selected="false" data-tab="customers">Customers</button>
+              <button type="button" role="tab" id="tab-files" aria-controls="worldPanel" aria-selected="false" data-tab="files">Workspace files</button>
+            </div>
+            <div id="worldPanel" role="tabpanel" aria-live="polite"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      Live dashboard • Autonomous AI Employee Runtime • every value on this page is read from the API.
+      The scripted replay in <code>demo-ui/index.html</code> is a separate, labelled simulation and is not used here.
+    </footer>
+  </div>
+
+  <dialog id="confirmDialog" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
+    <form method="dialog">
+      <h3 id="confirmTitle">Confirm</h3>
+      <p id="confirmBody"></p>
+      <pre id="confirmDetail" hidden></pre>
+      <div class="btn-row">
+        <button type="submit" value="cancel" id="confirmCancel">Cancel</button>
+        <button type="submit" value="confirm" class="primary" id="confirmOk">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
