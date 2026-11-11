@@ -1,7 +1,8 @@
 # Contributing
 
 Thanks for your interest. This project is a **local prototype**: a deterministic
-runtime with a mock planner, a CLI, and a `/health`-only HTTP API. Contributions
+runtime with a mock planner, a CLI, and an HTTP API plus dashboard that wrap the same
+runtime. Contributions
 that improve correctness, tests, documentation and portability are welcome.
 
 ## Setup
@@ -11,14 +12,20 @@ Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync
 uv run pytest -q
-uv run python -m compileall -q app tests
+uv run python -m compileall -q app tests scripts
 uv run aae --help
+uv run playwright install chromium   # browser tests; skipped locally if unavailable
 ```
+
+CI sets `AAE_REQUIRE_BROWSER_TESTS=1`, which turns a missing browser into a failure.
 
 ## Architecture
 
 ```text
-app/cli.py              CLI commands, exit codes, per-task locks
+app/cli.py              CLI commands, exit codes
+app/main.py, app/api/   HTTP API v1, request guard, public-demo sessions
+app/web/                live dashboard (static HTML/CSS/JS served by the API)
+app/runtime/locking.py  per-task OS locks shared by the CLI and the API
 app/llm/mock.py         strict mock interpreter/planner (two goal formats)
 app/planning/           goal interpretation, planning, plan validation
 app/runtime/executor.py task lifecycle, approval gate, bounded retry, crash resume
@@ -61,6 +68,10 @@ and exit codes.
 - Keep the README examples and `demo-ui/index.html` consistent with real CLI output;
   `tests/test_readme.py` and `tests/test_demo_ui.py` check this.
 - No new runtime dependencies without discussion.
+- Never add an HTTP endpoint that runs arbitrary tools, plans, shell commands or file
+  writes, or that accepts unrestricted filesystem paths.
+- Dashboard code must render data with `textContent`/`createElement`, never
+  `innerHTML`, and must not show values that did not come from the API.
 
 ## Runtime data and secrets
 
