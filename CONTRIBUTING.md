@@ -1,9 +1,10 @@
 # Contributing
 
-Thanks for your interest. This project is a **local prototype**: a deterministic
-runtime with a mock planner, a CLI, and an HTTP API plus dashboard that wrap the same
-runtime. Contributions
-that improve correctness, tests, documentation and portability are welcome.
+Thanks for your interest. This project is a **local-first developer preview**
+(v0.3.0): a deterministic runtime with a mock planner (plus optional trusted
+dynamic intents), a CLI, and an HTTP API plus dashboard that wrap the same
+runtime. Contributions that improve correctness, tests, documentation and
+portability are welcome. It is not production software.
 
 ## Setup
 
@@ -14,8 +15,13 @@ uv sync
 uv run pytest -q
 uv run python -m compileall -q app tests scripts
 uv run aae --help
+./scripts/demo_local.sh --seed-only   # isolated demo DB; never touches runtime.db
 uv run playwright install chromium   # browser tests; skipped locally if unavailable
 ```
+
+For the full browser-required suite used in CI and release acceptance, see the
+README Tests section. Do not set `AAE_TEST_MODE` / `AAE_TEST_SCRIPTED_PLAN` on
+a shared server.
 
 CI sets `AAE_REQUIRE_BROWSER_TESTS=1`, which turns a missing browser into a failure.
 

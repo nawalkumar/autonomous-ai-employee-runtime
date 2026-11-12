@@ -1,20 +1,21 @@
 # Autonomous AI Employee Runtime
 
-Prototype runtime for CentrAlign AI's Founding Engineer challenge: an AI worker that
-interprets a goal, plans tool calls, executes them against a mock company system,
-recovers from transient failures, pauses for human approval before sensitive writes,
-and independently verifies the outcome before reporting success.
+Prototype runtime that turns a narrow natural-language goal into a bounded,
+authorized plan, executes tools against a fictional company system, pauses for
+human approval on sensitive writes, retries transient failures within a budget,
+and independently verifies outcomes before reporting success.
 
-**Status (v0.2.0):** working prototype, not production software. The planner is a
-deterministic mock that accepts exactly two goal formats (below). Tasks can be run from
-the CLI or from a live web dashboard backed by an HTTP API; both use the same runtime,
-SQLite database and per-task locks. All company data is fictional.
+**Status (v0.3.0):** local-first **developer preview**, not production software.
+With dynamic planning off (default), the mock planner accepts exactly two goal
+formats (below). With the flag on, a trusted intent catalog and three collection
+grammars are also available. Tasks run from the CLI or a live dashboard backed by
+the same HTTP API, SQLite store and per-task locks. All company data is fictional.
 
 ![Dashboard after a ticket task with one simulated 503, a bounded retry and 6/6 verification checks](docs/images/dashboard-recovery.png)
 
 ## Contents
 
-- [What v0.2.0 adds](#what-v020-adds)
+- [What v0.3.0 includes](#what-v030-includes)
 - [Platform support](#platform-support)
 - [Quick start](#quick-start)
 - [Supported goals](#supported-goals-mock-planner)
@@ -33,61 +34,47 @@ SQLite database and per-task locks. All company data is fictional.
 - [Limitations](#limitations)
 - [How it works](#how-it-works)
 - [Tests](#tests)
+- [Changelog](CHANGELOG.md)
+- [Local demo guide](docs/LOCAL_DEMO.md)
 
-## What v0.2.0 adds
+## What v0.3.0 includes
 
-- A **live dashboard** served by FastAPI. It submits real goals, shows the real task ID,
-  plan, tool calls, retries, audit events, approval requests and verification evidence,
-  and lets you approve, reject or resume tasks. Nothing in it is scripted.
-- An **HTTP API** (`/api/v1`) that wraps the existing planner, executor, approval policy,
-  verifier and SQLite store. There is no endpoint for arbitrary tools, plans, shell
-  commands or file writes.
-- **Shared OS locks** between CLI and API processes, so the same task can never be
-  executed, approved or rejected by two processes at once.
-- Two run modes: **local** (persistent, localhost only) and **public demo** (per-browser
-  sandboxes of fictional data on ephemeral storage), plus a Render Free Blueprint.
-- Approval events record the approver (`local-dashboard`, `demo-session:<id>`, or
-  `cli:<user>`).
+Carried forward from v0.2.0:
 
-### Unreleased (v0.3.0 development)
+- A **live dashboard** served by FastAPI. It submits real goals and shows the real
+  task ID, plan, tool calls, retries, audit events, approvals and verification
+  evidence. Approve, reject and resume hit the same API as the CLI. Nothing in the
+  live dashboard is a scripted offline simulation (`demo-ui/` remains separate).
+- An **HTTP API** (`/api/v1`) over the planner, executor, approval policy, verifier
+  and SQLite store. There is no endpoint for arbitrary tools, plans, shell commands
+  or file writes.
+- **Shared OS locks** between CLI and API processes.
+- **Local** (persistent, localhost-oriented) and **public demo** modes, plus a
+  Render Free Blueprint.
+- Approval events record the approver label (`local-dashboard`,
+  `demo-session:<id>`, or `cli:<user>`).
 
-Safety hardening and an operation-level capability registry. These change no supported
-goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
+New in v0.3.0:
 
-- `update_employee` rejects unsupported fields, empty updates and non-string or blank
-  values with `invalid_args` instead of silently ignoring them; nothing is written.
-- Verification fails criteria it cannot evaluate (`unsupported_criterion`), and a task
-  with nothing to verify is reported as `unverified` instead of `passed`.
-- Approvals are bound to a fingerprint of the exact action; if the action changes, the
-  approval is invalidated and a fresh one is requested (`stale_approval`).
-- Operation metadata (risk, approval, retry safety, idempotency, verification strategy)
-  lives in one registry, discoverable at `GET /api/v1/capabilities`.
-- Five new company operations (`list_tickets`, `update_ticket`, `assign_ticket`,
-  `create_customer`, `deactivate_employee`) with independent verification, an additive
-  schema migration, and a separately seeded demo company
-  ([details](#company-data-model-and-demo-company)). They are available to explicit
-  plans; the mock planner's two goal formats are unchanged.
-- Explicit plans may bind later steps to earlier tool outputs with typed
-  [`$ref`](#step-output-references) objects. Resolution happens before approval and
-  invocation; approval fingerprints and verification use the concrete resolved
-  arguments. The mock planner still emits only literal plans.
-- Goal-scoped [plan authorization](#goal-scoped-plan-authorization): each task carries
-  an independently granted, versioned allowlist of operations with entity/field
-  constraints and execution budgets. Plans and resolved actions outside that scope
-  fail closed before side effects. This is not LLM autonomy.
-- Optional [dynamic LLM planning](#dynamic-llm-planning) behind
-  `AAE_DYNAMIC_PLANNING_ENABLED` (default **false**). When enabled, a trusted intent
-  catalog may ask a configured provider to **propose** structured plans that still
-  pass deterministic validation and independently derived authorization before any
-  execution. The LLM never grants permissions, executes tools, approves actions, or
-  declares verification success.
-- [Authorization hardening](#authorization-hardening-per-step-shapes): every
-  executable step must independently satisfy its constraint shape; typed
-  `constraint_alternatives` cover legitimate multi-shape operations.
-- Experimental [collection workflows](#bounded-collection-workflows) (runtime plan
-  expansion; not a CLI/API/dashboard end-user feature) and a library-level
-  [replanning](#bounded-replanning) experiment that must not expand the original
-  trusted authorization scope. Neither is production-ready end-user product surface.
+- Safety hardening: `update_employee` rejects invalid updates; verification reports
+  `unverified` / `unsupported_criterion` honestly; approvals are fingerprint-bound
+  (`stale_approval` when the action changes).
+- Operation-level [capability registry](#capability-registry) at
+  `GET /api/v1/capabilities`.
+- Five company operations (`list_tickets`, `update_ticket`, `assign_ticket`,
+  `create_customer`, `deactivate_employee`), additive schema migration, and a
+  separately seeded [demo company](#company-data-model-and-demo-company).
+- Typed step-output [`$ref`](#step-output-references) bindings for explicit plans.
+- Goal-scoped [plan authorization](#goal-scoped-plan-authorization) with per-step
+  shapes and budgets. This is not LLM autonomy.
+- Optional [dynamic LLM planning](#dynamic-llm-planning)
+  (`AAE_DYNAMIC_PLANNING_ENABLED`, default **false**) over a trusted intent catalog.
+- [Bounded collection workflows](#bounded-collection-workflows) as API/CLI/dashboard
+  grammars when dynamic planning is on (list / assign / batch status).
+- Optional [bounded replanning](#bounded-replanning) (`AAE_REPLANNING_ENABLED`,
+  default **false**) that cannot widen the original authorization scope.
+- Reproducible local demo helper: `./scripts/demo_local.sh` (see
+  [docs/LOCAL_DEMO.md](docs/LOCAL_DEMO.md)).
 
 ## Platform support
 
@@ -108,18 +95,32 @@ git clone <repository-url>
 cd Autonomous-AI-Employee-Runtime
 uv sync
 uv run aae --help
+```
+
+### Default local API (empty-ish runtime DB)
+
+```bash
 uv run aae-api
 ```
 
-`uv run aae-api` starts the API and dashboard in **local mode** on
-<http://127.0.0.1:8000>. Open that address in a browser. The server listens on the
-loopback interface only and answers only requests addressed to `localhost`,
-`127.0.0.1` or `[::1]`.
+Starts the API and dashboard in **local mode** on <http://127.0.0.1:8000>. The
+server defaults to the loopback interface and answers only requests addressed to
+`localhost`, `127.0.0.1` or `[::1]`. Database default: `./data/runtime.db`;
+workspace default: `./workspace`. The CLI and dashboard share them.
 
-By default the database is `./data/runtime.db` and the file workspace is `./workspace`,
-relative to the directory you start from. The CLI and the dashboard share them, so a
-task started in one can be inspected, approved or resumed in the other. Optionally copy
-`.env.example` to `.env` to change paths or settings.
+### Recommended demo (isolated fixture DB)
+
+```bash
+./scripts/demo_local.sh
+```
+
+Seeds `data/demo.db` (never `data/runtime.db`), enables the trusted collection
+grammars with `LLM_PROVIDER=mock`, keeps replanning and test scripted providers
+off, and starts the API on loopback. Full walkthrough:
+[docs/LOCAL_DEMO.md](docs/LOCAL_DEMO.md).
+
+Optionally copy `.env.example` to `.env` to change paths or settings. Never commit
+`.env` or real secrets.
 
 ## Supported goals (mock planner)
 
@@ -546,8 +547,9 @@ sibling step that omits it.
 **Status:** three natural-language workflows are available through the API and CLI
 when `AAE_DYNAMIC_PLANNING_ENABLED=true`. They use this collection engine. The
 engine also still accepts explicit in-process plans. Neither path is a general
-loop. Automatic replanning is a separate flag and is off by default. The dashboard does not render
-collection progress. Not a production-ready autonomous product.
+loop. Automatic replanning is a separate flag and is off by default. The dashboard
+renders `collection_progress` from the API when a task has a collection. Not a
+production-ready autonomous product.
 
 ### API and CLI grammars
 
@@ -1146,8 +1148,8 @@ macOS, file ownership and lock behaviour on shared folders have not been verifie
 To try public mode locally the way Render runs it:
 
 ```bash
-docker build -t aae-runtime:0.2.0 .
-docker run --rm -p 127.0.0.1:10000:10000 --memory 512m --cpus 0.1 --read-only --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges -e APP_MODE=public -e PORT=10000 -e ALLOWED_HOSTS=127.0.0.1,localhost -e SESSION_COOKIE_SECURE=false aae-runtime:0.2.0
+docker build -t aae-runtime:0.3.0 .
+docker run --rm -p 127.0.0.1:10000:10000 --memory 512m --cpus 0.1 --read-only --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges -e APP_MODE=public -e PORT=10000 -e ALLOWED_HOSTS=127.0.0.1,localhost -e SESSION_COOKIE_SECURE=false aae-runtime:0.3.0
 ```
 
 ## Deploying the public demo on Render Free
@@ -1205,10 +1207,18 @@ one instance.
 - **Public demo state is ephemeral and single-instance** (see above). Rate limits are in
   memory; behind Render's proxy all clients may share one rate-limit key if the last
   forwarded hop is a proxy address, which makes limits stricter, not looser.
-- **No accounts or roles.** Local mode trusts whoever can reach localhost. In public mode
-  the session that creates a task is the one that approves it. A missing approval
-  fingerprint is still accepted so the documented CLI and API bodies keep working.
-  The dashboard sends the fingerprint it showed. This milestone does not add accounts.
+- **No accounts or roles.** Local mode trusts whoever can reach the local API. In
+  public mode the session that creates a task is the one that approves it. A missing
+  approval fingerprint is still accepted so the documented CLI and API bodies keep
+  working. The dashboard sends the fingerprint it showed. There is no public
+  user-account system in this release.
+- **Local bind misconfiguration.** Default `APP_HOST` is `127.0.0.1`. The Docker
+  image sets `APP_HOST=0.0.0.0` so the process can listen inside the container;
+  compose still publishes only on `127.0.0.1`. If you bind local mode to a
+  non-loopback address on a shared network while keeping localhost Host names
+  allowed, remote clients that send `Host: 127.0.0.1` can reach the
+  unauthenticated local API. Prefer loopback on the host, or `APP_MODE=public`
+  with `ALLOWED_HOSTS` for any network-facing demo.
 - **Scripted plans are tests.** `AAE_TEST_SCRIPTED_PLAN` replaces the provider only
   when `AAE_TEST_MODE=1` as well. Do not set either on a shared server. Those
   responses are not live model reasoning.
@@ -1291,9 +1301,10 @@ app/
   world/      # mock company database, additive migrations, seed data, demo_fixture.py
   models/     # domain models
 demo-ui/      # scripted simulation page (offline presentations only)
-docs/         # authorization.md and dashboard screenshots
-scripts/      # smoke_demo.py deployment check
+docs/         # local demo guide, storyboard, presentation drafts, screenshots
+scripts/      # demo_local.sh, smoke_demo.py
 tests/
+CHANGELOG.md  # release history
 render.yaml   # Render Free Blueprint (public demo)
 data/         # runtime database and locks (local, gitignored)
 workspace/    # file tool sandbox (local, gitignored)
@@ -1301,9 +1312,14 @@ workspace/    # file tool sandbox (local, gitignored)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Demo recording and social drafts for
+maintainers live in [docs/DEMO_VIDEO_STORYBOARD.md](docs/DEMO_VIDEO_STORYBOARD.md)
+and [docs/RELEASE_PRESENTATION_DRAFTS.md](docs/RELEASE_PRESENTATION_DRAFTS.md)
+(drafts only — not published by this repository).
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). Third-party dependencies are licensed
-under their own terms.
+Licensed under the [Apache License 2.0](LICENSE). That license grants rights to
+use, modify and redistribute under its terms (including attribution and patent
+conditions). Third-party dependencies are licensed under their own terms. This
+preview makes no additional warranty of fitness for production use.
