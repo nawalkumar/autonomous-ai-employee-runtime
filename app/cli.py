@@ -15,8 +15,9 @@ When ``AAE_DYNAMIC_PLANNING_ENABLED=true``, a trusted intent catalog may invoke
 the configured LLM provider (default ``mock``) to propose structured plans that
 still pass deterministic validation and independently derived authorization.
 The three bounded collection grammars are an exception: their plans are built
-deterministically and the provider is not asked to plan them. Automatic
-replanning is not available from this CLI.
+deterministically and the provider is not asked to plan them. This CLI has no
+replan command. If ``AAE_REPLANNING_ENABLED`` is set, the existing executor may
+replan a supported business conflict; the default is off.
 Mutating commands hold an exclusive, OS-backed per-task lock shared with the
 HTTP API; this protects cooperating CLI and API processes, not code that uses
 ExecutionRuntime directly.

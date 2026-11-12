@@ -40,8 +40,9 @@ class Settings(BaseSettings):
     llm_max_provider_retries: int = Field(default=1, ge=0, le=3)
 
     # Optional bounded replanning. Default off; independent of dynamic planning.
-    # The replanner fails closed unless a trusted enablement context built from
-    # these settings is passed in. Execution does not replan automatically.
+    # When enabled, the executor may replace remaining work after a supported
+    # business-state conflict. The model cannot change authorization, approval
+    # or verification. Ordinary saves cannot install a revision.
     # Never expands the original trusted authorization scope.
     aae_replanning_enabled: bool = False
     aae_max_replan_rounds: int = Field(default=2, ge=0, le=5)

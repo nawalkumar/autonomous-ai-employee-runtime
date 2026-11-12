@@ -450,8 +450,8 @@ uv run python -m app.cli run 'List open high-priority tickets.'
 Not every natural-language goal is supported. There is no unrestricted goal
 interpretation, shell execution, or public plan-submission endpoint. The three
 bounded collection grammars below are API and CLI workflows. Arbitrary
-collection plans and library-level replanning are not. Replanning is not
-automatic. See also [Limitations](#limitations).
+collection plans are not. Automatic replanning is a separate opt-in and does
+not widen those plans. See also [Limitations](#limitations).
 
 ## Authorization hardening (per-step shapes)
 
@@ -477,7 +477,7 @@ sibling step that omits it.
 **Status:** three natural-language workflows are available through the API and CLI
 when `AAE_DYNAMIC_PLANNING_ENABLED=true`. They use this collection engine. The
 engine also still accepts explicit in-process plans. Neither path is a general
-loop, and neither path replans automatically. The dashboard does not render
+loop. Automatic replanning is a separate flag and is off by default. The dashboard does not render
 collection progress. Not a production-ready autonomous product.
 
 ### API and CLI grammars
@@ -496,7 +496,7 @@ python -m app.cli run "Mark tickets T-10009 and T-10010 as closed."
 
 Set `AAE_DYNAMIC_PLANNING_ENABLED=true`. `LLM_PROVIDER` is not consulted for
 these four sentences; a mock or xAI provider is used only for the other catalog
-intents. `AAE_REPLANNING_ENABLED` does not enable automatic replanning.
+intents. `AAE_REPLANNING_ENABLED` is independent and stays off unless set.
 
 | Grammar | Plan | Authority |
 | --- | --- | --- |
@@ -516,7 +516,7 @@ actually returned. The task-detail JSON adds `collection_progress` and each
 tool call's `result`. The current dashboard ignores those fields.
 
 What remains library-only: choosing an arbitrary collection path, item field or
-iteration expression, and every replanning API in `app/runtime/replan.py`.
+iteration expression. A replan cannot add those.
 
 Registered collection source today: `company_api.list_tickets` only.
 
@@ -554,25 +554,33 @@ A model reply is never treated as success. `verified` is set only when
 
 ## Bounded replanning
 
-**Status:** library-level experimental capability (`app/runtime/replan.py`). It is
-**not** automatic executor behavior, and the CLI, API and dashboard do not expose
-replanning workflows. Not production-ready.
+**Status:** opt-in executor behavior. Default off. The CLI, API and dashboard
+do not expose a replan control. Not production-ready.
 
 ```bash
 AAE_REPLANNING_ENABLED=false
 # AAE_MAX_REPLAN_ROUNDS=2
 ```
 
-`AAE_REPLANNING_ENABLED=false` is the default and is enforced. The executor,
-CLI, API and dashboard do not call the replanner. A direct `Replanner` call
-fails closed unless the caller passes a `ReplanEnablement` built from validated
-settings (`ReplanEnablement.from_settings` / `enablement_for_runtime`). Turning
-the flag on does not start automatic replanning. Independent of dynamic planning.
+`AAE_REPLANNING_ENABLED=false` is the default. The executor does not call the
+provider and does not change the plan. A direct `Replanner` call fails closed
+unless the caller passes a `ReplanEnablement` built from validated settings
+(`ReplanEnablement.from_settings` / `enablement_for_runtime`). Independent of
+dynamic planning. There is no dashboard replan view.
 
-When a trusted caller does invoke it, a `Replanner` may propose a replacement
-for **remaining** work only under recognized recoverable triggers (for example
-`ticket_state_conflict`). It does not run for authorization denials, approval
-rejection, budget exhaustion, malformed plans, or policy violations.
+When the flag is on, the existing executor may replace **remaining** work after
+exactly these tool failures:
+
+| Trigger | Failure | Message the tool must return |
+| --- | --- | --- |
+| `ticket_state_conflict` | invalid arguments | contains `cannot change from` |
+| `ticket_state_conflict` | policy blocked | contains `only open or in-progress tickets can be assigned` |
+| `entity_missing_transient` | unexpected environment | starts with `Ticket not found:` |
+
+Anything else fails the task with no provider call. That includes authorization
+denials, approval rejection, budget exhaustion, malformed plans, verification
+failures, inactive employees, the wrong department, a missing employee, and a
+generic `invalid_args` or `policy_blocked` message.
 
 Rules:
 
@@ -589,15 +597,29 @@ Rules:
   and historical mutating attempts (from capability `mutating` metadata,
   including failures) stay consumed. A proposal that would exceed any original
   budget is rejected and not installed.
-- Accepted and rejected decisions are stored with `replan.proposed`,
-  `replan.accepted` or `replan.rejected` events in one database transaction.
-  `replan.exhausted` is written when the round cap has already been reached.
-  Event metadata is task id, revision, trigger, plan identities, authorization
+- An accepted revision is installed only by `commit_replan`, which re-reads
+  the last committed task and writes the new plan together with
+  `replan.proposed` and `replan.accepted` in one transaction. A rejected
+  proposal writes `replan.proposed` and `replan.rejected` and consumes one
+  round. `replan.exhausted` is written when the round cap has already been
+  reached, and that write does not consume another round. A concurrent commit
+  that lost the race writes nothing and returns `rejected:stale_revision`.
+  `save_state` and `save_state_and_events` refuse a change to the replan
+  counters, the authorization fingerprint, or the step-id sequence (a
+  collection expansion is the one ordinary step-id change they still allow).
+  An edit that keeps the same step ids can still be saved and is authorized
+  again before it runs. `apply_replan` only changes the in-memory copy.
+- Event metadata is task id, revision, trigger, plan identities, authorization
   outcome, budget figures and a short reason. It does not include prompts,
   secrets or raw tool payloads.
-- New mutations still require approval when policy says so.
-- Provider output is untrusted structured JSON (mocked in tests). Replacement
-  steps are stored as pending; a proposal cannot mark itself complete.
+- A changed mutation does not keep an earlier approval. Closing a ticket still
+  asks for a fresh approval. Rejecting that approval aborts the task and does
+  not ask the provider again. Replacement outcomes go through the same
+  independent verifier as any other step.
+- A proposal that repeats the unfinished steps is `rejected:no_progress`.
+- Provider output is untrusted structured JSON with the existing timeout and
+  size bounds (mocked in tests). The model cannot set authorization or the
+  verification result. Replacement steps are stored as pending.
 
 ## Step-output references
 
@@ -827,7 +849,8 @@ permissions.
 - No public plan-submission or self-granted permission endpoints.
 - No generic collection iteration or unbounded replanning. API and CLI collection
   support is the three grammars in [Bounded collection workflows](#bounded-collection-workflows).
-  The `Replanner` library is not an executor, CLI, API or dashboard feature.
+  Automatic replanning is opt-in, off by default, and cannot widen a collection
+  scope. The dashboard has no replan control.
 - Constraint vocabulary is intentionally small and typed.
 - The LLM cannot create, widen, or replace an `AuthorizationScope`.
 
@@ -1026,7 +1049,7 @@ See `.env.example`. Settings are read from the environment and an optional `.env
 | `WORKSPACE_PATH` | File tool sandbox (default `workspace`) |
 | `MAX_RECOVERY_ATTEMPTS` | Retries allowed after a step's first attempt (default `2`) |
 | `LLM_PROVIDER`, `XAI_API_KEY`, `XAI_MODEL`, `XAI_BASE_URL` | Provider settings for library use; ignored by the CLI and the API |
-| `AAE_REPLANNING_ENABLED` | Default `false`. Library calls fail closed without a trusted enablement context. Not automatic, and not a CLI, API or dashboard control |
+| `AAE_REPLANNING_ENABLED` | Default `false`. When `true`, the executor may replan only the supported ticket conflicts in [Bounded replanning](#bounded-replanning). Not a CLI, API or dashboard control |
 | `AAE_MAX_REPLAN_ROUNDS` | Default `2`, valid range 0–5. Copied onto each new task as `replan_limit` and kept across restart |
 
 Never commit `.env` or real secrets.
@@ -1099,7 +1122,9 @@ one instance.
   at all. Other catalog intents use `LLM_PROVIDER` (`mock` by default). The CLI
   still refuses `--provider xai`; set `LLM_PROVIDER=xai` (with `XAI_API_KEY`) when
   the flag is on if you want the live adapter for those other intents. Unit tests
-  never make live provider calls. Automatic replanning stays disabled.
+  never make live provider calls. Automatic replanning stays off unless
+  `AAE_REPLANNING_ENABLED` is set, and then only for the supported ticket
+  conflicts. It cannot grant authorization or mark verification passed.
 - **Fictional world.** The company API, employees, customers and tickets are a seeded
   SQLite mock; there are no real integrations.
 - **Locks protect cooperating processes only** (the CLI and the API). Code that calls
