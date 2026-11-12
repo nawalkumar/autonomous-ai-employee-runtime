@@ -67,6 +67,8 @@ def authorize_plan(plan: Plan | list[PlanStep], scope: AuthorizationScope) -> No
 
         _authorize_step_arguments(step, tool, operation, scope)
 
+    _require_constraint_coverage(steps, scope)
+
     if len(steps) > scope.budgets.max_steps:
         raise AuthorizationError(
             AuthorizationReason.BUDGET_EXCEEDED,
@@ -126,7 +128,7 @@ def _authorize_step_arguments(
                     },
                 )
             if nested not in parent:
-                # Field absent — fine for field-level exact constraints.
+                # Coverage across steps is enforced by _require_constraint_coverage.
                 continue
             if contains_reference(parent.get(nested)):
                 continue
@@ -142,8 +144,8 @@ def _authorize_step_arguments(
             continue
 
         if arg_name not in arguments:
-            # Optional args may be omitted; entity constraints on missing required
-            # args are caught by schema validation elsewhere.
+            # Sibling steps of the same operation may carry different argument
+            # shapes; plan-level coverage ensures each constraint appears somewhere.
             continue
 
         value = arguments[arg_name]
@@ -168,6 +170,47 @@ def _authorize_step_arguments(
         _check_literal(
             step.step_id, tool, operation, arg_name, value, constraint, plan_time=True
         )
+
+
+def _require_constraint_coverage(steps: list[PlanStep], scope: AuthorizationScope) -> None:
+    """Every scope constraint must appear on at least one step of that operation.
+
+    Prevents optional schema fields (e.g. list_tickets.filters) from widening a
+    narrowly constrained operation when the constrained argument is simply omitted.
+    Per-step checks still skip missing args so multi-step same-operation plans
+    (different argument shapes) remain valid.
+    """
+    by_operation: dict[str, list[PlanStep]] = {}
+    for step in steps:
+        tool = step.resolved_tool_name()
+        operation = operation_of(step.arguments or {})
+        if not tool or not isinstance(operation, str) or not operation:
+            continue
+        by_operation.setdefault(operation_key(tool, operation), []).append(step)
+
+    for op_key, constraints in scope.constraints.items():
+        op_steps = by_operation.get(op_key) or []
+        for arg_name, constraint in constraints.items():
+            if any(_step_carries_constraint_arg(step, arg_name) for step in op_steps):
+                continue
+            raise AuthorizationError(
+                AuthorizationReason.PLAN_UNAUTHORIZED,
+                f"Plan never supplies constrained argument '{arg_name}' for {op_key}.",
+                details={
+                    "operation": op_key,
+                    "argument": arg_name,
+                    "constraint_type": getattr(constraint, "type", type(constraint).__name__),
+                },
+            )
+
+
+def _step_carries_constraint_arg(step: PlanStep, arg_name: str) -> bool:
+    arguments = step.arguments or {}
+    if "." not in arg_name:
+        return arg_name in arguments
+    root, _, nested = arg_name.partition(".")
+    parent = arguments.get(root)
+    return isinstance(parent, dict) and nested in parent
 
 
 def _check_literal(

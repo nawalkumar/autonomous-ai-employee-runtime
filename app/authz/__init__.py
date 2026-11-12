@@ -18,6 +18,10 @@ from app.authz.models import (
     IntRangeConstraint,
     parse_authorization_scope,
 )
+from app.authz.intent_scopes import (
+    authorization_for_goal,
+    authorization_for_trusted_intent,
+)
 from app.authz.origin import (
     authorization_for_supported_goal,
     legacy_authorization_for_state,
@@ -43,7 +47,9 @@ __all__ = [
     "IntRangeConstraint",
     "authorize_action",
     "authorize_plan",
+    "authorization_for_goal",
     "authorization_for_supported_goal",
+    "authorization_for_trusted_intent",
     "ensure_task_authorization",
     "legacy_authorization_for_state",
     "parse_authorization_scope",

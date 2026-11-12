@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.goal import InterpretedGoal, SuccessCriterion
 from app.models.plan import Plan, PlanStep
@@ -30,7 +30,7 @@ class InterpretedGoalDraft(BaseModel):
 
 
 class PlanDraft(BaseModel):
-    """Structured planner output."""
+    """Structured planner output (legacy mock planner)."""
 
     steps: list[PlanStep] = Field(default_factory=list)
 
@@ -38,9 +38,43 @@ class PlanDraft(BaseModel):
         return Plan(steps=self.steps)
 
 
+class DynamicPlanStepDraft(BaseModel):
+    """Strict step shape for untrusted LLM plan proposals."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=500)
+    tool_name: str = Field(min_length=1, max_length=64)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: str = Field(default="", max_length=500)
+
+    def to_plan_step(self) -> PlanStep:
+        return PlanStep(
+            step_id=self.step_id,
+            description=self.description,
+            tool_name=self.tool_name,
+            arguments=self.arguments,
+            expected_outcome=self.expected_outcome,
+        )
+
+
+class DynamicPlanDraft(BaseModel):
+    """Strict plan shape for untrusted LLM plan proposals."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[DynamicPlanStepDraft] = Field(default_factory=list)
+
+    def to_plan(self) -> Plan:
+        return Plan(steps=[step.to_plan_step() for step in self.steps])
+
+
 __all__ = [
     "InterpretedGoalDraft",
     "PlanDraft",
+    "DynamicPlanDraft",
+    "DynamicPlanStepDraft",
     "Plan",
     "PlanStep",
     "InterpretedGoal",
