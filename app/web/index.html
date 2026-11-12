@@ -200,15 +200,13 @@
   </div>
 
   <dialog id="confirmDialog" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
-    <form method="dialog">
-      <h3 id="confirmTitle">Confirm</h3>
-      <p id="confirmBody"></p>
-      <pre id="confirmDetail" hidden></pre>
-      <div class="btn-row">
-        <button type="submit" value="cancel" id="confirmCancel">Cancel</button>
-        <button type="submit" value="confirm" class="primary" id="confirmOk">Confirm</button>
-      </div>
-    </form>
+    <h3 id="confirmTitle">Confirm</h3>
+    <p id="confirmBody"></p>
+    <pre id="confirmDetail" hidden></pre>
+    <div class="btn-row">
+      <button type="button" id="confirmCancel">Cancel</button>
+      <button type="button" class="primary" id="confirmOk">Confirm</button>
+    </div>
   </dialog>
 
   <script src="/static/app.js"></script>

@@ -231,6 +231,8 @@
     poll: null,
     submitting: false,
     acting: false,
+    // Bumped for every confirm dialog open; stale closes cannot resolve a newer wait.
+    confirmEpoch: 0,
     pendingSubmit: null,
     worldTab: "employees",
     worldSeq: 0
@@ -247,7 +249,7 @@
     "refreshTaskBtn", "resumeBtn", "taskMsg", "verificationPanel", "interpretedGoal",
     "collectionPanel", "replanPanel", "taskList",
     "refreshListBtn", "worldPanel", "refreshWorldBtn", "confirmDialog", "confirmTitle", "confirmBody",
-    "confirmDetail", "confirmCancel"
+    "confirmDetail", "confirmCancel", "confirmOk"
   ].forEach(function (id) { els[id] = $(id); });
 
   // --- Connection and session ------------------------------------------------------
@@ -1214,6 +1216,34 @@
 
   // --- Confirmation dialog ------------------------------------------------------------
 
+  function suppressGhostClicks() {
+    // When a modal closes under the cursor, some engines deliver the same click to
+    // whatever is now underneath (Approve/Reject). Swallow pointer/click for two
+    // animation frames — event-loop based, not a wall-clock sleep.
+    var block = function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    document.addEventListener("click", block, true);
+    document.addEventListener("pointerup", block, true);
+    document.addEventListener("mouseup", block, true);
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        document.removeEventListener("click", block, true);
+        document.removeEventListener("pointerup", block, true);
+        document.removeEventListener("mouseup", block, true);
+      });
+    });
+  }
+
+  function afterGhostClickWindow() {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(resolve);
+      });
+    });
+  }
+
   function confirmAction(title, body, detail) {
     return new Promise(function (resolve) {
       var dialog = els.confirmDialog;
@@ -1221,15 +1251,47 @@
         resolve(window.confirm(title + "\n\n" + body));
         return;
       }
+      var epoch = ++state.confirmEpoch;
+      var settled = false;
       els.confirmTitle.textContent = title;
       els.confirmBody.textContent = body;
       els.confirmDetail.textContent = detail || "";
       show(els.confirmDetail, !!detail);
-      dialog.returnValue = "";
-      dialog.addEventListener("close", function onClose() {
-        dialog.removeEventListener("close", onClose);
-        resolve(dialog.returnValue === "confirm");
-      });
+
+      function finish(ok) {
+        if (settled || epoch !== state.confirmEpoch) return;
+        settled = true;
+        cleanup();
+        suppressGhostClicks();
+        if (dialog.open) dialog.close();
+        resolve(ok);
+      }
+
+      function onOk(event) {
+        event.preventDefault();
+        finish(true);
+      }
+
+      function onCancel(event) {
+        event.preventDefault();
+        finish(false);
+      }
+
+      function onDialogCancel(event) {
+        // ESC / implicit cancel — do not treat as confirm.
+        event.preventDefault();
+        finish(false);
+      }
+
+      function cleanup() {
+        els.confirmOk.removeEventListener("click", onOk);
+        els.confirmCancel.removeEventListener("click", onCancel);
+        dialog.removeEventListener("cancel", onDialogCancel);
+      }
+
+      els.confirmOk.addEventListener("click", onOk);
+      els.confirmCancel.addEventListener("click", onCancel);
+      dialog.addEventListener("cancel", onDialogCancel);
       dialog.showModal();
       els.confirmCancel.focus();
     });
@@ -1270,6 +1332,7 @@
       pretty(args)
     );
     if (!ok) {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
@@ -1284,6 +1347,7 @@
       setMsg(els.approvalMsg, err.message, "error");
       await refreshTask();
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
@@ -1312,6 +1376,7 @@
       "The task will be aborted and " + operation + " will not run. Reason: " + reason
     );
     if (!ok) {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
@@ -1326,6 +1391,7 @@
       setMsg(els.approvalMsg, err.message, "error");
       await refreshTask();
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
@@ -1344,6 +1410,7 @@
       "The server will continue task " + taskId + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
     );
     if (!ok) {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
@@ -1357,6 +1424,7 @@
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.taskMsg, err.message, "error");
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
       startPolling();
