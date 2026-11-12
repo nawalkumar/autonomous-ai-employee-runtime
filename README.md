@@ -81,6 +81,13 @@ goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
   pass deterministic validation and independently derived authorization before any
   execution. The LLM never grants permissions, executes tools, approves actions, or
   declares verification success.
+- [Authorization hardening](#authorization-hardening-per-step-shapes): every
+  executable step must independently satisfy its constraint shape; typed
+  `constraint_alternatives` cover legitimate multi-shape operations.
+- Experimental [collection workflows](#bounded-collection-workflows) (runtime plan
+  expansion; not a CLI/API/dashboard end-user feature) and a library-level
+  [replanning](#bounded-replanning) experiment that must not expand the original
+  trusted authorization scope. Neither is production-ready end-user product surface.
 
 ## Platform support
 
@@ -433,9 +440,91 @@ uv run python -m app.cli run 'List open high-priority tickets.'
 
 ### Limitations
 
-Not every natural-language goal is supported. There is no generic autonomous
-replanning, collection iteration, unrestricted goal interpretation, shell execution,
-or public plan-submission endpoint. See also [Limitations](#limitations).
+Not every natural-language goal is supported. There is no unrestricted goal
+interpretation, shell execution, or public plan-submission endpoint. Collection
+expansion and library-level replanning are separate experimental mechanisms
+(below); they are not exposed as CLI, API or dashboard end-user workflows.
+See also [Limitations](#limitations).
+
+## Authorization hardening (per-step shapes)
+
+Every executable step must **independently** satisfy the authorization constraints
+for its operation. A constrained argument present on one step does not authorize a
+sibling step that omits it.
+
+- Flat `constraints` are an AND map: every listed argument must be present and valid
+  on that step.
+- `constraint_alternatives` is an OR of complete `ConstraintShape` objects for
+  operations that legitimately have more than one argument form (for example
+  `find_customer` by `company` vs by `customer_id`). A step must fully match one
+  shape.
+- Empty alternative shapes are forbidden.
+- Plan-time and runtime enforcement are aligned. `$ref` and `$collection_item`
+  placeholders count as presence; concrete membership / equality is checked after
+  binding.
+- Fingerprints omit empty `constraint_alternatives` so older persisted scopes remain
+  stable.
+
+## Bounded collection workflows
+
+**Status:** experimental runtime/library mechanism for explicit plans that include
+`PlanStep.collection`. Not a CLI, API or dashboard end-user feature. Not
+production-ready as a product workflow.
+
+Registered collection source today: `company_api.list_tickets` only.
+
+Contract (`app/models/collections.py`):
+
+- Ordered `CollectionSnapshot` sealed from a successful list call (max 50 items;
+  default limit 20). Snapshots are persisted on `ExecutionState.collections`.
+- Unique `item_id` values; duplicates dropped and recorded.
+- Typed `$collection_item` placeholders in plan arguments (not JSONPath).
+- `PlanStep.collection` declares selection (`first_n` or `explicit_ids`) and
+  `max_items`. The runtime expands the template into ordinary steps, persists the
+  expanded plan, re-runs `authorize_plan`, then executes each item with normal
+  approval, idempotency and verification.
+- `FromCollectionConstraint` authorizes item ids only if they appear in the sealed
+  snapshot for `source_step_id` — appearing in a live query is not enough.
+
+**Restart and progress:** Restart safety relies on durable plan-step state,
+tool-call history and per-step idempotency keys — not on
+`collections.progress`. That progress list is created in an initial `pending`
+state when a template expands and is **not currently updated** afterward.
+Partial completion is visible from plan step statuses and tool-call records.
+
+## Bounded replanning
+
+**Status:** library-level experimental capability (`app/runtime/replan.py`). It is
+**not** automatic executor behavior, and the CLI, API and dashboard do not expose
+replanning workflows. Not production-ready.
+
+```bash
+AAE_REPLANNING_ENABLED=false
+# AAE_MAX_REPLAN_ROUNDS=2
+```
+
+`AAE_REPLANNING_ENABLED=false` is the configured default. The setting is **not yet
+enforced** by the replanning library: callers that invoke `Replanner` directly are
+not gated by this flag. Independent of dynamic planning.
+
+When used, a `Replanner` may propose a replacement for **remaining** work only
+under recognized recoverable triggers (for example `ticket_state_conflict`). It
+must not run for authorization denials, approval rejection, budget exhaustion,
+malformed plans, or policy violations.
+
+Rules (intended):
+
+- Original `AuthorizationScope` is immutable; replacement steps are validated against it.
+- Completed verified steps are retained; side effects are not replayed by revision alone.
+- `replan_count` / `replan_limit` are persisted on state when a revision is applied;
+  budgets must not be reset.
+- New mutations still require approval when policy says so.
+- Provider output is untrusted structured JSON (mocked in tests).
+
+**Known gaps (do not treat as complete):** aggregate step-budget accounting when
+completed steps are retained alongside a replacement plan; mutation accounting that
+does not fully align with capability-based mutating detection; and replan audit
+events (`replan.*`) that are defined but not yet emitted on the runtime path.
 
 ## Step-output references
 
@@ -663,7 +752,9 @@ permissions.
 - No natural-language-general authorization: scopes come only from trusted grammars
   (mock scenarios, dynamic intents when flagged, or trusted internal `create_task`).
 - No public plan-submission or self-granted permission endpoints.
-- No generic collection iteration or unbounded replanning.
+- No generic collection iteration or unbounded replanning. Collection expansion and
+  the `Replanner` library are experimental; they are not CLI/API/dashboard product
+  features and are not production-ready end-user workflows.
 - Constraint vocabulary is intentionally small and typed.
 - The LLM cannot create, widen, or replace an `AuthorizationScope`.
 
@@ -862,6 +953,8 @@ See `.env.example`. Settings are read from the environment and an optional `.env
 | `WORKSPACE_PATH` | File tool sandbox (default `workspace`) |
 | `MAX_RECOVERY_ATTEMPTS` | Retries allowed after a step's first attempt (default `2`) |
 | `LLM_PROVIDER`, `XAI_API_KEY`, `XAI_MODEL`, `XAI_BASE_URL` | Provider settings for library use; ignored by the CLI and the API |
+| `AAE_REPLANNING_ENABLED` | Configured default `false`. Documents intent only today: the replanning library does not yet enforce this flag |
+| `AAE_MAX_REPLAN_ROUNDS` | Conservative default `2` in settings; task state also carries `replan_limit` (not an end-user product control) |
 
 Never commit `.env` or real secrets.
 
