@@ -25,6 +25,7 @@ from typing import Any
 from app.api.errors import ApiError
 from app.api.redaction import Redactor
 from app.api.schemas import (
+    CollectionProgressOut,
     CriterionOut,
     CustomerOut,
     EmployeeOut,
@@ -618,6 +619,7 @@ class TaskService:
                     completed_at=c.completed_at,
                     error_type=c.error_type,
                     error_message=self.redact.text(c.error_message) if c.error_message else None,
+                    result=self.redact(c.result) if c.result else None,
                 )
                 for c in state.tool_calls
             ],
@@ -663,6 +665,16 @@ class TaskService:
                 state.final_status in (TaskStatus.QUEUED, TaskStatus.RUNNING) and not executing
             ),
             idempotent_replay=idempotent_replay,
+            collection_progress=[
+                CollectionProgressOut(
+                    collection_id=item.collection_id,
+                    item_id=item.item_id,
+                    step_id=item.step_id,
+                    status=item.status,
+                    error=item.error,
+                )
+                for item in state.collections.progress
+            ],
         )
 
     # Mock company and workspace (read-only)

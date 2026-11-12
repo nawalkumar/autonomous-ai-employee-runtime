@@ -143,6 +143,16 @@ class InterpretedGoalOut(BaseModel):
     success_criteria: list[CriterionOut]
 
 
+class CollectionProgressOut(BaseModel):
+    """Per-item collection progress. Empty when the task has no collection."""
+
+    collection_id: str
+    item_id: str
+    step_id: str
+    status: str
+    error: str | None = None
+
+
 class PlanStepOut(BaseModel):
     step_id: str
     description: str
@@ -166,6 +176,7 @@ class ToolCallOut(BaseModel):
     completed_at: datetime | None
     error_type: str | None
     error_message: str | None
+    result: dict[str, Any] | None = None
 
 
 class PendingActionOut(BaseModel):
@@ -234,6 +245,7 @@ class TaskDetail(BaseModel):
     executing: bool
     resumable: bool
     idempotent_replay: bool = False
+    collection_progress: list[CollectionProgressOut] = Field(default_factory=list)
 
 
 class EventOut(BaseModel):
