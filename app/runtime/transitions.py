@@ -46,6 +46,12 @@ class EventType:
     ACTION_CHANGED = "step.action_changed"
     AUTHORIZATION_DENIED = "authorization.denied"
     AUTHORIZATION_BOUND = "authorization.bound"
+    COLLECTION_OBSERVED = "collection.observed"
+    COLLECTION_EXPANDED = "collection.expanded"
+    REPLAN_PROPOSED = "replan.proposed"
+    REPLAN_ACCEPTED = "replan.accepted"
+    REPLAN_REJECTED = "replan.rejected"
+    REPLAN_EXHAUSTED = "replan.exhausted"
 
 
 def make_event(

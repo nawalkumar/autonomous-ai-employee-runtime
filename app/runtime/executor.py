@@ -648,6 +648,8 @@ class ExecutionRuntime:
 
     def _execute_step(self, state: ExecutionState, step_index: int) -> ExecutionState:
         step = state.plan[step_index]
+        if step.collection is not None:
+            return self._expand_collection_and_continue(state, step_index, step)
         tool_name = step.resolved_tool_name()
         if not tool_name:
             return self._fail_missing_tool(state, step_index, step, None)
@@ -1690,6 +1692,136 @@ class ExecutionRuntime:
             "[RESUME] step=%s interrupted_calls=%s", step.step_id, len(interrupted)
         )
         return state
+
+    def _expand_collection_and_continue(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        template: PlanStep,
+    ) -> ExecutionState:
+        """Seal a collection snapshot, expand the template, re-authorize, continue."""
+        from app.models.collections import CollectionExecutionState
+        from app.runtime.collections import (
+            CollectionError,
+            build_ticket_collection_snapshot,
+            expand_collection_step,
+            progress_records,
+            select_collection_items,
+        )
+
+        work = template.collection
+        assert work is not None
+        try:
+            snapshots = dict(state.collections.snapshots or {})
+            snapshot = snapshots.get(work.from_step)
+            if snapshot is None:
+                snapshot = build_ticket_collection_snapshot(
+                    state,
+                    source_step_id=work.from_step,
+                    max_items=work.max_items,
+                    item_id_field=work.item_id_field,
+                    items_path=list(work.items_path),
+                )
+                snapshots[work.from_step] = snapshot
+                state = state.model_copy(
+                    update={
+                        "collections": state.collections.model_copy(
+                            update={"snapshots": snapshots}
+                        )
+                    }
+                ).touch()
+                self._emit(
+                    make_event(
+                        task_id=state.task_id,
+                        event_type=EventType.COLLECTION_OBSERVED,
+                        action="collection_observed",
+                        result={
+                            "source_step_id": work.from_step,
+                            "collection_id": snapshot.collection_id,
+                            "count": len(snapshot.items),
+                            "truncated": snapshot.truncated,
+                            "empty": snapshot.empty,
+                        },
+                    )
+                )
+
+            selected = select_collection_items(
+                snapshot, work.select, max_items=work.max_items
+            )
+            expanded = expand_collection_step(template, work, selected)
+        except CollectionError as exc:
+            return self._fail_before_call(
+                state,
+                step_index,
+                template,
+                template.resolved_tool_name() or "",
+                failure_type=FailureType.PERMANENT,
+                message=str(exc),
+                event_type=EventType.STEP_FAILED,
+            )
+
+        if not expanded:
+            # Empty selection: skip the template without side effects.
+            plan = list(state.plan)
+            plan[step_index] = template.model_copy(
+                update={"status": PlanStepStatus.SKIPPED, "collection": None}
+            )
+            state = state.model_copy(
+                update={"plan": plan, "current_step": step_index + 1}
+            ).touch()
+            self._save(state)
+            return self._execute_next_locked(state.task_id)
+
+        # Replace template with expanded ordinary steps; preserve prefix/suffix.
+        plan = list(state.plan)
+        new_plan = [*plan[:step_index], *expanded, *plan[step_index + 1 :]]
+        expanded_from = dict(state.collections.expanded_from or {})
+        for child in expanded:
+            expanded_from[child.step_id] = template.step_id
+        progress = list(state.collections.progress or [])
+        progress.extend(progress_records(snapshot.collection_id, expanded, selected))
+        collections = CollectionExecutionState(
+            snapshots=dict(state.collections.snapshots),
+            progress=progress,
+            expanded_from=expanded_from,
+        )
+        state = state.model_copy(
+            update={
+                "plan": new_plan,
+                "collections": collections,
+                "current_step": step_index,
+            }
+        ).touch()
+
+        try:
+            scope = ensure_task_authorization(state)
+            authorize_plan(new_plan, scope)
+        except AuthorizationError as exc:
+            return self._fail_before_call(
+                state,
+                step_index,
+                template,
+                template.resolved_tool_name() or "",
+                failure_type=FailureType.UNAUTHORIZED,
+                message=f"Expanded collection plan unauthorized: {exc.message}",
+                event_type=EventType.AUTHORIZATION_DENIED,
+            )
+
+        self._save(state)
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.COLLECTION_EXPANDED,
+                action="collection_expanded",
+                result={
+                    "template_step_id": template.step_id,
+                    "collection_id": snapshot.collection_id,
+                    "item_ids": [item.item_id for item in selected],
+                    "expanded_step_ids": [step.step_id for step in expanded],
+                },
+            )
+        )
+        return self._execute_next_locked(state.task_id)
 
     def _update_step(
         self,

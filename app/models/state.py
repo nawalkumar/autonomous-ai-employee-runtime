@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.authz.models import AuthorizationScope
+from app.models.collections import CollectionExecutionState
 from app.models.enums import ApprovalStatus, TaskStatus, VerificationStatus
 from app.models.goal import InterpretedGoal, SuccessCriterion
 from app.models.ids import new_id
@@ -44,6 +45,13 @@ class ExecutionState(BaseModel):
     plan: list[PlanStep] = Field(default_factory=list)
     current_step: int = 0
     completed_steps: list[str] = Field(default_factory=list)
+
+    # Bounded collection snapshots and per-item progress (Milestone 6).
+    collections: CollectionExecutionState = Field(default_factory=CollectionExecutionState)
+    # Bounded replanning (Milestone 6); retained across resume.
+    replan_count: int = 0
+    replan_limit: int = 2
+    last_replan_trigger: str | None = None
 
     observations: list[Observation] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)

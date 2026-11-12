@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     llm_max_response_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     llm_max_provider_retries: int = Field(default=1, ge=0, le=3)
 
+    # Optional bounded replanning (Milestone 6). Default off; independent of
+    # dynamic planning. Never expands the original trusted authorization scope.
+    aae_replanning_enabled: bool = False
+    aae_max_replan_rounds: int = Field(default=2, ge=0, le=5)
+
     # "local": one persistent SQLite database and workspace shared with the CLI,
     # served to localhost only. "public": per-browser-session sandboxes in
     # ephemeral storage, for an internet-facing demo of fictional data.
