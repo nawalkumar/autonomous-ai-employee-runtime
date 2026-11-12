@@ -5,18 +5,22 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from app.authz.errors import AuthorizationError
 from app.authz.intent_scopes import authorization_for_goal, authorization_for_trusted_intent
 from app.authz.models import AuthorizationScope
 from app.authz.origin import authorization_for_supported_goal
+from app.authz.plan_check import authorize_plan
 from app.config import Settings, get_settings
 from app.llm.base import LLMClient
 from app.llm.mock import parse_supported_goal
 from app.models.goal import InterpretedGoal
 from app.models.plan import Plan
+from app.planning.collection_plans import plan_for_collection_intent
 from app.planning.dynamic import DynamicPlanner
-from app.planning.intents import parse_trusted_intent
+from app.planning.intents import COLLECTION_INTENT_IDS, parse_trusted_intent
 from app.planning.interpreter import GoalInterpreter, InterpretationError
 from app.planning.planner import Planner, PlanningError
+from app.planning.validator import PlanValidationError, validate_plan
 from app.tools.registry import ToolRegistry
 
 
@@ -95,6 +99,22 @@ class PlanningPipeline:
             intent, max_recovery_attempts=max_recovery
         )
         interpreted = intent.to_interpreted_goal()
+        # Collection grammars are planned here. The provider must not choose
+        # the source path, the item field, the bound, or extra mutations.
+        if intent.intent_id in COLLECTION_INTENT_IDS:
+            plan = plan_for_collection_intent(intent)
+            try:
+                plan = validate_plan(plan, self.registry)
+                authorize_plan(plan, authorization)
+            except PlanValidationError as exc:
+                raise PlanningError(f"Collection plan invalid: {exc}") from exc
+            except AuthorizationError as exc:
+                raise PlanningError(f"Collection plan unauthorized: {exc}") from exc
+            return PlanningResult(
+                interpreted_goal=interpreted,
+                plan=plan,
+                authorization=authorization,
+            )
         try:
             plan = await self.dynamic_planner.plan_async(
                 interpreted,

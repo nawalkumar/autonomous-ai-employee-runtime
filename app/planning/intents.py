@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from app.models.collections import DEFAULT_COLLECTION_LIMIT, MAX_COLLECTION_ITEMS
 from app.models.goal import InterpretedGoal, SuccessCriterion
 
 # ID fragments for case-insensitive fullmatch against soft-normalized goals.
@@ -27,7 +28,22 @@ IntentId = Literal[
     "assign_ticket",
     "update_employee_title",
     "create_customer_and_welcome_ticket",
+    "assign_bounded_tickets",
+    "update_ticket_status_batch",
+    "list_bounded_tickets",
 ]
+
+# Natural-language collection goals cannot ask for more than the default
+# collection limit, and never more than the runtime hard ceiling.
+GOAL_COLLECTION_MAX = min(DEFAULT_COLLECTION_LIMIT, MAX_COLLECTION_ITEMS)
+
+COLLECTION_INTENT_IDS = frozenset(
+    {
+        "assign_bounded_tickets",
+        "update_ticket_status_batch",
+        "list_bounded_tickets",
+    }
+)
 
 SUPPORTED_DYNAMIC_INTENTS: tuple[str, ...] = (
     "List open high-priority tickets.",
@@ -39,6 +55,10 @@ SUPPORTED_DYNAMIC_INTENTS: tuple[str, ...] = (
     "Update employee E-<id> title to <title>.",
     "Create a new customer named <name> at company <company> "
     "with email <email> and a welcome ticket.",
+    "Assign up to <1-20> <open|in_progress> <priority>-priority tickets "
+    "to employee E-<id>.",
+    "Mark tickets T-<id> and T-<id> [, and T-<id>...] as <status>.",
+    "List up to <1-20> <status> <priority>-priority tickets.",
 )
 
 _TICKET_STATUSES = ("open", "in_progress", "resolved", "closed")
@@ -73,6 +93,28 @@ _UPDATE_TITLE = re.compile(
     rf"update employee (?P<employee_id>{_EID})(?:'s)? "
     rf"title to (?P<title>{_TITLE})"
 )
+_PRIORITIES = ("low", "medium", "high", "urgent")
+_PRIORITY_ALT = "|".join(_PRIORITIES)
+_ASSIGNABLE_ALT = "open|in_progress"
+_BOUND = r"[1-9][0-9]?"
+
+# Checked before the single-ticket grammars. "tickets" (plural) and "up to N"
+# keep these from matching "Mark ticket T-1 as resolved" or "List open
+# high-priority tickets".
+_ASSIGN_BOUNDED = re.compile(
+    rf"assign up to (?P<bound>{_BOUND}) (?P<status>{_ASSIGNABLE_ALT}) "
+    rf"(?P<priority>{_PRIORITY_ALT})(?:-|\s)priority tickets to employee "
+    rf"(?P<employee_id>{_EID})"
+)
+_LIST_BOUNDED = re.compile(
+    rf"(?:list|show) up to (?P<bound>{_BOUND}) (?P<status>{_STATUS_ALT}) "
+    rf"(?P<priority>{_PRIORITY_ALT})(?:-|\s)priority tickets"
+)
+_BATCH_STATUS = re.compile(
+    rf"mark tickets (?P<idlist>{_TID}(?:\s*(?:,\s*and|,|and)\s+{_TID})+) "
+    rf"as (?P<status>{_STATUS_ALT})"
+)
+
 _CREATE_CUSTOMER = re.compile(
     rf"create a new customer named (?P<name>{_PERSON}) "
     rf"at company (?P<company>{_PERSON}) "
@@ -118,6 +160,83 @@ def parse_trusted_intent(text: str) -> TrustedIntent | None:
         return None
     soft = _soft_normalize(original)
     lowered = soft.lower()
+
+    match = _ASSIGN_BOUNDED.fullmatch(lowered)
+    if match:
+        bound = _collection_bound(match.group("bound"))
+        if bound is None:
+            return None
+        employee_id = match.group("employee_id").upper()
+        status = match.group("status")
+        priority = match.group("priority")
+        return TrustedIntent(
+            intent_id="assign_bounded_tickets",
+            original_request=original,
+            objective=(
+                f"Assign up to {bound} {status} {priority}-priority tickets "
+                f"to employee {employee_id}."
+            ),
+            entities={
+                "bound": bound,
+                "status": status,
+                "priority": priority,
+                "employee_id": employee_id,
+                "list_step_id": "list",
+            },
+            constraints=(
+                "bounded_collection",
+                f"bound={bound}",
+                f"status={status}",
+                f"priority={priority}",
+                f"employee_id={employee_id}",
+            ),
+        )
+
+    match = _LIST_BOUNDED.fullmatch(lowered)
+    if match:
+        bound = _collection_bound(match.group("bound"))
+        if bound is None:
+            return None
+        status = match.group("status")
+        priority = match.group("priority")
+        return TrustedIntent(
+            intent_id="list_bounded_tickets",
+            original_request=original,
+            objective=f"List up to {bound} {status} {priority}-priority tickets.",
+            entities={
+                "bound": bound,
+                "status": status,
+                "priority": priority,
+                "list_step_id": "list",
+            },
+            constraints=(
+                "read_only",
+                "bounded_collection",
+                f"bound={bound}",
+                f"status={status}",
+                f"priority={priority}",
+            ),
+        )
+
+    match = _BATCH_STATUS.fullmatch(lowered)
+    if match:
+        ticket_ids = _batch_ticket_ids(match.group("idlist"))
+        if ticket_ids is None:
+            return None
+        status = match.group("status")
+        return TrustedIntent(
+            intent_id="update_ticket_status_batch",
+            original_request=original,
+            objective=(
+                f"Update tickets {', '.join(ticket_ids)} status to {status}."
+            ),
+            entities={"ticket_ids": ticket_ids, "status": status},
+            constraints=(
+                "explicit_ids",
+                f"ticket_ids={','.join(ticket_ids)}",
+                f"status={status}",
+            ),
+        )
 
     if _LIST_OPEN_HIGH.fullmatch(lowered):
         return TrustedIntent(
@@ -233,6 +352,29 @@ def parse_trusted_intent(text: str) -> TrustedIntent | None:
         )
 
     return None
+
+
+def _collection_bound(raw: str) -> int | None:
+    if not raw.isdigit():
+        return None
+    value = int(raw)
+    if value < 1 or value > GOAL_COLLECTION_MAX:
+        return None
+    return value
+
+
+def _batch_ticket_ids(idlist: str) -> list[str] | None:
+    """Unique explicit ticket ids, or None when the list is not a safe batch."""
+    ids = [item.upper() for item in re.findall(_TID, idlist)]
+    if len(ids) < 2 or len(ids) > GOAL_COLLECTION_MAX:
+        return None
+    if len(ids) != len(set(ids)):
+        return None
+    leftover = re.sub(_TID, " ", idlist.lower())
+    tokens = re.findall(r"[a-z0-9_]+", leftover)
+    if any(token != "and" for token in tokens):
+        return None
+    return ids
 
 
 def describe_trusted_intent(intent: TrustedIntent) -> str:

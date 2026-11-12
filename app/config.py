@@ -27,8 +27,10 @@ class Settings(BaseSettings):
     xai_api_key: str = ""
     xai_model: str = "grok-2-latest"
     xai_base_url: str = "https://api.x.ai/v1"
-    # Optional LLM-backed planning for a trusted intent catalog. Default off:
-    # disabled mode preserves the two deterministic mock goal contracts only.
+    # Optional planning for a trusted intent catalog. Default off: disabled mode
+    # preserves the two deterministic mock goal contracts only. When enabled,
+    # bounded collection grammars are planned deterministically (no provider
+    # call); other catalog intents may call the configured provider.
     aae_dynamic_planning_enabled: bool = False
     # Provider reliability bounds (dynamic planner / xAI adapter). Unused when
     # dynamic planning is disabled.

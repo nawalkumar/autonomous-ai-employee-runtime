@@ -5,21 +5,68 @@ Scopes are independent of planner/LLM output. The LLM cannot create or expand th
 
 from __future__ import annotations
 
+import re
+
 from app.authz.errors import AuthorizationError, AuthorizationReason
 from app.authz.models import (
+    AllowedValuesConstraint,
     AuthorizationBudgets,
     AuthorizationScope,
     ExactValueConstraint,
     FieldKeysConstraint,
+    FromCollectionConstraint,
     FromStepOutputConstraint,
 )
 from app.authz.origin import authorization_for_supported_goal, welcome_customer_ticket_scope
 from app.llm.mock import parse_supported_goal
-from app.planning.intents import TrustedIntent, parse_trusted_intent
+from app.planning.intents import GOAL_COLLECTION_MAX, TrustedIntent, parse_trusted_intent
+from app.world.models import (
+    EMPLOYEE_ID_PATTERN,
+    OPEN_TICKET_STATUSES,
+    TICKET_ID_PATTERN,
+    TICKET_TRANSITIONS,
+)
 
 
 def _attempts(max_recovery_attempts: int) -> int:
     return max(1, 1 + max_recovery_attempts)
+
+
+_EMPLOYEE_ID = re.compile(EMPLOYEE_ID_PATTERN)
+_TICKET_ID = re.compile(TICKET_ID_PATTERN)
+_PRIORITIES = frozenset({"low", "medium", "high", "urgent"})
+_STATUSES = frozenset(TICKET_TRANSITIONS)
+_TRANSITION_TARGETS = frozenset().union(*TICKET_TRANSITIONS.values())
+
+
+def _budgets(steps: int, mutations: int, calls: int) -> AuthorizationBudgets:
+    return AuthorizationBudgets(
+        max_steps=min(100, max(1, steps)),
+        max_mutations=min(100, max(0, mutations)),
+        max_tool_calls=min(500, max(1, calls)),
+    )
+
+
+def _require_bound(entities: dict) -> int:
+    value = entities.get("bound")
+    if type(value) is not int or not 1 <= value <= GOAL_COLLECTION_MAX:
+        raise AuthorizationError(
+            AuthorizationReason.LEGACY_UNMAPPED,
+            "Collection bound is not an explicit authorized limit.",
+        )
+    return value
+
+
+def _ticket_filters(entities: dict, *, assignable_only: bool) -> dict[str, str]:
+    status = str(entities.get("status") or "")
+    priority = str(entities.get("priority") or "")
+    allowed = OPEN_TICKET_STATUSES if assignable_only else _STATUSES
+    if status not in allowed or priority not in _PRIORITIES:
+        raise AuthorizationError(
+            AuthorizationReason.LEGACY_UNMAPPED,
+            "Ticket filters are not an authorized status and priority.",
+        )
+    return {"status": status, "priority": priority}
 
 
 def authorization_for_trusted_intent(
@@ -171,6 +218,90 @@ def authorization_for_trusted_intent(
             ticket_constraints["subject"] = ExactValueConstraint(value=str(subject))
         constraints["company_api.create_ticket"] = ticket_constraints
         return scope.model_copy(update={"constraints": constraints})
+
+    if intent.intent_id == "assign_bounded_tickets":
+        bound = _require_bound(entities)
+        employee_id = str(entities.get("employee_id") or "")
+        if _EMPLOYEE_ID.fullmatch(employee_id) is None:
+            raise AuthorizationError(
+                AuthorizationReason.LEGACY_UNMAPPED,
+                "Assignment requires an explicit employee id.",
+            )
+        filters = _ticket_filters(entities, assignable_only=True)
+        source_step = str(entities.get("list_step_id") or "list")
+        return AuthorizationScope(
+            allowed_operations=[
+                "company_api.list_tickets",
+                "company_api.assign_ticket",
+            ],
+            constraints={
+                "company_api.list_tickets": {
+                    "filters": ExactValueConstraint(value=filters),
+                    "limit": ExactValueConstraint(value=bound),
+                    "offset": ExactValueConstraint(value=0),
+                },
+                "company_api.assign_ticket": {
+                    "employee_id": ExactValueConstraint(value=employee_id),
+                    "ticket_id": FromCollectionConstraint(source_step_id=source_step),
+                },
+            },
+            budgets=_budgets(
+                steps=1 + bound,
+                mutations=bound * attempts,
+                calls=(1 + bound) * attempts,
+            ),
+        )
+
+    if intent.intent_id == "list_bounded_tickets":
+        bound = _require_bound(entities)
+        filters = _ticket_filters(entities, assignable_only=False)
+        return AuthorizationScope(
+            allowed_operations=["company_api.list_tickets"],
+            constraints={
+                "company_api.list_tickets": {
+                    "filters": ExactValueConstraint(value=filters),
+                    "limit": ExactValueConstraint(value=bound),
+                    "offset": ExactValueConstraint(value=0),
+                }
+            },
+            budgets=_budgets(steps=1, mutations=0, calls=1 * attempts),
+        )
+
+    if intent.intent_id == "update_ticket_status_batch":
+        status = str(entities.get("status") or "")
+        raw_ids = entities.get("ticket_ids")
+        if status not in _TRANSITION_TARGETS or not isinstance(raw_ids, list):
+            raise AuthorizationError(
+                AuthorizationReason.LEGACY_UNMAPPED,
+                "Batch status update is not an authorized transition.",
+            )
+        ticket_ids = [str(item) for item in raw_ids]
+        if (
+            len(ticket_ids) < 2
+            or len(ticket_ids) > GOAL_COLLECTION_MAX
+            or len(ticket_ids) != len(set(ticket_ids))
+            or any(_TICKET_ID.fullmatch(ticket_id) is None for ticket_id in ticket_ids)
+        ):
+            raise AuthorizationError(
+                AuthorizationReason.LEGACY_UNMAPPED,
+                "Batch status update requires explicit unique ticket ids.",
+            )
+        count = len(ticket_ids)
+        return AuthorizationScope(
+            allowed_operations=["company_api.update_ticket"],
+            constraints={
+                "company_api.update_ticket": {
+                    "ticket_id": AllowedValuesConstraint(values=ticket_ids),
+                    "fields": FieldKeysConstraint(allowed_keys=["status"]),
+                    "fields.status": ExactValueConstraint(value=status),
+                }
+            },
+            budgets=_budgets(
+                steps=count,
+                mutations=count * attempts,
+                calls=count * attempts,
+            ),
+        )
 
     raise AuthorizationError(
         AuthorizationReason.LEGACY_UNMAPPED,
