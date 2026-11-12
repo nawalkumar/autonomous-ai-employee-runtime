@@ -12,6 +12,7 @@ from app.authz.models import (
     AuthorizationScope,
     ExactValueConstraint,
     FieldKeysConstraint,
+    FromCollectionConstraint,
     FromStepOutputConstraint,
     IntRangeConstraint,
     parse_authorization_scope,
@@ -204,10 +205,61 @@ def _authorize_resolved_arguments(
     arguments: dict[str, Any],
     step_id: str | None,
 ) -> None:
-    constraints = scope.constraints_for(tool, operation)
-    for arg_name, constraint in constraints.items():
+    """Every resolved action must independently match one authorized shape."""
+    shapes = scope.shapes_for(tool, operation)
+    if len(shapes) == 1 and not shapes[0]:
+        return
+
+    last_error: AuthorizationError | None = None
+    for shape in shapes:
+        try:
+            _authorize_resolved_against_shape(
+                state, scope, tool, operation, arguments, shape, step_id=step_id
+            )
+            return
+        except AuthorizationError as exc:
+            last_error = exc
+            continue
+
+    assert last_error is not None
+    raise AuthorizationError(
+        last_error.reason,
+        f"Resolved action does not satisfy any authorized argument shape for "
+        f"{operation_key(tool, operation)}.",
+        details={
+            "operation": operation_key(tool, operation),
+            "step_id": step_id or "",
+            "shape_count": len(shapes),
+            "kind": last_error.details.get("kind", "value"),
+            "cause": last_error.message,
+        },
+    )
+
+
+def _authorize_resolved_against_shape(
+    state: ExecutionState,
+    scope: AuthorizationScope,
+    tool: str,
+    operation: str,
+    arguments: dict[str, Any],
+    shape: dict[str, ArgumentConstraint],
+    *,
+    step_id: str | None,
+) -> None:
+    for arg_name, constraint in shape.items():
         if "." in arg_name:
             root, _, nested = arg_name.partition(".")
+            if root not in arguments:
+                raise AuthorizationError(
+                    AuthorizationReason.FIELD_UNAUTHORIZED,
+                    f"Argument '{root}' is missing for constraint '{arg_name}'.",
+                    details={
+                        "operation": operation_key(tool, operation),
+                        "argument": arg_name,
+                        "step_id": step_id or "",
+                        "kind": "field",
+                    },
+                )
             parent = arguments.get(root)
             if not isinstance(parent, dict):
                 raise AuthorizationError(
@@ -221,7 +273,16 @@ def _authorize_resolved_arguments(
                     },
                 )
             if nested not in parent:
-                continue
+                raise AuthorizationError(
+                    AuthorizationReason.FIELD_UNAUTHORIZED,
+                    f"Constrained field '{arg_name}' is missing.",
+                    details={
+                        "operation": operation_key(tool, operation),
+                        "argument": arg_name,
+                        "step_id": step_id or "",
+                        "kind": "field",
+                    },
+                )
             _apply_constraint(
                 state,
                 scope,
@@ -235,7 +296,23 @@ def _authorize_resolved_arguments(
             continue
 
         if arg_name not in arguments:
-            continue
+            reason = _violation_reason(arg_name, constraint)
+            raise AuthorizationError(
+                reason,
+                f"Constrained argument '{arg_name}' is missing.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step_id or "",
+                    "kind": (
+                        "field"
+                        if reason is AuthorizationReason.FIELD_UNAUTHORIZED
+                        else "entity"
+                        if reason is AuthorizationReason.ENTITY_UNAUTHORIZED
+                        else "value"
+                    ),
+                },
+            )
         _apply_constraint(
             state,
             scope,
@@ -268,6 +345,33 @@ def _apply_constraint(
     *,
     step_id: str | None,
 ) -> None:
+    if isinstance(constraint, FromCollectionConstraint):
+        snapshot = (state.collections.snapshots or {}).get(constraint.source_step_id)
+        if snapshot is None:
+            raise AuthorizationError(
+                AuthorizationReason.ENTITY_UNAUTHORIZED,
+                f"No sealed collection for source step '{constraint.source_step_id}'.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step_id or "",
+                    "kind": "entity",
+                },
+            )
+        if value not in snapshot.item_ids():
+            raise AuthorizationError(
+                AuthorizationReason.ENTITY_UNAUTHORIZED,
+                f"Argument '{arg_name}' is not a member of the sealed collection "
+                f"from '{constraint.source_step_id}'.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step_id or "",
+                    "kind": "entity",
+                },
+            )
+        return
+
     if isinstance(constraint, FromStepOutputConstraint):
         try:
             data = producer_output(state, constraint.step_id)

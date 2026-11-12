@@ -82,6 +82,18 @@ class FromStepOutputConstraint(BaseModel):
     path: list[str | int] = Field(min_length=1, max_length=8)
 
 
+class FromCollectionConstraint(BaseModel):
+    """Argument must be an item id from a sealed collection snapshot.
+
+    The collection is observed from ``source_step_id``; membership is checked
+    against the durable snapshot, not against live DB queries. This is not a
+    wildcard over all tickets.
+    """
+
+    type: Literal["from_collection"] = "from_collection"
+    source_step_id: str = Field(min_length=1, max_length=128)
+
+
 ArgumentConstraint = Annotated[
     Union[
         ExactValueConstraint,
@@ -89,9 +101,22 @@ ArgumentConstraint = Annotated[
         IntRangeConstraint,
         FieldKeysConstraint,
         FromStepOutputConstraint,
+        FromCollectionConstraint,
     ],
     Field(discriminator="type"),
 ]
+
+
+class ConstraintShape(BaseModel):
+    """One complete argument-shape alternative for an operation.
+
+    A step matches a shape only when every listed constraint is present and
+    satisfied on that step. Shapes are OR alternatives: a step may match any
+    one shape. Empty shapes are forbidden — use an absent alternatives entry
+    (and empty flat constraints) for unconstrained allowlisted operations.
+    """
+
+    constraints: dict[str, ArgumentConstraint] = Field(min_length=1)
 
 
 class AuthorizationBudgets(BaseModel):
@@ -119,8 +144,13 @@ class AuthorizationScope(BaseModel):
 
     version: Literal[1] = SCOPE_VERSION
     allowed_operations: list[str] = Field(min_length=1)
-    # operation key ("tool.operation") -> argument name -> constraint
+    # operation key ("tool.operation") -> argument name -> constraint (AND).
+    # Every executable step of the operation must satisfy the full map.
     constraints: dict[str, dict[str, ArgumentConstraint]] = Field(default_factory=dict)
+    # Optional OR of complete shapes when an operation legitimately has more
+    # than one argument form (e.g. find_customer by company vs by customer_id).
+    # When present for an operation, ``constraints`` for that key is ignored.
+    constraint_alternatives: dict[str, list[ConstraintShape]] = Field(default_factory=dict)
     budgets: AuthorizationBudgets
 
     @field_validator("allowed_operations")
@@ -140,11 +170,39 @@ class AuthorizationScope(BaseModel):
             raise ValueError("allowed_operations must list at least one tool.operation")
         return cleaned
 
+    @model_validator(mode="after")
+    def _alternatives_nonempty(self) -> AuthorizationScope:
+        for op_key, shapes in self.constraint_alternatives.items():
+            if not shapes:
+                raise ValueError(
+                    f"constraint_alternatives for {op_key!r} must list at least one shape"
+                )
+        return self
+
     def allows_operation(self, tool: str, operation: str) -> bool:
         return f"{tool}.{operation}" in self.allowed_operations
 
     def constraints_for(self, tool: str, operation: str) -> dict[str, ArgumentConstraint]:
-        return dict(self.constraints.get(f"{tool}.{operation}") or {})
+        """Flat AND constraints for ``tool.operation`` (empty when alternatives apply)."""
+        key = f"{tool}.{operation}"
+        if key in self.constraint_alternatives:
+            return {}
+        return dict(self.constraints.get(key) or {})
+
+    def shapes_for(self, tool: str, operation: str) -> list[dict[str, ArgumentConstraint]]:
+        """Constraint shapes a step of this operation must match (OR).
+
+        - Alternatives present → each alternative's constraint map.
+        - Else flat ``constraints`` → a single shape (possibly empty = unconstrained).
+        """
+        key = f"{tool}.{operation}"
+        alts = self.constraint_alternatives.get(key)
+        if alts:
+            return [dict(shape.constraints) for shape in alts]
+        flat = self.constraints.get(key)
+        if flat:
+            return [dict(flat)]
+        return [{}]
 
     def fingerprint(self) -> str:
         """Stable digest used to detect silent scope changes on resume."""
@@ -152,6 +210,10 @@ class AuthorizationScope(BaseModel):
         import json
 
         payload = self.model_dump(mode="json")
+        # Omit empty alternatives so scopes persisted before this field keep
+        # the same fingerprint after reload.
+        if not payload.get("constraint_alternatives"):
+            payload.pop("constraint_alternatives", None)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         return f"sha256:{digest}"
@@ -179,46 +241,102 @@ def parse_authorization_scope(raw: Any) -> AuthorizationScope:
             details={"version": version},
         )
     # Reject unknown constraint types before pydantic unions soften the error.
-    constraints = raw.get("constraints")
-    if constraints is not None:
-        if not isinstance(constraints, dict):
+    _validate_constraint_maps(raw.get("constraints"), label="constraints")
+    alternatives = raw.get("constraint_alternatives")
+    if alternatives is not None:
+        if not isinstance(alternatives, dict):
             raise AuthorizationError(
                 AuthorizationReason.MALFORMED_AUTHORIZATION,
-                "Authorization constraints must be an object.",
+                "Authorization constraint_alternatives must be an object.",
             )
-        for op_key, args in constraints.items():
-            if not isinstance(args, dict):
+        for op_key, shapes in alternatives.items():
+            if not isinstance(shapes, list) or not shapes:
                 raise AuthorizationError(
                     AuthorizationReason.MALFORMED_AUTHORIZATION,
-                    f"Constraints for {op_key!r} must be an object.",
+                    f"constraint_alternatives for {op_key!r} must be a non-empty list.",
                 )
-            for arg_name, constraint in args.items():
-                if not isinstance(constraint, dict) or "type" not in constraint:
+            for index, shape in enumerate(shapes):
+                if not isinstance(shape, dict):
                     raise AuthorizationError(
                         AuthorizationReason.MALFORMED_AUTHORIZATION,
-                        f"Constraint for {op_key}.{arg_name} is malformed.",
+                        f"constraint_alternatives[{op_key!r}][{index}] must be an object.",
                     )
-                ctype = constraint.get("type")
-                if ctype not in {
-                    "exact",
-                    "allowed_values",
-                    "int_range",
-                    "field_keys",
-                    "from_step_output",
-                }:
-                    raise AuthorizationError(
-                        AuthorizationReason.UNSUPPORTED_CONSTRAINT,
-                        f"Unsupported constraint type {ctype!r} on {op_key}.{arg_name}.",
-                        details={
-                            "operation": str(op_key),
-                            "argument": str(arg_name),
-                            "constraint_type": ctype,
-                        },
+                shape_constraints = shape.get("constraints", shape)
+                # Accept either {"constraints": {...}} or a bare constraint map.
+                if "constraints" in shape:
+                    _validate_constraint_maps(
+                        {op_key: shape["constraints"]},
+                        label=f"constraint_alternatives[{op_key}][{index}]",
+                    )
+                else:
+                    _validate_constraint_maps(
+                        {op_key: shape_constraints},
+                        label=f"constraint_alternatives[{op_key}][{index}]",
                     )
     try:
-        return AuthorizationScope.model_validate(raw)
+        # Normalize bare alternative maps into ConstraintShape objects.
+        normalized = dict(raw)
+        if isinstance(alternatives, dict):
+            fixed: dict[str, list[dict[str, Any]]] = {}
+            for op_key, shapes in alternatives.items():
+                fixed_shapes: list[dict[str, Any]] = []
+                for shape in shapes:
+                    if isinstance(shape, dict) and "constraints" in shape:
+                        fixed_shapes.append(shape)
+                    elif isinstance(shape, dict):
+                        fixed_shapes.append({"constraints": shape})
+                    else:
+                        fixed_shapes.append(shape)
+                fixed[op_key] = fixed_shapes
+            normalized["constraint_alternatives"] = fixed
+        return AuthorizationScope.model_validate(normalized)
     except ValidationError as exc:
         raise AuthorizationError(
             AuthorizationReason.MALFORMED_AUTHORIZATION,
             f"Authorization scope failed validation: {exc.error_count()} error(s).",
         ) from exc
+
+
+_CONSTRAINT_TYPES = frozenset(
+    {
+        "exact",
+        "allowed_values",
+        "int_range",
+        "field_keys",
+        "from_step_output",
+        "from_collection",
+    }
+)
+
+
+def _validate_constraint_maps(constraints: Any, *, label: str) -> None:
+    if constraints is None:
+        return
+    if not isinstance(constraints, dict):
+        raise AuthorizationError(
+            AuthorizationReason.MALFORMED_AUTHORIZATION,
+            f"Authorization {label} must be an object.",
+        )
+    for op_key, args in constraints.items():
+        if not isinstance(args, dict):
+            raise AuthorizationError(
+                AuthorizationReason.MALFORMED_AUTHORIZATION,
+                f"{label} for {op_key!r} must be an object.",
+            )
+        for arg_name, constraint in args.items():
+            if not isinstance(constraint, dict) or "type" not in constraint:
+                raise AuthorizationError(
+                    AuthorizationReason.MALFORMED_AUTHORIZATION,
+                    f"Constraint for {op_key}.{arg_name} is malformed.",
+                )
+            ctype = constraint.get("type")
+            if ctype not in _CONSTRAINT_TYPES:
+                raise AuthorizationError(
+                    AuthorizationReason.UNSUPPORTED_CONSTRAINT,
+                    f"Unsupported constraint type {ctype!r} on {op_key}.{arg_name}.",
+                    details={
+                        "operation": str(op_key),
+                        "argument": str(arg_name),
+                        "constraint_type": ctype,
+                    },
+                )

@@ -14,6 +14,7 @@ from app.authz.models import (
     ArgumentConstraint,
     AuthorizationBudgets,
     AuthorizationScope,
+    ConstraintShape,
     ExactValueConstraint,
     FieldKeysConstraint,
     FromStepOutputConstraint,
@@ -73,13 +74,14 @@ def matching_scope_for_plan(
 ) -> AuthorizationScope:
     """Build a narrow scope from plan literals — for trusted internal callers only.
 
-    This is the independently supplied scope for explicit test plans. It must
-    never be invoked by the planner or on untrusted public input. Reference-
-    bearing arguments are not turned into concrete allowlists; callers that
-    need ``from_step_output`` (e.g. W8) must pass ``extra_constraints``.
+    Per-operation argument shapes that are incompatible (different constrained
+    keys) become ``constraint_alternatives`` so each step must still fully match
+    one explicit shape. Compatible shapes merge into a single AND map.
     """
     allowed: list[str] = []
-    constraints: dict[str, dict[str, ArgumentConstraint]] = {}
+    # operation -> list of per-step non-empty constraint maps
+    shapes_by_op: dict[str, list[dict[str, ArgumentConstraint]]] = {}
+
     for step in steps:
         resolved = _step_operation(step)
         if resolved is None:
@@ -88,47 +90,85 @@ def matching_scope_for_plan(
         key = operation_key(tool, operation)
         if key not in allowed:
             allowed.append(key)
+
+        shape: dict[str, ArgumentConstraint] = {}
         if contains_reference(step.arguments):
-            # Narrowly authorize each top-level $ref as from_step_output of that
-            # exact producer path — never a wildcard entity permission.
-            ref_constraints = _reference_constraints(step.arguments)
-            if ref_constraints:
-                existing = constraints.setdefault(key, {})
-                for name, constraint in ref_constraints.items():
-                    if name not in existing:
-                        existing[name] = constraint
-            # Also constrain any sibling literal entity fields.
-            for name, constraint in _literal_constraints(tool, operation, step.arguments).items():
-                if name not in constraints.setdefault(key, {}):
-                    constraints[key][name] = constraint
-            continue
-        arg_constraints = _literal_constraints(tool, operation, step.arguments)
-        if arg_constraints:
-            existing = constraints.setdefault(key, {})
-            for name, constraint in arg_constraints.items():
-                # Keep the first constraint; conflicting literals across steps
-                # for the same operation widen via allowed_values when needed.
-                if name not in existing:
-                    existing[name] = constraint
-                else:
-                    existing[name] = _widen(existing[name], constraint)
+            shape.update(_reference_constraints(step.arguments))
+            shape.update(_literal_constraints(tool, operation, step.arguments))
+        else:
+            shape.update(_literal_constraints(tool, operation, step.arguments))
+        if shape:
+            shapes_by_op.setdefault(key, []).append(shape)
+
     if extra_constraints:
         for key, args in extra_constraints.items():
             if key not in allowed:
                 allowed.append(key)
-            bucket = constraints.setdefault(key, {})
-            bucket.update(args)
+            shapes_by_op.setdefault(key, []).append(dict(args))
+
     if not allowed:
         raise AuthorizationError(
             AuthorizationReason.MISSING_AUTHORIZATION,
             "Cannot build a scope from a plan with no recognized operations.",
         )
+
+    constraints: dict[str, dict[str, ArgumentConstraint]] = {}
+    alternatives: dict[str, list[ConstraintShape]] = {}
+    for key, shapes in shapes_by_op.items():
+        merged_or_alts = _merge_or_alternatives(shapes)
+        if isinstance(merged_or_alts, list):
+            alternatives[key] = [
+                ConstraintShape(constraints=shape) for shape in merged_or_alts
+            ]
+        else:
+            constraints[key] = merged_or_alts
+
     return AuthorizationScope(
         allowed_operations=allowed,
         constraints=constraints,
+        constraint_alternatives=alternatives,
         budgets=budgets
         or default_budgets_for_plan(steps, max_recovery_attempts=max_recovery_attempts),
     )
+
+
+def _shape_key_set(shape: dict[str, ArgumentConstraint]) -> frozenset[str]:
+    return frozenset(shape)
+
+
+def _merge_or_alternatives(
+    shapes: list[dict[str, ArgumentConstraint]],
+) -> dict[str, ArgumentConstraint] | list[dict[str, ArgumentConstraint]]:
+    """Merge compatible shapes; otherwise return distinct non-empty alternatives."""
+    if not shapes:
+        return {}
+    key_sets = {_shape_key_set(shape) for shape in shapes}
+    if len(key_sets) == 1:
+        merged: dict[str, ArgumentConstraint] = {}
+        for shape in shapes:
+            for name, constraint in shape.items():
+                if name not in merged:
+                    merged[name] = constraint
+                else:
+                    merged[name] = _widen(merged[name], constraint)
+        return merged
+
+    # Incompatible key sets: keep unique shapes as OR alternatives (no empty).
+    unique: list[dict[str, ArgumentConstraint]] = []
+    seen: set[str] = set()
+    for shape in shapes:
+        if not shape:
+            continue
+        marker = repr(sorted((k, c.model_dump(mode="json")) for k, c in shape.items()))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(dict(shape))
+    if len(unique) == 1:
+        return unique[0]
+    if not unique:
+        return {}
+    return unique
 
 
 def _widen(
@@ -225,6 +265,9 @@ def _literal_constraints(
         if isinstance(assignee_id, str):
             result["assignee_id"] = ExactValueConstraint(value=assignee_id)
 
+    if operation == "list_tickets":
+        filters = arguments.get("filters")
+        if isinstance(filters, dict) and not contains_reference(filters):
+            result["filters"] = ExactValueConstraint(value=dict(filters))
+
     return result
-
-

@@ -11,10 +11,12 @@ from app.authz.models import (
     AuthorizationScope,
     ExactValueConstraint,
     FieldKeysConstraint,
+    FromCollectionConstraint,
     FromStepOutputConstraint,
     IntRangeConstraint,
 )
 from app.authz.origin import operation_key, reference_targets_constraint
+from app.models.collections import COLLECTION_REF_KEY, parse_collection_item_ref
 from app.models.plan import Plan, PlanStep
 from app.models.references import contains_reference
 from app.tools.capabilities import CAPABILITIES, operation_of
@@ -23,8 +25,11 @@ from app.tools.capabilities import CAPABILITIES, operation_of
 def authorize_plan(plan: Plan | list[PlanStep], scope: AuthorizationScope) -> None:
     """Validate every step against ``scope``. Raises AuthorizationError on denial.
 
-    Operation and argument checks run before budget checks so an unauthorized
-    extra action surfaces as ``PLAN_UNAUTHORIZED`` rather than a step-count miss.
+    Every executable step must independently satisfy one complete constraint shape
+    for its operation. Omitted constrained arguments never inherit permission from
+    a sibling step. Operation and argument checks run before budget checks so an
+    unauthorized extra action surfaces as ``PLAN_UNAUTHORIZED`` rather than a
+    step-count miss.
     """
     steps = plan.steps if isinstance(plan, Plan) else list(plan)
 
@@ -67,8 +72,6 @@ def authorize_plan(plan: Plan | list[PlanStep], scope: AuthorizationScope) -> No
 
         _authorize_step_arguments(step, tool, operation, scope)
 
-    _require_constraint_coverage(steps, scope)
-
     if len(steps) > scope.budgets.max_steps:
         raise AuthorizationError(
             AuthorizationReason.BUDGET_EXCEEDED,
@@ -100,23 +103,60 @@ def _authorize_step_arguments(
     operation: str,
     scope: AuthorizationScope,
 ) -> None:
-    constraints = scope.constraints_for(tool, operation)
-    if not constraints:
+    shapes = scope.shapes_for(tool, operation)
+    if len(shapes) == 1 and not shapes[0]:
         return
-    arguments = step.arguments or {}
-    has_refs = contains_reference(arguments)
 
-    for arg_name, constraint in constraints.items():
+    last_error: AuthorizationError | None = None
+    for shape in shapes:
+        try:
+            _authorize_step_against_shape(step, tool, operation, shape)
+            return
+        except AuthorizationError as exc:
+            last_error = exc
+            continue
+
+    assert last_error is not None
+    raise AuthorizationError(
+        AuthorizationReason.PLAN_UNAUTHORIZED,
+        f"Step '{step.step_id}' does not satisfy any authorized argument shape "
+        f"for {operation_key(tool, operation)}.",
+        details={
+            "operation": operation_key(tool, operation),
+            "step_id": step.step_id,
+            "shape_count": len(shapes),
+            "cause": last_error.message,
+        },
+    )
+
+
+def _authorize_step_against_shape(
+    step: PlanStep,
+    tool: str,
+    operation: str,
+    shape: dict[str, ArgumentConstraint],
+) -> None:
+    """Require every constraint in ``shape`` to be present and satisfied on ``step``."""
+    arguments = step.arguments or {}
+
+    for arg_name, constraint in shape.items():
         if "." in arg_name:
-            # Nested field constraint (e.g. fields.title) — only when parent is concrete.
             root, _, nested = arg_name.partition(".")
+            if root not in arguments:
+                raise AuthorizationError(
+                    AuthorizationReason.PLAN_UNAUTHORIZED,
+                    f"Step '{step.step_id}' is missing constrained argument '{root}'.",
+                    details={
+                        "operation": operation_key(tool, operation),
+                        "argument": arg_name,
+                        "step_id": step.step_id,
+                    },
+                )
             parent = arguments.get(root)
             if contains_reference({root: parent}) if parent is not None else False:
-                # Defer nested checks until runtime after binding.
+                # Parent still a $ref — defer nested literal checks to runtime.
                 continue
             if not isinstance(parent, dict):
-                if has_refs and root not in arguments:
-                    continue
                 raise AuthorizationError(
                     AuthorizationReason.PLAN_UNAUTHORIZED,
                     f"Step '{step.step_id}' argument '{root}' must be an object for "
@@ -128,8 +168,15 @@ def _authorize_step_arguments(
                     },
                 )
             if nested not in parent:
-                # Coverage across steps is enforced by _require_constraint_coverage.
-                continue
+                raise AuthorizationError(
+                    AuthorizationReason.PLAN_UNAUTHORIZED,
+                    f"Step '{step.step_id}' is missing constrained field '{arg_name}'.",
+                    details={
+                        "operation": operation_key(tool, operation),
+                        "argument": arg_name,
+                        "step_id": step.step_id,
+                    },
+                )
             if contains_reference(parent.get(nested)):
                 continue
             _check_literal(
@@ -144,11 +191,45 @@ def _authorize_step_arguments(
             continue
 
         if arg_name not in arguments:
-            # Sibling steps of the same operation may carry different argument
-            # shapes; plan-level coverage ensures each constraint appears somewhere.
-            continue
+            raise AuthorizationError(
+                AuthorizationReason.PLAN_UNAUTHORIZED,
+                f"Step '{step.step_id}' is missing constrained argument '{arg_name}'.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step.step_id,
+                },
+            )
 
         value = arguments[arg_name]
+        if isinstance(constraint, FromCollectionConstraint):
+            # Collection placeholders or concrete ids: membership is checked at
+            # runtime against the sealed snapshot for source_step_id.
+            try:
+                placeholder = parse_collection_item_ref(value)
+            except Exception as exc:  # noqa: BLE001
+                raise AuthorizationError(
+                    AuthorizationReason.PLAN_UNAUTHORIZED,
+                    f"Step '{step.step_id}' has a malformed collection reference: {exc}",
+                    details={
+                        "operation": operation_key(tool, operation),
+                        "argument": arg_name,
+                        "step_id": step.step_id,
+                    },
+                ) from exc
+            if placeholder is not None or isinstance(value, str):
+                continue
+            raise AuthorizationError(
+                AuthorizationReason.PLAN_UNAUTHORIZED,
+                f"Step '{step.step_id}' argument '{arg_name}' must be a collection "
+                "item placeholder or item id.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step.step_id,
+                },
+            )
+
         if contains_reference(value):
             if isinstance(constraint, FromStepOutputConstraint):
                 if reference_targets_constraint(arguments, arg_name, constraint):
@@ -163,54 +244,25 @@ def _authorize_step_arguments(
                         "step_id": step.step_id,
                     },
                 )
-            # Other constraints: do not treat the reference as an authorized concrete
-            # value; runtime will authorize after binding.
+            # Exact/allowlist constraints: presence of $ref is required; concrete
+            # value is authorized only after binding at runtime.
             continue
+
+        if isinstance(value, dict) and COLLECTION_REF_KEY in value:
+            raise AuthorizationError(
+                AuthorizationReason.PLAN_UNAUTHORIZED,
+                f"Step '{step.step_id}' argument '{arg_name}' uses a collection "
+                "placeholder but the constraint is not from_collection.",
+                details={
+                    "operation": operation_key(tool, operation),
+                    "argument": arg_name,
+                    "step_id": step.step_id,
+                },
+            )
 
         _check_literal(
             step.step_id, tool, operation, arg_name, value, constraint, plan_time=True
         )
-
-
-def _require_constraint_coverage(steps: list[PlanStep], scope: AuthorizationScope) -> None:
-    """Every scope constraint must appear on at least one step of that operation.
-
-    Prevents optional schema fields (e.g. list_tickets.filters) from widening a
-    narrowly constrained operation when the constrained argument is simply omitted.
-    Per-step checks still skip missing args so multi-step same-operation plans
-    (different argument shapes) remain valid.
-    """
-    by_operation: dict[str, list[PlanStep]] = {}
-    for step in steps:
-        tool = step.resolved_tool_name()
-        operation = operation_of(step.arguments or {})
-        if not tool or not isinstance(operation, str) or not operation:
-            continue
-        by_operation.setdefault(operation_key(tool, operation), []).append(step)
-
-    for op_key, constraints in scope.constraints.items():
-        op_steps = by_operation.get(op_key) or []
-        for arg_name, constraint in constraints.items():
-            if any(_step_carries_constraint_arg(step, arg_name) for step in op_steps):
-                continue
-            raise AuthorizationError(
-                AuthorizationReason.PLAN_UNAUTHORIZED,
-                f"Plan never supplies constrained argument '{arg_name}' for {op_key}.",
-                details={
-                    "operation": op_key,
-                    "argument": arg_name,
-                    "constraint_type": getattr(constraint, "type", type(constraint).__name__),
-                },
-            )
-
-
-def _step_carries_constraint_arg(step: PlanStep, arg_name: str) -> bool:
-    arguments = step.arguments or {}
-    if "." not in arg_name:
-        return arg_name in arguments
-    root, _, nested = arg_name.partition(".")
-    parent = arguments.get(root)
-    return isinstance(parent, dict) and nested in parent
 
 
 def _check_literal(
@@ -296,6 +348,10 @@ def _check_literal(
                 f"'{constraint.step_id}' output; literal values are not permitted.",
                 details=details,
             )
+        return
+
+    if isinstance(constraint, FromCollectionConstraint):
+        # Membership is enforced at runtime against the sealed snapshot.
         return
 
     raise AuthorizationError(
