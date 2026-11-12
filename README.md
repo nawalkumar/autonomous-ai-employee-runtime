@@ -23,6 +23,7 @@ SQLite database and per-task locks. All company data is fictional.
 - [HTTP API](#http-api)
 - [Capability registry](#capability-registry)
 - [Step-output references](#step-output-references)
+- [Goal-scoped plan authorization](#goal-scoped-plan-authorization)
 - [Company data model and demo company](#company-data-model-and-demo-company)
 - [Local mode and public demo mode](#local-mode-and-public-demo-mode)
 - [Security model](#security-model)
@@ -70,6 +71,10 @@ goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
   [`$ref`](#step-output-references) objects. Resolution happens before approval and
   invocation; approval fingerprints and verification use the concrete resolved
   arguments. The mock planner still emits only literal plans.
+- Goal-scoped [plan authorization](#goal-scoped-plan-authorization): each task carries
+  an independently granted, versioned allowlist of operations with entity/field
+  constraints and execution budgets. Plans and resolved actions outside that scope
+  fail closed before side effects. This is not LLM autonomy.
 
 ## Platform support
 
@@ -454,6 +459,127 @@ Unsupported criteria still fail; read-only tasks remain `unverified`.
 - No filesystem, environment, private-attribute or code access through paths.
 - No public HTTP endpoint for submitting arbitrary plans.
 
+## Goal-scoped plan authorization
+
+Authorization answers **what the task is permitted to do**. It is separate from
+human approval (whether a gated action should run) and from independent verification
+(what actually happened). A technically valid plan is still rejected if any operation,
+entity, field mutation or execution volume falls outside the independently granted
+scope.
+
+This is **not** an LLM-autonomous system. Scopes come from trusted deterministic
+origins; the planner cannot grant or expand permissions.
+
+### Authorization contract
+
+Each task persists a versioned `AuthorizationScope` (`version: 1`) with:
+
+| Field | Meaning |
+|-------|---------|
+| `allowed_operations` | Explicit `tool.operation` allowlist (e.g. `company_api.create_ticket`) |
+| `constraints` | Per-operation argument constraints |
+| `budgets` | `max_steps`, `max_mutations`, `max_tool_calls` |
+
+Supported constraint types (fail-closed on anything else; no regex or executable
+policy language):
+
+- `exact` — argument must equal a concrete value
+- `allowed_values` — argument must be one of a fixed set
+- `int_range` — inclusive integer bounds
+- `field_keys` — dictionary payloads (e.g. `fields`) may contain only listed keys
+- `from_step_output` — argument must equal a prior authorized step's successful output
+  path (narrow W8-style binding, not a wildcard entity permission)
+
+Unknown operations and unsupported constraint types are denied.
+
+### Trusted scope origin
+
+| Path | How scope is established |
+|------|--------------------------|
+| CLI / HTTP API | Derived from the deterministic mock goal grammar (`parse_supported_goal`), **not** from planner output or the request body |
+| Explicit internal plans (tests) | Independently supplied at `create_task`; test-only `tests.authz_support.matching_scope_for_plan` may build a matching narrow scope. Production never imports that helper; the planner never supplies a scope |
+| Legacy tasks without a persisted scope | Mapped only for the two known mock scenarios from trusted persisted goal text; otherwise fail closed |
+
+The public API does **not** accept a caller-provided scope. Plans cannot declare their
+own permissions. LLM text and tool observations cannot increase authority. After task
+creation the scope is immutable (no public re-authorization path in this milestone).
+
+### Plan-time enforcement
+
+Before a task is persisted, the entire plan is checked against the scope:
+
+- every operation is allowed and registered
+- literal arguments satisfy constraints
+- `$ref`-bearing arguments are **not** treated as authorized concrete values; concrete
+  checks run after binding (except a plan `$ref` that exactly matches a
+  `from_step_output` constraint)
+- step count and planned mutating steps fit budgets
+
+Failures use reason code `PLAN_UNAUTHORIZED` (or `BUDGET_EXCEEDED` /
+`UNKNOWN_OPERATION` / `UNSUPPORTED_CONSTRAINT`). Nothing is executed.
+
+### Runtime enforcement
+
+After `$ref` resolution and schema validation, immediately before approval and every
+tool attempt (retries and resume included):
+
+1. Load the trusted persisted task scope (fingerprint-checked).
+2. Authorize the exact resolved operation and arguments.
+3. Enforce tool-call and mutation budgets from durable `tool_calls` records.
+4. Then evaluate approval, fingerprint, and invoke the tool.
+
+Bypassing via direct executor use, retry, approval continuation, restart, or reference
+resolution is refused by the same gate. Denials use `ACTION_UNAUTHORIZED` /
+`BUDGET_EXCEEDED` / `MALFORMED_AUTHORIZATION` and failure type `unauthorized`.
+
+### `$ref` interaction
+
+A reference is never authorized solely because the destination operation is allowed.
+The resolved value must satisfy the scope (e.g. ticket creation for `C-1001` only).
+W8 uses `from_step_output` so a welcome ticket may use only the customer ID produced by
+the authorized `create_customer` step.
+
+### Approval interaction
+
+**An approver cannot approve an action outside the task scope.** Authorization failure
+prevents creating or continuing an approval. A valid fingerprint does not override
+entity or field constraints. Reapproval does not expand the task scope. Stale-approval
+protections from earlier milestones remain.
+
+### Budget semantics
+
+| Budget | Counts |
+|--------|--------|
+| `max_steps` | Plan length (plan-time) |
+| `max_mutations` | Plan-time: number of mutating steps. Runtime: mutating tool-call **attempts** including failures and retries (reads do not count). Trusted default scopes size this as `mutating_steps × (1 + max_recovery_attempts)` so one authorized retry remains possible; the cap is still finite. |
+| `max_tool_calls` | Every recorded tool-call attempt (reads, writes, failures, retries). Authorization denials that never create a tool-call record fail the task instead of retrying. |
+
+Restarts cannot reset consumed budget (counters come from persisted `tool_calls`).
+Reusing an idempotency key does not bypass authorization. `ExecutionRuntime` takes the
+same OS-backed per-task lock as the CLI/API; callers that already hold that lock pass
+`execution_locked=True`. Direct concurrent runtime callers cannot overspend budgets
+across processes.
+
+### Persistence and audit
+
+Scope and its fingerprint are stored on `ExecutionState` in the existing SQLite
+`state_json` snapshot (additive; no demo-company rewrite). Audit events include
+`authorization.bound` and `authorization.denied` with reason codes; secrets and full
+private payloads are not logged. Corrupted or fingerprint-mismatched scopes fail closed.
+
+### Legacy compatibility
+
+Both original deterministic mock scenarios continue to work under scopes derived from
+their grammars. Unmappable legacy tasks fail closed rather than receiving unrestricted
+permissions.
+
+### Known limitations
+
+- No LLM-backed or natural-language-general authorization.
+- No public plan-submission or self-granted permission endpoints.
+- No generic collection iteration or bounded replanning.
+- Constraint vocabulary is intentionally small and typed.
+
 ## Company data model and demo company
 
 ### Schema and migration
@@ -593,6 +719,10 @@ Enforced on the server, in both modes:
 
 - Tasks come only from goals accepted by the strict mock grammar. There is no endpoint
   that runs a tool, plan, shell command or file write directly.
+- Each task is bound to a [goal-scoped authorization](#goal-scoped-plan-authorization)
+  contract derived from that grammar (not from the planner or the caller). Plans and
+  resolved actions outside the scope fail closed before side effects; approval cannot
+  expand the scope.
 - The approval policy pauses `company_api.update_employee` (and any destructive tool)
   before it runs. Approval requires `confirm: true` and the exact pending `step_id`, and
   is bound to a fingerprint of the exact action; it is re-checked immediately before
@@ -707,8 +837,10 @@ one instance.
 
 ## Limitations
 
-- **Mock planner only.** Exactly two goal formats; no live LLM planning. `--provider xai`
-  is refused by the CLI and `LLM_PROVIDER` does not affect the CLI or the API.
+- **Not LLM-autonomous.** Exactly two mock goal formats; no live LLM planning.
+  Authorization is independently granted from those grammars (or trusted internal
+  scopes), not inferred from free-form natural language. `--provider xai` is refused
+  by the CLI and `LLM_PROVIDER` does not affect the CLI or the API.
 - **Fictional world.** The company API, employees, customers and tickets are a seeded
   SQLite mock; there are no real integrations.
 - **Locks protect cooperating processes only** (the CLI and the API). Code that calls
@@ -731,18 +863,23 @@ one instance.
 ## How it works
 
 ```text
-Goal → mock interpreter (strict grammar) → plan validated against the tool registry
+Goal → mock interpreter (strict grammar) → trusted authorization scope
+     → plan validated against registry + scope
      → resolve $ref arguments from earlier step outputs (explicit plans)
-     → policy gate (approval for sensitive writes) → tool calls with bounded retry
+     → authorize resolved action → policy gate (HITL) → tool calls with bounded retry
      → independent verification of database + workspace → COMPLETED / FAILED
 ```
 
+- **Authorization:** independently granted scope checked at plan time and again after
+  every reference binding, before approval and each tool attempt. See
+  [Goal-scoped plan authorization](#goal-scoped-plan-authorization).
 - **Step-output references:** explicit plans may declare `$ref` bindings; they are
-  resolved before approval and every attempt. See [Step-output references](#step-output-references).
+  resolved before authorization, approval and every attempt. See [Step-output references](#step-output-references).
 - **Human-in-the-loop:** the pending action and its fingerprint are persisted, so
   approval works across restarts and processes. Approving twice, after a rejection, or
   for an action that has since changed is refused. Tasks persisted before fingerprints
-  existed are bound to the arguments recorded on their pending action.
+  existed are bound to the arguments recorded on their pending action. Approval never
+  overrides authorization.
 - **Independent verification:** completion is never based on tool responses alone. The
   verifier checks the requested and planned outcomes against the actual database and
   files, and a task cannot complete while any step is unfinished. A criterion the
@@ -784,15 +921,16 @@ app/
   web/        # live dashboard (index.html, app.css, app.js)
   llm/        # LLM clients; mock.py holds the strict two-goal grammar
   planning/   # goal interpreter, planner, plan validation
+  authz/      # goal-scoped authorization contract, trusted origin, plan/runtime gates
   runtime/    # ExecutionRuntime, recovery, audit event types, shared task locks
-  policy/     # approval policy
+  policy/     # approval policy (HITL; distinct from authorization)
   tools/      # company API and file tools, capability registry, tool registry, failure injection
   verify/     # independent outcome verifier
   store/      # SQLite task state and audit events
   world/      # mock company database, additive migrations, seed data, demo_fixture.py
   models/     # domain models
 demo-ui/      # scripted simulation page (offline presentations only)
-docs/images/  # dashboard screenshots
+docs/         # authorization.md and dashboard screenshots
 scripts/      # smoke_demo.py deployment check
 tests/
 render.yaml   # Render Free Blueprint (public demo)
