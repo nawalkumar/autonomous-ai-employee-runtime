@@ -145,7 +145,28 @@ def test_command_line(tmp_path: Path, capsys) -> None:
     assert "not a disposable demo database" in capsys.readouterr().err
     directory = tmp_path / "db-dir"
     directory.mkdir()
-    with pytest.raises(FixtureSafetyError):
+    with pytest.raises(FixtureSafetyError, match="not a SQLite database file path"):
+        seed_demo_company(directory, reset=True)
+    with pytest.raises(FixtureSafetyError, match="not a SQLite database file path"):
+        seed_demo_company(directory, reset=False)
+    assert directory.is_dir()
+    assert list(directory.iterdir()) == []
+
+
+def test_directory_paths_never_reach_sqlite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows reports st_size==0 for directories; classification must not open SQLite."""
+    directory = tmp_path / "empty-looking-dir"
+    directory.mkdir()
+
+    def forbid_connect(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("sqlite3.connect must not run for directory targets")
+
+    def forbid_repo(*_args, **_kwargs):  # noqa: ANN001
+        raise AssertionError("CompanyRepository must not be constructed for directories")
+
+    monkeypatch.setattr("app.world.demo_fixture.sqlite3.connect", forbid_connect)
+    monkeypatch.setattr("app.world.demo_fixture.CompanyRepository", forbid_repo)
+    with pytest.raises(FixtureSafetyError, match="not a SQLite database file path"):
         seed_demo_company(directory, reset=True)
     assert directory.is_dir()
 

@@ -128,6 +128,37 @@ def expect_approval(page, step_id: str, label: str) -> None:
     )
 
 
+def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
+    """Sync on backend pending approval and the matching enabled dashboard control."""
+    expect(page.locator("#approvalCard")).to_have_attribute(
+        "data-approval-ready", "1", timeout=20_000
+    )
+    expect(page.locator("#statusPill")).to_have_text("needs_approval")
+    pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
+    assert pending is not None
+    assert pending.get("step_id") and pending.get("fingerprint")
+    expect(page.locator("#approvalCard")).to_have_attribute(
+        "data-pending-step", pending["step_id"]
+    )
+    expect(page.locator("#approvalCard")).to_have_attribute(
+        "data-pending-fingerprint", pending["fingerprint"]
+    )
+    expect(page.locator("#approveBtn")).to_be_enabled()
+    expect(page.locator("#approveBtn")).to_be_visible()
+    return pending
+
+
+def approve_through_dashboard(page, server: LiveServer, task_id: str) -> dict:
+    """Approve the current pending step only after UI and API agree on the target."""
+    pending = wait_until_approvable(page, server, task_id)
+    page.locator("#approveBtn").click()
+    page.locator("#confirmOk").click()
+    expect(page.locator("#approvalMsg")).to_contain_text(
+        "Resulting task status:", timeout=20_000
+    )
+    return pending
+
+
 def test_read_only_list_shows_real_ticket_ids(page, tmp_path: Path) -> None:
     server = start_demo(tmp_path)
     try:
@@ -179,8 +210,7 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
     try:
         page.goto(server.url)
         task_id = run_goal(page, CLOSE_GOAL)
-        expect(page.locator("#approvalCard")).to_be_visible(timeout=20_000)
-        pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
+        pending = wait_until_approvable(page, server, task_id)
         expect(page.locator("#apOperation")).to_have_text(pending["operation"])
         expect(page.locator("#apArgs")).to_contain_text("closed")
         plan = api(server, f"/api/v1/tasks/{task_id}")["plan"]
@@ -194,17 +224,17 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
             if ticket["ticket_id"] in {"T-10009", "T-10010"}
         }
         assert before == {"T-10009": "resolved", "T-10010": "resolved"}
+        seen_fingerprints: list[str] = []
         for _ in range(4):
-            expect(page.locator("#statusPill")).to_have_text(
-                re.compile(r"needs_approval|completed|failed"), timeout=20_000
-            )
-            if page.locator("#statusPill").inner_text() != "needs_approval":
+            detail = api(server, f"/api/v1/tasks/{task_id}")
+            if detail["status"] != "needs_approval":
                 break
-            expect(page.locator("#approveBtn")).to_be_enabled()
-            page.click("#approveBtn")
-            page.click("#confirmOk")
-            expect(page.locator("#approvalMsg")).to_contain_text("Resulting task status:", timeout=20_000)
-        expect(page.locator("#statusPill")).to_have_text("completed")
+            approved = approve_through_dashboard(page, server, task_id)
+            assert approved["fingerprint"] not in seen_fingerprints
+            seen_fingerprints.append(approved["fingerprint"])
+        assert seen_fingerprints, "expected at least one dashboard approval"
+        expect(page.locator("#statusPill")).to_have_text("completed", timeout=20_000)
+        expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "0")
         finished = api(server, f"/api/v1/tasks/{task_id}")
         for step in finished["plan"]:
             expect_approval(page, step["step_id"], "Approved.")
@@ -223,10 +253,10 @@ def test_rejection_does_not_continue_or_replan(page, tmp_path: Path) -> None:
     try:
         page.goto(server.url)
         task_id = run_goal(page, CLOSE_GOAL)
-        expect(page.locator("#approvalCard")).to_be_visible(timeout=20_000)
-        pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
-        page.click("#rejectBtn")
-        page.click("#confirmOk")
+        pending = wait_until_approvable(page, server, task_id)
+        expect(page.locator("#rejectBtn")).to_be_enabled()
+        page.locator("#rejectBtn").click()
+        page.locator("#confirmOk").click()
         expect(page.locator("#statusPill")).to_have_text("aborted", timeout=20_000)
         detail = api(server, f"/api/v1/tasks/{task_id}")
         assert detail["status"] == "aborted"
@@ -388,8 +418,7 @@ def test_dashboard_security_boundaries(page, tmp_path: Path) -> None:
         page.unroute("**/api/v1/tasks/**")
         page.goto(server.url)
         close_id = run_goal(page, CLOSE_GOAL)
-        expect(page.locator("#approvalCard")).to_be_visible(timeout=20_000)
-        pending = api(server, f"/api/v1/tasks/{close_id}")["pending_action"]
+        pending = wait_until_approvable(page, server, close_id)
         stale = httpx.post(
             f"{server.url}/api/v1/tasks/{close_id}/approve",
             json={
@@ -401,9 +430,11 @@ def test_dashboard_security_boundaries(page, tmp_path: Path) -> None:
         )
         assert stale.status_code == 409
         assert api(server, f"/api/v1/tasks/{close_id}")["status"] == "needs_approval"
-        page.click("#approveBtn")
-        page.click("#confirmCancel")
+        wait_until_approvable(page, server, close_id)
+        page.locator("#approveBtn").click()
+        page.locator("#confirmCancel").click()
         expect(page.locator("#statusPill")).to_have_text("needs_approval")
+        expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "1")
         expect_approval(page, pending["step_id"], "Awaiting approval.")
     finally:
         server.stop()
