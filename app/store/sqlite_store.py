@@ -162,29 +162,61 @@ class SQLiteStore:
     def append_event(self, event: AuditEvent) -> None:
         """Insert an immutable audit event. Duplicate event_id raises."""
         with self._connect() as conn:
+            self._insert_event(conn, event)
+
+    def save_state_and_events(self, state: ExecutionState, events: list[AuditEvent]) -> None:
+        """Upsert task state and append audit events in one transaction.
+
+        A failure on any write rolls the whole unit back, so an audit event
+        cannot report a revision that was not persisted.
+        """
+        payload = state.model_dump_json()
+        with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO events (
-                    event_id, task_id, timestamp, event_type, action, tool, actor,
-                    arguments_json, result_json, observation_json,
-                    failure_json, verification_result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (task_id, status, created_at, updated_at, state_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = excluded.updated_at,
+                    state_json = excluded.state_json
                 """,
                 (
-                    event.event_id,
-                    event.task_id,
-                    event.timestamp.isoformat(),
-                    event.event_type,
-                    event.action,
-                    event.tool,
-                    event.actor.value,
-                    _json_dumps(event.arguments),
-                    _json_dumps(event.result),
-                    _json_dumps(event.observation),
-                    _json_dumps(event.failure),
-                    _json_dumps(event.verification_result),
+                    state.task_id,
+                    state.final_status.value,
+                    state.created_at.isoformat(),
+                    state.updated_at.isoformat(),
+                    payload,
                 ),
             )
+            for event in events:
+                self._insert_event(conn, event)
+
+    @staticmethod
+    def _insert_event(conn: sqlite3.Connection, event: AuditEvent) -> None:
+        conn.execute(
+            """
+            INSERT INTO events (
+                event_id, task_id, timestamp, event_type, action, tool, actor,
+                arguments_json, result_json, observation_json,
+                failure_json, verification_result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.task_id,
+                event.timestamp.isoformat(),
+                event.event_type,
+                event.action,
+                event.tool,
+                event.actor.value,
+                _json_dumps(event.arguments),
+                _json_dumps(event.result),
+                _json_dumps(event.observation),
+                _json_dumps(event.failure),
+                _json_dumps(event.verification_result),
+            ),
+        )
 
     def get_events(self, task_id: str) -> list[AuditEvent]:
         """Return audit events for a task in insertion order."""

@@ -21,6 +21,7 @@ from app.models.enums import PlanStepStatus, TaskStatus
 from app.models.plan import PlanStep
 from app.runtime.replan import (
     NON_REPLANABLE,
+    ReplanEnablement,
     ReplanTrigger,
     Replanner,
     apply_replan,
@@ -45,6 +46,10 @@ class ScriptedLLM(LLMClient):
         return LLMResponse(content=self.content, model="scripted", provider="scripted")
 
 
+def _enabled(rounds: int = 2) -> ReplanEnablement:
+    return ReplanEnablement(enabled=True, max_rounds=rounds)
+
+
 def test_flag_defaults_off(tmp_path: Path) -> None:
     settings = Settings(
         database_path=str(tmp_path / "db.sqlite"),
@@ -62,7 +67,7 @@ def test_non_replanable_categories_denied(world: World, category: str) -> None:
     )
     state = state.model_copy(update={"replan_limit": 2})
     decision = Replanner(ScriptedLLM("{}"), world.registry).evaluate_trigger(
-        category=category, state=state
+        category=category, state=state, enablement=_enabled()
     )
     assert decision.allowed is False
 
@@ -121,6 +126,7 @@ def test_replan_accepts_authorized_remaining_work(world: World) -> None:
             scope,
             trigger=ReplanTrigger.TICKET_STATE_CONFLICT,
             failure_summary="ticket already in_progress",
+            enablement=_enabled(),
         )
     )
     assert result.accepted
@@ -170,6 +176,7 @@ def test_replan_rejects_unauthorized_operation(world: World) -> None:
             scope,
             trigger=ReplanTrigger.TICKET_STATE_CONFLICT,
             failure_summary="conflict",
+            enablement=_enabled(),
         )
     )
     assert result.accepted is False
@@ -183,7 +190,61 @@ def test_replan_limit_exhausted(world: World) -> None:
     )
     state = state.model_copy(update={"replan_count": 2, "replan_limit": 2})
     decision = Replanner(ScriptedLLM("{}"), world.registry).evaluate_trigger(
-        category=ReplanTrigger.TICKET_STATE_CONFLICT.value, state=state
+        category=ReplanTrigger.TICKET_STATE_CONFLICT.value,
+        state=state,
+        enablement=_enabled(),
     )
     assert decision.allowed is False
     assert "limit" in decision.reason
+
+
+def test_direct_call_without_enablement_fails_closed(world: World) -> None:
+    llm = ScriptedLLM("{}")
+    state = world.runtime.create_task(
+        user_goal="g",
+        plan=[step("u", "update_ticket", ticket_id="T-10009", fields={"status": "in_progress"})],
+    )
+    decision = Replanner(llm, world.registry).evaluate_trigger(
+        category=ReplanTrigger.TICKET_STATE_CONFLICT.value, state=state
+    )
+    assert decision.allowed is False
+    assert decision.reason == "replanning_disabled"
+    result = asyncio.run(
+        Replanner(llm, world.registry).propose_async(
+            state,
+            state.authorization,
+            trigger=ReplanTrigger.TICKET_STATE_CONFLICT,
+            failure_summary="conflict",
+        )
+    )
+    assert result.accepted is False
+    assert result.reason == "replanning_disabled"
+    assert llm.calls == 0
+
+
+def test_runtime_settings_disable_replanning_by_default(world: World) -> None:
+    from app.runtime.replan import enablement_for_runtime
+
+    settings = Settings(
+        database_path=str(world.db),
+        workspace_path=str(world.workspace),
+        aae_replanning_enabled=False,
+    )
+    enablement = enablement_for_runtime(settings)
+    assert enablement.enabled is False
+    llm = ScriptedLLM('{"steps":[]}')
+    state = world.runtime.create_task(
+        user_goal="g",
+        plan=[step("u", "update_ticket", ticket_id="T-10009", fields={"status": "in_progress"})],
+    )
+    result = asyncio.run(
+        Replanner(llm, world.registry).propose_async(
+            state,
+            state.authorization,
+            trigger=ReplanTrigger.TICKET_STATE_CONFLICT,
+            failure_summary="conflict",
+            enablement=enablement,
+        )
+    )
+    assert result.accepted is False
+    assert llm.calls == 0

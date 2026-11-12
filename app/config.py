@@ -37,8 +37,10 @@ class Settings(BaseSettings):
     llm_max_response_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     llm_max_provider_retries: int = Field(default=1, ge=0, le=3)
 
-    # Optional bounded replanning (Milestone 6). Default off; independent of
-    # dynamic planning. Never expands the original trusted authorization scope.
+    # Optional bounded replanning. Default off; independent of dynamic planning.
+    # The replanner fails closed unless a trusted enablement context built from
+    # these settings is passed in. Execution does not replan automatically.
+    # Never expands the original trusted authorization scope.
     aae_replanning_enabled: bool = False
     aae_max_replan_rounds: int = Field(default=2, ge=0, le=5)
 
