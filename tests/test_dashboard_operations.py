@@ -288,6 +288,29 @@ def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
     )
 
 
+def track_approve_posts(page) -> list[dict[str, Any]]:
+    """Capture browser approve POSTs (step id + fingerprint prefix only)."""
+    posts: list[dict[str, Any]] = []
+
+    def _on_request(request) -> None:
+        if request.method != "POST" or "/approve" not in request.url:
+            return
+        try:
+            body = json.loads(request.post_data or "{}")
+        except json.JSONDecodeError:
+            body = {}
+        posts.append(
+            {
+                "seq": len(posts) + 1,
+                "step_id": body.get("step_id"),
+                "fp_prefix": str(body.get("fingerprint") or "")[:18],
+            }
+        )
+
+    page.on("request", _on_request)
+    return posts
+
+
 def approve_through_dashboard(page, server: LiveServer, task_id: str) -> dict:
     """Approve the current pending step only after UI and API agree on the target."""
     pending = wait_until_approvable(page, server, task_id)
@@ -298,6 +321,26 @@ def approve_through_dashboard(page, server: LiveServer, task_id: str) -> dict:
     expect(page.locator("#approvalMsg")).to_contain_text(
         "Resulting task status:", timeout=20_000
     )
+    return pending
+
+
+def approve_one_pending_step(
+    page, server: LiveServer, task_id: str, posts: list[dict[str, Any]]
+) -> dict:
+    """One deliberate dashboard confirm must create exactly one approve POST."""
+    before = len(posts)
+    pending = approve_through_dashboard(page, server, task_id)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and len(posts) < before + 1:
+        time.sleep(0.05)
+    # Allow a brief window for a forbidden automatic second POST to appear.
+    time.sleep(0.15)
+    new_posts = posts[before:]
+    assert len(new_posts) == 1, (
+        "one dashboard confirmation must issue exactly one approve POST; "
+        f"got {len(new_posts)}: {new_posts}"
+    )
+    assert new_posts[0]["step_id"] == pending["step_id"]
     return pending
 
 
@@ -349,6 +392,7 @@ def test_bounded_assignment_shows_collection_progress(page, tmp_path: Path) -> N
 
 def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> None:
     server = start_demo(tmp_path)
+    posts = track_approve_posts(page)
     try:
         page.goto(server.url)
         task_id = run_goal(page, CLOSE_GOAL)
@@ -365,6 +409,7 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
         events = [event["event_type"] for event in history["events"]]
         assert events.count("approval.requested") == 1
         assert events.count("approval.approved") == 0
+        assert posts == []
         for step in detail["plan"]:
             label = "Awaiting approval." if step["step_id"] == pending["step_id"] else "Not required."
             expect_approval(page, step["step_id"], label)
@@ -374,21 +419,30 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
             if ticket["ticket_id"] in {"T-10009", "T-10010"}
         }
         assert before == {"T-10009": "resolved", "T-10010": "resolved"}
-        seen_fingerprints: list[str] = []
-        for _ in range(4):
-            detail = api(server, f"/api/v1/tasks/{task_id}")
-            if detail["status"] in {"completed", "failed", "aborted"} and not detail["executing"]:
-                break
-            if detail["status"] != "needs_approval" or detail["executing"]:
-                time.sleep(0.05)
-                continue
-            approved = approve_through_dashboard(page, server, task_id)
-            assert approved["fingerprint"] not in seen_fingerprints
-            seen_fingerprints.append(approved["fingerprint"])
-        assert len(seen_fingerprints) == 2, (
-            "close-batch must pause once per ticket; "
-            f"got {len(seen_fingerprints)} dashboard approval(s)"
-        )
+
+        first = approve_one_pending_step(page, server, task_id, posts)
+        assert first["step_id"] == "update_1"
+        mid = api(server, f"/api/v1/tasks/{task_id}")
+        assert mid["status"] == "needs_approval"
+        assert mid["pending_action"]["step_id"] == "update_2"
+        mid_events = [
+            event["event_type"]
+            for event in api(server, f"/api/v1/tasks/{task_id}/history")["events"]
+        ]
+        assert mid_events.count("approval.requested") == 2
+        assert mid_events.count("approval.approved") == 1
+        mid_tickets = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in api(server, "/api/v1/company/tickets")["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010"}
+        }
+        assert mid_tickets == {"T-10009": "closed", "T-10010": "resolved"}
+
+        second = approve_one_pending_step(page, server, task_id, posts)
+        assert second["step_id"] == "update_2"
+        assert second["fingerprint"] != first["fingerprint"]
+        assert [post["step_id"] for post in posts] == ["update_1", "update_2"]
+
         expect(page.locator("#statusPill")).to_have_text("completed", timeout=20_000)
         expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "0")
         finished = api(server, f"/api/v1/tasks/{task_id}")
@@ -406,6 +460,47 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
             if ticket["ticket_id"] in {"T-10009", "T-10010"}
         }
         assert after == {"T-10009": "closed", "T-10010": "closed"}
+    finally:
+        server.stop()
+
+
+def test_one_confirm_does_not_approve_the_next_close_step(page, tmp_path: Path) -> None:
+    """A single Confirm must not auto-approve the next protected close."""
+    server = start_demo(tmp_path)
+    posts = track_approve_posts(page)
+    try:
+        page.goto(server.url)
+        task_id = run_goal(page, CLOSE_GOAL)
+        wait_until_approvable(page, server, task_id)
+        page.locator("#approveBtn").click()
+        expect(page.locator("#confirmDialog")).to_be_visible()
+        # Rapid double activation of Confirm — only one approve POST may result.
+        page.locator("#confirmOk").dblclick(delay=20)
+        expect(page.locator("#confirmDialog")).to_be_hidden()
+        expect(page.locator("#approvalMsg")).to_contain_text(
+            "Resulting task status:", timeout=20_000
+        )
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and len(posts) < 1:
+            time.sleep(0.05)
+        time.sleep(0.2)
+        assert len(posts) == 1, f"expected one approve POST, got {posts}"
+        assert posts[0]["step_id"] == "update_1"
+        detail = api(server, f"/api/v1/tasks/{task_id}")
+        assert detail["status"] == "needs_approval"
+        assert detail["pending_action"]["step_id"] == "update_2"
+        events = [
+            event["event_type"]
+            for event in api(server, f"/api/v1/tasks/{task_id}/history")["events"]
+        ]
+        assert events.count("approval.approved") == 1
+        tickets = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in api(server, "/api/v1/company/tickets")["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010"}
+        }
+        assert tickets == {"T-10009": "closed", "T-10010": "resolved"}
+        expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "1")
     finally:
         server.stop()
 
