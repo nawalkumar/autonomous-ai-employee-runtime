@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
-from pathlib import Path
-
+from app.authz import (
+    AuthorizationError,
+    AuthorizationReason,
+    AuthorizationScope,
+    authorize_action,
+    authorize_plan,
+    ensure_task_authorization,
+)
 from app.config import database_inside_workspace, get_settings
 from app.models.enums import (
     Actor,
@@ -45,6 +53,7 @@ from app.runtime.transitions import (
     pending_fingerprint,
     pending_matches,
 )
+from app.runtime.locking import LockBusyError, hold_task_lock
 from app.store.sqlite_store import SQLiteStore
 from app.tools.base import BaseTool
 from app.tools.registry import ToolRegistry
@@ -60,6 +69,9 @@ _TERMINAL = {
     TaskStatus.ABORTED,
 }
 
+# How long a direct runtime caller waits for a busy task lock.
+_EXECUTION_LOCK_TIMEOUT_SECONDS = 30.0
+
 
 class ApprovalError(ValueError):
     """Raised for invalid approval/rejection operations."""
@@ -69,8 +81,19 @@ class StaleApprovalError(ApprovalError):
     """The approval does not match the exact action that would run."""
 
 
+class TaskExecutionLockError(RuntimeError):
+    """Another process or runtime holds the exclusive execution lock for this task."""
+
+
 class ExecutionRuntime:
-    """Executes a predefined plan against tools via the registry."""
+    """Executes a predefined plan against tools via the registry.
+
+    Public execution and approval paths take the OS-backed per-task lock under
+    ``lock_dir`` (default ``<database_parent>/locks``) so concurrent direct
+    runtime callers cannot overspend authorization budgets. CLI/API callers that
+    already hold the same lock must pass ``execution_locked=True`` to avoid
+    deadlock (fcntl locks are not re-entrant across descriptors).
+    """
 
     def __init__(
         self,
@@ -81,6 +104,7 @@ class ExecutionRuntime:
         verifier: OutcomeVerifier | None = None,
         workspace_path: str | Path | None = None,
         policy: ApprovalPolicy | None = None,
+        lock_dir: str | Path | None = None,
     ) -> None:
         self.store = store
         self.registry = registry
@@ -90,6 +114,7 @@ class ExecutionRuntime:
             if max_recovery_attempts is not None
             else get_settings().max_recovery_attempts
         )
+        self.lock_dir = Path(lock_dir) if lock_dir is not None else Path(store.db_path).parent / "locks"
         if workspace_path is not None and database_inside_workspace(
             store.db_path, workspace_path
         ):
@@ -106,16 +131,39 @@ class ExecutionRuntime:
                 ws,
             )
 
+    @contextmanager
+    def _maybe_execution_lock(self, task_id: str, execution_locked: bool):
+        """Acquire the task execution lock, or nest when already held by the caller."""
+        if execution_locked:
+            yield None
+            return
+        try:
+            with hold_task_lock(
+                self.lock_dir, task_id, timeout=_EXECUTION_LOCK_TIMEOUT_SECONDS
+            ) as held:
+                yield held
+        except LockBusyError as exc:
+            raise TaskExecutionLockError(
+                f"Task {task_id} is locked by another execution; budgets were not consumed."
+            ) from exc
+
     def create_task(
         self,
         *,
         user_goal: str,
         plan: list[PlanStep],
+        authorization: AuthorizationScope,
         interpreted_goal: InterpretedGoal | None = None,
         success_criteria: list | None = None,
         task_id: str | None = None,
     ) -> ExecutionState:
-        """Create and persist a queued ExecutionState with a predefined plan."""
+        """Create and persist a queued ExecutionState with a predefined plan.
+
+        ``authorization`` must come from a trusted origin (deterministic mock
+        goal derivation or an independently supplied internal scope). The plan
+        is checked against that scope before the task is persisted; an
+        unauthorized plan never starts.
+        """
         if not plan:
             raise ValueError("plan must contain at least one step")
         not_pending = [s for s in plan if s.status is not PlanStepStatus.PENDING]
@@ -124,16 +172,25 @@ class ExecutionRuntime:
                 "New tasks must start with all plan steps PENDING; got "
                 + ", ".join(f"'{s.step_id}'={s.status.value}" for s in not_pending)
             )
+        if authorization is None:
+            raise AuthorizationError(
+                AuthorizationReason.MISSING_AUTHORIZATION,
+                "create_task requires an independently granted authorization scope.",
+            )
+        authorize_plan(plan, authorization)
 
         criteria = list(success_criteria or [])
         if not criteria and interpreted_goal is not None:
             criteria = list(interpreted_goal.success_criteria)
 
+        fingerprint = authorization.fingerprint()
         kwargs: dict[str, Any] = {
             "user_goal": user_goal,
             "interpreted_goal": interpreted_goal,
             "success_criteria": criteria,
             "plan": plan,
+            "authorization": authorization,
+            "authorization_fingerprint": fingerprint,
             "final_status": TaskStatus.QUEUED,
             "current_step": 0,
         }
@@ -150,6 +207,19 @@ class ExecutionRuntime:
                 result={"plan_steps": len(plan), "user_goal": user_goal},
             )
         )
+        self._emit(
+            make_event(
+                task_id=state.task_id,
+                event_type=EventType.AUTHORIZATION_BOUND,
+                action="authorization_bound",
+                result={
+                    "fingerprint": fingerprint,
+                    "allowed_operations": list(authorization.allowed_operations),
+                    "budgets": authorization.budgets.model_dump(mode="json"),
+                    "version": authorization.version,
+                },
+            )
+        )
         return state
 
     def load(self, task_id: str) -> ExecutionState:
@@ -158,8 +228,16 @@ class ExecutionRuntime:
             raise KeyError(f"Unknown task_id: {task_id}")
         return state
 
-    def run(self, task_id: str) -> ExecutionState:
-        """Execute pending steps until complete, failed, aborted, or approval required."""
+    def run(self, task_id: str, *, execution_locked: bool = False) -> ExecutionState:
+        """Execute pending steps until complete, failed, aborted, or approval required.
+
+        Takes the OS-backed per-task lock unless ``execution_locked`` is true
+        (caller already holds the same lock via CLI/API or an outer runtime call).
+        """
+        with self._maybe_execution_lock(task_id, execution_locked):
+            return self._run_locked(task_id)
+
+    def _run_locked(self, task_id: str) -> ExecutionState:
         state = self.load(task_id)
         if state.final_status in _TERMINAL:
             return state
@@ -170,12 +248,13 @@ class ExecutionRuntime:
             state = self._mark_running(state)
 
         while True:
+            # Reload under the held lock so budget checks see durable tool_calls.
             state = self.load(task_id)
             if state.final_status in _TERMINAL:
                 return state
             if state.final_status is TaskStatus.NEEDS_APPROVAL:
                 return state
-            advanced = self.execute_next(task_id)
+            advanced = self.execute_next(task_id, execution_locked=True)
             if advanced.final_status in _TERMINAL:
                 return advanced
             if advanced.final_status is TaskStatus.NEEDS_APPROVAL:
@@ -185,8 +264,12 @@ class ExecutionRuntime:
             ):
                 return advanced
 
-    def execute_next(self, task_id: str) -> ExecutionState:
+    def execute_next(self, task_id: str, *, execution_locked: bool = False) -> ExecutionState:
         """Execute exactly one pending plan step (with bounded recovery), then return."""
+        with self._maybe_execution_lock(task_id, execution_locked):
+            return self._execute_next_locked(task_id)
+
+    def _execute_next_locked(self, task_id: str) -> ExecutionState:
         state = self.load(task_id)
         if state.final_status in _TERMINAL:
             return state
@@ -213,6 +296,7 @@ class ExecutionRuntime:
         *,
         approver: str | None = None,
         expected_fingerprint: str | None = None,
+        execution_locked: bool = False,
     ) -> ExecutionState:
         """Approve the pending action and resume execution from that step.
 
@@ -223,60 +307,76 @@ class ExecutionRuntime:
         If the planned step no longer matches the pending action, the stale
         request is replaced by a fresh one and StaleApprovalError is raised.
         """
-        state = self.load(task_id)
-        pending = self._require_pending(state, expected_fingerprint)
+        with self._maybe_execution_lock(task_id, execution_locked):
+            state = self.load(task_id)
+            pending = self._require_pending(state, expected_fingerprint)
 
-        located = self._pending_step(state)
-        if located is not None:
-            step_index, step = located
-            tool_name = step.resolved_tool_name() or ""
-            try:
-                arguments = prepare_arguments(state, step, self._tool(tool_name)).arguments
-            except BindingError as exc:
-                raise ApprovalError(
-                    f"The pending step's arguments cannot be resolved ({exc.message}); "
-                    "nothing was approved."
-                ) from None
-            if not pending_matches(pending, tool_name, arguments):
-                decision = self.policy.evaluate(
-                    tool_name=tool_name, arguments=arguments, tool=self._tool(tool_name)
-                )
-                self._request_approval(
-                    state, step_index, step, tool_name, decision, arguments, stale=pending
-                )
-                raise StaleApprovalError(
-                    "The pending action no longer matches the planned step; a new "
-                    "approval was requested for the current action. Nothing was executed."
-                )
+            located = self._pending_step(state)
+            if located is not None:
+                step_index, step = located
+                tool_name = step.resolved_tool_name() or ""
+                try:
+                    arguments = prepare_arguments(state, step, self._tool(tool_name)).arguments
+                except BindingError as exc:
+                    raise ApprovalError(
+                        f"The pending step's arguments cannot be resolved ({exc.message}); "
+                        "nothing was approved."
+                    ) from None
+                try:
+                    authorize_action(
+                        state,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        step_id=step.step_id,
+                    )
+                except AuthorizationError as exc:
+                    self._authorize_or_fail(
+                        state, step_index, step, tool_name, arguments, error=exc
+                    )
+                    raise ApprovalError(
+                        f"Pending action is outside the task authorization scope "
+                        f"({exc.reason.value}); nothing was approved."
+                    ) from exc
+                if not pending_matches(pending, tool_name, arguments):
+                    decision = self.policy.evaluate(
+                        tool_name=tool_name, arguments=arguments, tool=self._tool(tool_name)
+                    )
+                    self._request_approval(
+                        state, step_index, step, tool_name, decision, arguments, stale=pending
+                    )
+                    raise StaleApprovalError(
+                        "The pending action no longer matches the planned step; a new "
+                        "approval was requested for the current action. Nothing was executed."
+                    )
 
-        pending = pending.model_copy(
-            update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
-        )
-        state = state.model_copy(
-            update={
-                "approval_status": ApprovalStatus.APPROVED,
-                "pending_action": pending,
-                "final_status": TaskStatus.RUNNING,
-            }
-        ).touch()
-        self._save(state)
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.APPROVAL_APPROVED,
-                action="approval_approved",
-                tool=pending.tool_name,
-                arguments=dict(pending.arguments),
-                result={
-                    "step_id": pending.step_id,
-                    "risk": pending.risk,
-                    "fingerprint": pending.fingerprint,
-                    **({"approver": approver} if approver else {}),
-                },
-                actor=Actor.HUMAN,
+            pending = pending.model_copy(
+                update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
             )
-        )
-        return self.run(task_id)
+            state = state.model_copy(
+                update={
+                    "approval_status": ApprovalStatus.APPROVED,
+                    "pending_action": pending,
+                    "final_status": TaskStatus.RUNNING,
+                }
+            ).touch()
+            self._save(state)
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.APPROVAL_APPROVED,
+                    action="approval_approved",
+                    tool=pending.tool_name,
+                    arguments=dict(pending.arguments),
+                    result={
+                        "step_id": pending.step_id,
+                        "risk": pending.risk,
+                        "fingerprint": pending.fingerprint,
+                        **({"approver": approver} if approver else {}),
+                    },
+                    actor=Actor.HUMAN,
+                )
+            )
+            return self.run(task_id, execution_locked=True)
 
     def reject_task(
         self,
@@ -285,6 +385,7 @@ class ExecutionRuntime:
         *,
         approver: str | None = None,
         expected_fingerprint: str | None = None,
+        execution_locked: bool = False,
     ) -> ExecutionState:
         """Reject the pending action and terminate without executing the tool.
 
@@ -292,38 +393,39 @@ class ExecutionRuntime:
         action; ``expected_fingerprint`` only guards against rejecting an action
         other than the one the caller was shown.
         """
-        state = self.load(task_id)
-        pending = self._require_pending(state, expected_fingerprint)
-        pending = pending.model_copy(
-            update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
-        )
-        state = state.model_copy(
-            update={
-                "approval_status": ApprovalStatus.REJECTED,
-                "pending_action": pending,
-                "final_status": TaskStatus.ABORTED,
-                "completion_summary": reason,
-            }
-        ).touch()
-        self._save(state)
-        self._emit(
-            make_event(
-                task_id=state.task_id,
-                event_type=EventType.APPROVAL_REJECTED,
-                action="approval_rejected",
-                tool=pending.tool_name,
-                arguments=dict(pending.arguments),
-                result={
-                    "step_id": pending.step_id,
-                    "risk": pending.risk,
-                    "reason": reason,
-                    "fingerprint": pending.fingerprint,
-                    **({"approver": approver} if approver else {}),
-                },
-                actor=Actor.HUMAN,
+        with self._maybe_execution_lock(task_id, execution_locked):
+            state = self.load(task_id)
+            pending = self._require_pending(state, expected_fingerprint)
+            pending = pending.model_copy(
+                update={"resolved_at": utc_now(), "fingerprint": pending_fingerprint(pending)}
             )
-        )
-        return state
+            state = state.model_copy(
+                update={
+                    "approval_status": ApprovalStatus.REJECTED,
+                    "pending_action": pending,
+                    "final_status": TaskStatus.ABORTED,
+                    "completion_summary": reason,
+                }
+            ).touch()
+            self._save(state)
+            self._emit(
+                make_event(
+                    task_id=state.task_id,
+                    event_type=EventType.APPROVAL_REJECTED,
+                    action="approval_rejected",
+                    tool=pending.tool_name,
+                    arguments=dict(pending.arguments),
+                    result={
+                        "step_id": pending.step_id,
+                        "risk": pending.risk,
+                        "reason": reason,
+                        "fingerprint": pending.fingerprint,
+                        **({"approver": approver} if approver else {}),
+                    },
+                    actor=Actor.HUMAN,
+                )
+            )
+            return state
 
     @staticmethod
     def _require_pending(
@@ -397,6 +499,79 @@ class ExecutionRuntime:
                     f"earlier attempt {call.attempt or '?'} ({call.call_id}); refusing to "
                     f"reuse idempotency key {idempotency_key_for(state.task_id, step.step_id)}"
                 )
+        return None
+
+    def _authorize_or_fail(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        error: AuthorizationError | None = None,
+    ) -> ExecutionState | None:
+        """Authorize the resolved action; on denial, fail closed without invoking tools."""
+        try:
+            if error is None:
+                ensure_task_authorization(state)
+                authorize_action(
+                    state,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    step_id=step.step_id,
+                )
+            else:
+                raise error
+        except AuthorizationError as exc:
+            message = f"{exc.reason.value}: {exc.message}"
+            plan = list(state.plan)
+            plan[step_index] = step.model_copy(update={"status": PlanStepStatus.FAILED})
+            # Clear any pending approval so a scope violation cannot be continued.
+            state = state.model_copy(
+                update={
+                    "plan": plan,
+                    "current_step": step_index,
+                    "final_status": TaskStatus.FAILED,
+                    "completion_summary": message,
+                    "approval_status": ApprovalStatus.NONE,
+                    "pending_action": None,
+                    "failures": [
+                        *state.failures,
+                        FailureRecord(
+                            task_id=state.task_id,
+                            step_id=step.step_id,
+                            failure_type=FailureType.UNAUTHORIZED,
+                            message=message,
+                            retryable=False,
+                            recovery_action=RecoveryAction.FAIL.value,
+                        ),
+                    ],
+                }
+            ).touch()
+            self._save(state)
+            failure = {
+                "failure_type": FailureType.UNAUTHORIZED.value,
+                "message": message,
+                "step_id": step.step_id,
+                **exc.audit_payload(),
+            }
+            for kind, action in (
+                (EventType.AUTHORIZATION_DENIED, "authorization_denied"),
+                (EventType.STEP_FAILED, "step_failed"),
+                (EventType.TASK_FAILED, "task_failed"),
+            ):
+                self._emit(
+                    make_event(
+                        task_id=state.task_id,
+                        event_type=kind,
+                        action=action,
+                        tool=tool_name,
+                        arguments=dict(arguments),
+                        failure=failure,
+                    )
+                )
+            return state
         return None
 
     def _fail_before_call(
@@ -482,8 +657,8 @@ class ExecutionRuntime:
         except KeyError:
             tool = None
 
-        # References are resolved before the policy gate, so approval, its
-        # fingerprint and the tool call all see the concrete action.
+        # References are resolved before authorization and the policy gate, so
+        # both see the concrete action (never a bare $ref as an authorized value).
         try:
             prepared = prepare_arguments(state, step, tool)
         except BindingError as exc:
@@ -493,7 +668,14 @@ class ExecutionRuntime:
                 event_type=EventType.ARGUMENTS_UNRESOLVED,
             )
 
+        denied = self._authorize_or_fail(
+            state, step_index, step, tool_name, prepared.arguments
+        )
+        if denied is not None:
+            return denied
+
         # Policy gate BEFORE any tool mutation or step RUNNING transition.
+        # Authorization already passed; approval cannot expand scope.
         paused_or_ready = self._apply_approval_gate(
             state, step_index, step, tool_name, tool, prepared.arguments
         )
@@ -563,6 +745,13 @@ class ExecutionRuntime:
                     event_type=EventType.ARGUMENTS_UNRESOLVED,
                 )
             arguments = prepared.arguments
+            # Re-authorize the exact resolved action on every attempt (retries
+            # and resumed executions included) before approval or invocation.
+            denied = self._authorize_or_fail(
+                state, step_index, step, tool_name, arguments
+            )
+            if denied is not None:
+                return denied
             # Immediately before each invocation: the approved action must still
             # be exactly the action about to run.
             approved, decision = self._approval_still_valid(

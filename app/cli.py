@@ -37,6 +37,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.authz import AuthorizationError, authorization_for_supported_goal
 from app.config import Settings, database_inside_workspace
 from app.llm.mock import SUPPORTED_GOALS, MockLLMClient
 from app.models.enums import ApprovalStatus, FailureType, PlanStepStatus, TaskStatus
@@ -93,7 +94,11 @@ def validate_task_id(task_id: str) -> str:
 
 @contextmanager
 def task_lock(lock_dir: Path, task_id: str) -> Iterator[None]:
-    """Exclusive, non-blocking OS lock for one task."""
+    """Exclusive, non-blocking OS lock for one task.
+
+    While this lock is held, call ``ExecutionRuntime`` with
+    ``execution_locked=True`` so the runtime does not re-acquire the same lock.
+    """
     validate_task_id(task_id)
     lock = TaskLock(lock_dir, task_id)
     try:
@@ -187,6 +192,7 @@ def build_runtime(settings: Settings) -> CliRuntime:
         registry=registry,
         workspace_path=workspace_path,
         max_recovery_attempts=settings.max_recovery_attempts,
+        lock_dir=lock_dir,
     )
     return CliRuntime(
         database_path, workspace_path, lock_dir, repository, injector, registry, store, runtime
@@ -356,18 +362,26 @@ def cmd_run(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -> i
         out.line()
     try:
         planned = cli.planning().interpret_and_plan(args.goal)
-    except (InterpretationError, PlanningError) as exc:
+        authorization = authorization_for_supported_goal(args.goal)
+    except (InterpretationError, PlanningError, AuthorizationError) as exc:
         raise CliError(f"Goal rejected; no task was created. {exc}", EXIT_GOAL_REJECTED) from None
 
     task_id = new_id("task_")
     with task_lock(cli.lock_dir, task_id):
-        cli.runtime.create_task(
-            task_id=task_id,
-            user_goal=args.goal,
-            interpreted_goal=planned.interpreted_goal,
-            plan=planned.plan.steps,
-        )
-        state = cli.runtime.run(task_id)
+        try:
+            cli.runtime.create_task(
+                task_id=task_id,
+                user_goal=args.goal,
+                interpreted_goal=planned.interpreted_goal,
+                plan=planned.plan.steps,
+                authorization=authorization,
+            )
+        except AuthorizationError as exc:
+            raise CliError(
+                f"Plan unauthorized; no task was created. {exc}",
+                EXIT_GOAL_REJECTED,
+            ) from None
+        state = cli.runtime.run(task_id, execution_locked=True)
     _report(out, cli, state)
     return _exit_for(state)
 
@@ -433,6 +447,7 @@ def cmd_approve(
                 task_id,
                 approver=_cli_approver(),
                 expected_fingerprint=pending_fingerprint(state.pending_action),
+                execution_locked=True,
             )
         except ApprovalError as exc:
             raise CliError(f"Approval failed: {exc}", EXIT_INVALID_TASK) from None
@@ -448,7 +463,10 @@ def cmd_reject(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
         _pending_or_fail(state)
         try:
             state = cli.runtime.reject_task(
-                task_id, reason=args.reason, approver=_cli_approver()
+                task_id,
+                reason=args.reason,
+                approver=_cli_approver(),
+                execution_locked=True,
             )
         except ApprovalError as exc:
             raise CliError(f"Rejection failed: {exc}", EXIT_INVALID_TASK) from None
@@ -462,7 +480,7 @@ def cmd_resume(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
     with task_lock(cli.lock_dir, task_id):
         state = _load(cli, task_id)
         if state.final_status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
-            state = cli.runtime.run(task_id)
+            state = cli.runtime.run(task_id, execution_locked=True)
         elif state.final_status is TaskStatus.NEEDS_APPROVAL:
             out.line("Task is awaiting approval; use 'approve' or 'reject'.")
         else:

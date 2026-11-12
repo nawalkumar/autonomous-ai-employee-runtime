@@ -44,6 +44,8 @@ class EventType:
     ARGUMENTS_RESOLVED = "arguments.resolved"
     ARGUMENTS_UNRESOLVED = "arguments.unresolved"
     ACTION_CHANGED = "step.action_changed"
+    AUTHORIZATION_DENIED = "authorization.denied"
+    AUTHORIZATION_BOUND = "authorization.bound"
 
 
 def make_event(

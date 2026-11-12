@@ -1,6 +1,11 @@
 """Deterministic execution runtime with recovery, verification, and HITL."""
 
-from app.runtime.executor import ApprovalError, ExecutionRuntime, StaleApprovalError
+from app.runtime.executor import (
+    ApprovalError,
+    ExecutionRuntime,
+    StaleApprovalError,
+    TaskExecutionLockError,
+)
 from app.runtime.recovery import RecoveryAction, RecoveryDecision, classify_failure
 from app.runtime.transitions import (
     EventType,
@@ -16,6 +21,7 @@ __all__ = [
     "RecoveryAction",
     "RecoveryDecision",
     "StaleApprovalError",
+    "TaskExecutionLockError",
     "action_fingerprint",
     "classify_failure",
     "idempotency_key_for",

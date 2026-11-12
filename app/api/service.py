@@ -45,6 +45,10 @@ from app.api.schemas import (
     WorkspaceFileContent,
     WorkspaceFileOut,
 )
+from app.authz import (
+    AuthorizationError,
+    authorization_for_supported_goal,
+)
 from app.cli import CliError, CliRuntime, build_runtime
 from app.config import Settings
 from app.models.enums import (
@@ -290,16 +294,33 @@ class TaskService:
                     headers={"Retry-After": "5"},
                 )
 
+            try:
+                authorization = authorization_for_supported_goal(goal)
+            except AuthorizationError as exc:
+                raise ApiError(
+                    422,
+                    "goal_rejected",
+                    f"Goal rejected; no task was created. {exc}",
+                ) from None
+
             task_id = new_id("task_")
             lock = TaskLock(rt.lock_dir, task_id)
             try:
                 lock.acquire()
-                state = rt.runtime.create_task(
-                    task_id=task_id,
-                    user_goal=goal,
-                    interpreted_goal=planned.interpreted_goal,
-                    plan=planned.plan.steps,
-                )
+                try:
+                    state = rt.runtime.create_task(
+                        task_id=task_id,
+                        user_goal=goal,
+                        interpreted_goal=planned.interpreted_goal,
+                        plan=planned.plan.steps,
+                        authorization=authorization,
+                    )
+                except AuthorizationError as exc:
+                    raise ApiError(
+                        422,
+                        "plan_unauthorized",
+                        f"Plan unauthorized; no task was created. {exc}",
+                    ) from None
                 if inject_failure is not None:
                     rt.store.append_event(
                         make_event(
@@ -339,7 +360,8 @@ class TaskService:
                     FailureType.TRANSIENT.value,
                     INJECTED_FAILURE_MESSAGE,
                 )
-            rt.runtime.run(task_id)
+            # OS lock is already held on ``lock``; skip re-acquire (cross-thread).
+            rt.runtime.run(task_id, execution_locked=True)
         finally:
             lock.release()
 
@@ -379,11 +401,16 @@ class TaskService:
             self._check_step(self._load(rt, task_id), step_id)
             try:
                 state = rt.runtime.approve_task(
-                    task_id, approver=tenant.approver, expected_fingerprint=fingerprint
+                    task_id,
+                    approver=tenant.approver,
+                    expected_fingerprint=fingerprint,
+                    execution_locked=True,
                 )
             except StaleApprovalError as exc:
                 raise ApiError(409, "stale_approval", str(exc)) from None
-            except ApprovalError:
+            except ApprovalError as exc:
+                if isinstance(exc.__cause__, AuthorizationError):
+                    raise ApiError(409, "unauthorized", str(exc)) from None
                 raise ApiError(409, "no_pending_approval", "No pending approval.") from None
         return self.detail(tenant, state)
 
@@ -405,6 +432,7 @@ class TaskService:
                     reason=reason,
                     approver=tenant.approver,
                     expected_fingerprint=fingerprint,
+                    execution_locked=True,
                 )
             except StaleApprovalError as exc:
                 raise ApiError(409, "stale_approval", str(exc)) from None
@@ -428,7 +456,7 @@ class TaskService:
                     f"The task already ended with status {state.final_status.value}; "
                     "nothing was executed.",
                 )
-            state = rt.runtime.run(task_id)
+            state = rt.runtime.run(task_id, execution_locked=True)
         return self.detail(tenant, state)
 
     # Read-only views

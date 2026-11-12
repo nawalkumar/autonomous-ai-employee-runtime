@@ -48,6 +48,7 @@ class FailureType(str, Enum):
     MISSING_INFO = "missing_info"
     ENVIRONMENT_UNEXPECTED = "environment_unexpected"
     POLICY_BLOCKED = "policy_blocked"
+    UNAUTHORIZED = "unauthorized"
     VERIFICATION_FAILED = "verification_failed"
     REPEATED = "repeated"
 

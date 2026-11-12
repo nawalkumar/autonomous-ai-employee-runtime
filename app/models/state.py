@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.authz.models import AuthorizationScope
 from app.models.enums import ApprovalStatus, TaskStatus, VerificationStatus
 from app.models.goal import InterpretedGoal, SuccessCriterion
 from app.models.ids import new_id
@@ -32,6 +33,13 @@ class ExecutionState(BaseModel):
     user_goal: str
     interpreted_goal: InterpretedGoal | None = None
     success_criteria: list[SuccessCriterion] = Field(default_factory=list)
+
+    # Goal-scoped authorization. Set at trusted task creation and immutable
+    # thereafter (except via a separately trusted re-authorization path, which
+    # this milestone does not expose). Legacy snapshots may omit it; the runtime
+    # maps only known deterministic scenarios or fails closed.
+    authorization: AuthorizationScope | None = None
+    authorization_fingerprint: str | None = None
 
     plan: list[PlanStep] = Field(default_factory=list)
     current_step: int = 0
