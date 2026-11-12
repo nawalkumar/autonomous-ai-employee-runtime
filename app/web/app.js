@@ -423,10 +423,21 @@
     if (!injectable) els.injectToggle.checked = false;
   }
 
+  function approvalPending(task) {
+    // Approve/reject only when the selected task is paused on a concrete pending
+    // action with a fingerprint. Status alone is not enough: a poll can briefly
+    // show needs_approval before pending_action is present, which left the
+    // button disabled or unstable under Playwright.
+    if (!task || task.status !== "needs_approval" || !task.pending_action) return null;
+    var pending = task.pending_action;
+    if (!pending.step_id || !pending.fingerprint) return null;
+    return pending;
+  }
+
   function updateControls() {
     var blocked = !state.online || !hasAccess();
     els.runBtn.disabled = blocked || state.submitting;
-    var pending = state.task && state.task.pending_action;
+    var pending = approvalPending(state.task);
     els.approveBtn.disabled = blocked || state.acting || !pending;
     els.rejectBtn.disabled = blocked || state.acting || !pending;
     els.resumeBtn.disabled = blocked || state.acting;
@@ -537,12 +548,15 @@
   async function refreshTask(signal) {
     var id = state.taskId;
     if (!id) return true;
+    // Never let a poll overwrite task state while an approve/reject/resume is in
+    // flight — that raced with the confirmation dialog and disabled #approveBtn.
+    if (state.acting) return false;
     try {
       // Task first, then history: once the task reports it is no longer executing,
       // a history read that starts afterwards includes every event of that run.
       var task = await api.task(id, signal);
       var history = await api.history(id, signal);
-      if (state.taskId !== id) return true;
+      if (state.acting || state.taskId !== id) return true;
       if (!task.data || !task.data.task_id || !history.data || !history.data.events) {
         setMsg(els.taskMsg, "The server returned a response this page could not read.", "error");
         return false;
@@ -554,9 +568,10 @@
       var settled = !t.executing && (!!TERMINAL[t.status] || t.status === "needs_approval" || t.resumable);
       if (settled) {
         var verification = await api.verification(id, signal);
-        if (state.taskId !== id) return true;
+        if (state.acting || state.taskId !== id) return true;
         state.verification = verification.data;
       }
+      if (state.acting) return false;
       renderTask();
       if (settled) {
         loadTaskList();
@@ -612,6 +627,9 @@
     renderCollection(null);
     renderReplan();
     els.approvalCard.classList.remove("visible");
+    els.approvalCard.setAttribute("data-approval-ready", "0");
+    els.approvalCard.removeAttribute("data-pending-step");
+    els.approvalCard.removeAttribute("data-pending-fingerprint");
     show(els.resumeBtn, false);
     els.refreshTaskBtn.disabled = true;
     highlightTaskList();
@@ -893,9 +911,16 @@
   }
 
   function renderApproval(t) {
-    var pending = t.status === "needs_approval" ? t.pending_action : null;
+    var pending = approvalPending(t);
     els.approvalCard.classList.toggle("visible", !!pending);
-    if (!pending) return;
+    els.approvalCard.setAttribute("data-approval-ready", pending ? "1" : "0");
+    if (!pending) {
+      els.approvalCard.removeAttribute("data-pending-step");
+      els.approvalCard.removeAttribute("data-pending-fingerprint");
+      return;
+    }
+    els.approvalCard.setAttribute("data-pending-step", String(pending.step_id));
+    els.approvalCard.setAttribute("data-pending-fingerprint", String(pending.fingerprint));
     els.apStep.textContent = str(pending.step_id) + " · " + pending.tool;
     els.apOperation.textContent = str(pending.operation);
     els.apRisk.textContent = pending.risk;
@@ -1034,7 +1059,8 @@
 
   function approvalLabel(task, step) {
     // A task-wide approval_status must not mark steps that never required approval.
-    if (task.pending_action && task.pending_action.step_id === step.step_id && task.status === "needs_approval") {
+    var awaiting = approvalPending(task);
+    if (awaiting && awaiting.step_id === step.step_id) {
       return "Awaiting approval.";
     }
     var related = (state.events || []).filter(function (event) {
@@ -1206,84 +1232,111 @@
   // --- Approval, rejection, resume ----------------------------------------------------
 
   function afterAction(task, message, msgNode) {
+    // Apply the action response without restarting polls — callers resume
+    // polling only after state.acting is cleared so a late refresh cannot
+    // disable the approval controls mid-click.
     state.task = task;
     state.verification = null;
     renderTask();
     setMsg(msgNode || els.approvalMsg, message, "ok");
-    startPolling();
   }
 
   async function onApprove() {
     var t = state.task;
-    if (!t || !t.pending_action || state.acting) return;
-    var pending = t.pending_action;
+    var pending = approvalPending(t);
+    if (!pending || state.acting) return;
+    // Freeze the target before the dialog; polls must not retarget the approve.
+    var taskId = t.task_id;
+    var stepId = pending.step_id;
+    var fingerprint = pending.fingerprint;
+    var operation = pending.tool + "." + pending.operation;
+    var args = pending.arguments;
+    stopPolling();
     var ok = await confirmAction(
       "Approve this write?",
-      "The server will execute " + pending.tool + "." + pending.operation + " for " + pending.step_id +
-        " in task " + t.task_id + ", then continue the plan and verify the outcome.",
-      pretty(pending.arguments)
+      "The server will execute " + operation + " for " + stepId +
+        " in task " + taskId + ", then continue the plan and verify the outcome.",
+      pretty(args)
     );
-    if (!ok) return;
+    if (!ok) {
+      startPolling();
+      return;
+    }
     state.acting = true;
     updateControls();
     setMsg(els.approvalMsg, "Sending approval…");
     try {
-      var res = await api.approve(t.task_id, pending.step_id, pending.fingerprint);
+      var res = await api.approve(taskId, stepId, fingerprint);
       afterAction(res.data, "Approved. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.approvalMsg, err.message, "error");
-      refreshTask();
+      await refreshTask();
     } finally {
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 
   async function onReject() {
     var t = state.task;
-    if (!t || !t.pending_action || state.acting) return;
+    var pending = approvalPending(t);
+    if (!pending || state.acting) return;
     var reason = els.rejectReason.value.trim();
     if (!reason) {
       setMsg(els.approvalMsg, "Enter a rejection reason.", "error");
       els.rejectReason.focus();
       return;
     }
-    var pending = t.pending_action;
+    var taskId = t.task_id;
+    var stepId = pending.step_id;
+    var fingerprint = pending.fingerprint;
+    var operation = pending.tool + "." + pending.operation;
+    stopPolling();
     var ok = await confirmAction(
       "Reject this write?",
-      "The task will be aborted and " + pending.tool + "." + pending.operation + " will not run. Reason: " + reason
+      "The task will be aborted and " + operation + " will not run. Reason: " + reason
     );
-    if (!ok) return;
+    if (!ok) {
+      startPolling();
+      return;
+    }
     state.acting = true;
     updateControls();
     setMsg(els.approvalMsg, "Sending rejection…");
     try {
-      var res = await api.reject(t.task_id, pending.step_id, reason, pending.fingerprint);
+      var res = await api.reject(taskId, stepId, reason, fingerprint);
       afterAction(res.data, "Rejected. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.approvalMsg, err.message, "error");
-      refreshTask();
+      await refreshTask();
     } finally {
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 
   async function onResume() {
     var t = state.task;
     if (!t || !t.resumable || state.acting) return;
+    var taskId = t.task_id;
+    stopPolling();
     var ok = await confirmAction(
       "Resume this task?",
-      "The server will continue task " + t.task_id + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
+      "The server will continue task " + taskId + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
     );
-    if (!ok) return;
+    if (!ok) {
+      startPolling();
+      return;
+    }
     state.acting = true;
     updateControls();
     setMsg(els.taskMsg, "Resuming…");
     try {
-      var res = await api.resume(t.task_id);
+      var res = await api.resume(taskId);
       afterAction(res.data, "Resumed. Resulting task status: " + res.data.status + ".", els.taskMsg);
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
@@ -1291,6 +1344,7 @@
     } finally {
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 

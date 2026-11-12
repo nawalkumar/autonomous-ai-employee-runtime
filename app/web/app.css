@@ -356,7 +356,9 @@ pre.json {
   margin-bottom: 14px;
   box-shadow: var(--shadow);
 }
-.approval-card.visible { display: block; animation: fadeIn 0.25s ease; }
+/* No transform animation: Playwright treats moving bounding boxes as unstable,
+   which raced with approval clicks in CI when the card was toggled visible. */
+.approval-card.visible { display: block; }
 .approval-card h3 { margin: 0 0 4px; font-size: 18px; color: #f0d48a; }
 .approval-card .sub { color: var(--text-muted); margin-bottom: 14px; font-size: 13px; }
 .approval-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 10px; }
