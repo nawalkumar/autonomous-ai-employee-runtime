@@ -10,10 +10,17 @@ SQLite store, approval workflow, and independent outcome verifier.
     python -m app.cli resume <task_id>
     python -m app.cli history <task_id>
 
-The planner is always the deterministic mock, which accepts only its supported
-goal formats. Mutating commands hold an exclusive, OS-backed per-task lock shared
-with the HTTP API; this protects cooperating CLI and API processes, not code that
-uses ExecutionRuntime directly.
+By default the planner is the deterministic mock (two supported goal formats).
+When ``AAE_DYNAMIC_PLANNING_ENABLED=true``, a trusted intent catalog may invoke
+the configured LLM provider (default ``mock``) to propose structured plans that
+still pass deterministic validation and independently derived authorization.
+The three bounded collection grammars are an exception: their plans are built
+deterministically and the provider is not asked to plan them. This CLI has no
+replan command. If ``AAE_REPLANNING_ENABLED`` is set, the existing executor may
+replan a supported business conflict; the default is off.
+Mutating commands hold an exclusive, OS-backed per-task lock shared with the
+HTTP API; this protects cooperating CLI and API processes, not code that uses
+ExecutionRuntime directly.
 
 Exit codes: 0 completed / successful read, 1 failed or aborted, 2 usage,
 configuration or file-permission error, 3 goal rejected, 4 awaiting approval, 5 unknown task or
@@ -37,16 +44,29 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.authz import AuthorizationError, authorization_for_supported_goal
 from app.config import Settings, database_inside_workspace
+from app.llm.factory import create_llm_client
 from app.llm.mock import SUPPORTED_GOALS, MockLLMClient
-from app.models.enums import ApprovalStatus, FailureType, PlanStepStatus, TaskStatus
+from app.models.enums import (
+    ApprovalStatus,
+    FailureType,
+    PlanStepStatus,
+    TaskStatus,
+    ToolCallStatus,
+)
 from app.models.ids import new_id
 from app.models.state import ExecutionState
-from app.planning import InterpretationError, PlanningError, PlanningPipeline
-from app.runtime import ApprovalError, ExecutionRuntime
+from app.planning import (
+    InterpretationError,
+    PlanningError,
+    PlanningPipeline,
+    SUPPORTED_DYNAMIC_INTENTS,
+)
+from app.runtime import ApprovalError, ExecutionRuntime, pending_fingerprint
 from app.runtime.locking import LOCK_BACKEND, LockBusyError, TaskLock  # noqa: F401
 from app.store import SQLiteStore
-from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
+from app.tools import BaseTool, CompanyAPITool, FailureInjector, FileTool, ToolRegistry
 from app.world import CompanyRepository
 
 EXIT_OK = 0
@@ -93,7 +113,11 @@ def validate_task_id(task_id: str) -> str:
 
 @contextmanager
 def task_lock(lock_dir: Path, task_id: str) -> Iterator[None]:
-    """Exclusive, non-blocking OS lock for one task."""
+    """Exclusive, non-blocking OS lock for one task.
+
+    While this lock is held, call ``ExecutionRuntime`` with
+    ``execution_locked=True`` so the runtime does not re-acquire the same lock.
+    """
     validate_task_id(task_id)
     lock = TaskLock(lock_dir, task_id)
     try:
@@ -125,9 +149,16 @@ class CliRuntime:
     registry: ToolRegistry
     store: SQLiteStore
     runtime: ExecutionRuntime
+    settings: Settings
 
     def planning(self) -> PlanningPipeline:
-        return PlanningPipeline(MockLLMClient(), self.registry)
+        # Disabled: always the offline mock (no provider calls).
+        # Enabled: configured provider (default mock) behind the feature flag.
+        if self.settings.aae_dynamic_planning_enabled:
+            llm = create_llm_client(self.settings)
+        else:
+            llm = MockLLMClient()
+        return PlanningPipeline(llm, self.registry, settings=self.settings)
 
 
 def _require_writable_dir(path: Path, label: str) -> None:
@@ -151,6 +182,10 @@ def _require_writable_file(path: Path, label: str) -> None:
             f"{path}",
             EXIT_USAGE,
         )
+
+
+# Tool classes that build_runtime registers; capability discovery lists only these.
+RUNTIME_TOOLS: tuple[type[BaseTool], ...] = (CompanyAPITool, FileTool)
 
 
 def build_runtime(settings: Settings) -> CliRuntime:
@@ -183,9 +218,18 @@ def build_runtime(settings: Settings) -> CliRuntime:
         registry=registry,
         workspace_path=workspace_path,
         max_recovery_attempts=settings.max_recovery_attempts,
+        lock_dir=lock_dir,
     )
     return CliRuntime(
-        database_path, workspace_path, lock_dir, repository, injector, registry, store, runtime
+        database_path,
+        workspace_path,
+        lock_dir,
+        repository,
+        injector,
+        registry,
+        store,
+        runtime,
+        settings,
     )
 
 
@@ -219,18 +263,35 @@ class Output:
 
 
 def _environment(cli: CliRuntime) -> dict[str, Any]:
+    provider = (
+        cli.settings.llm_provider
+        if cli.settings.aae_dynamic_planning_enabled
+        else "mock"
+    )
     return {
-        "provider": "mock",
+        "provider": provider,
+        "dynamic_planning": cli.settings.aae_dynamic_planning_enabled,
         "database": str(cli.database_path),
         "workspace": str(cli.workspace_path),
     }
 
 
 def _print_environment(out: Output, cli: CliRuntime, *, show_formats: bool) -> None:
-    out.line("Provider:  mock (deterministic; accepts only its supported goal formats)")
+    if cli.settings.aae_dynamic_planning_enabled:
+        out.line(
+            f"Provider:  {cli.settings.llm_provider} "
+            "(dynamic planning enabled; trusted intents only; "
+            "collection workflows are deterministic and do not call the provider)"
+        )
+    else:
+        out.line("Provider:  mock (deterministic; accepts only its supported goal formats)")
     if show_formats:
         for goal in SUPPORTED_GOALS:
             out.line(f"           - {goal}")
+        if cli.settings.aae_dynamic_planning_enabled:
+            out.line("           Dynamic intents:")
+            for goal in SUPPORTED_DYNAMIC_INTENTS:
+                out.line(f"           - {goal}")
     out.line(f"Database:  {cli.database_path}")
     out.line(f"Workspace: {cli.workspace_path}")
     out.line()
@@ -278,7 +339,46 @@ def task_summary(state: ExecutionState) -> dict[str, Any]:
         ],
         "evidence_count": len(state.evidence),
         "completion_summary": state.completion_summary,
+        "collection_progress": [
+            {
+                "item_id": item.item_id,
+                "step_id": item.step_id,
+                "status": item.status,
+                "error": item.error,
+            }
+            for item in state.collections.progress
+        ],
+        "observations": _list_observations(state),
     }
+
+
+def _list_observations(state: ExecutionState) -> list[dict[str, Any]]:
+    """Ticket ids actually returned by successful bounded list calls."""
+    observations: list[dict[str, Any]] = []
+    for call in state.tool_calls:
+        if call.status is not ToolCallStatus.SUCCEEDED:
+            continue
+        if (call.arguments or {}).get("operation") != "list_tickets":
+            continue
+        data = (call.result or {}).get("data")
+        if not isinstance(data, dict):
+            continue
+        tickets = data.get("tickets")
+        if not isinstance(tickets, list):
+            continue
+        observations.append(
+            {
+                "step_id": call.step_id,
+                "count": data.get("count"),
+                "total": data.get("total"),
+                "ticket_ids": [
+                    ticket.get("ticket_id")
+                    for ticket in tickets
+                    if isinstance(ticket, dict) and ticket.get("ticket_id")
+                ],
+            }
+        )
+    return observations
 
 
 def _print_pending(out: Output, pending: dict[str, Any]) -> None:
@@ -299,6 +399,20 @@ def _print_task(out: Output, state: ExecutionState) -> None:
         out.line(
             f"  - {step['step_id']}: {step['tool']}.{step['operation']} [{step['status']}]"
         )
+    if summary["collection_progress"]:
+        out.line("Collection:")
+        for item in summary["collection_progress"]:
+            detail = f"  - {item['item_id']} [{item['status']}] step {item['step_id']}"
+            if item.get("error"):
+                detail += f" ({item['error']})"
+            out.line(detail)
+    if summary["observations"]:
+        out.line("Observations:")
+        for observed in summary["observations"]:
+            ids = ", ".join(observed["ticket_ids"])
+            out.line(
+                f"  - {observed['step_id']}: {observed['count']} of {observed['total']} ({ids})"
+            )
     out.line(f"Retries:       {summary['retry_count']}")
     if summary["pending_action"]:
         _print_pending(out, summary["pending_action"])
@@ -351,19 +465,32 @@ def cmd_run(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -> i
         out.line(f"Simulated: one transient 503 on company_api.{args.inject_transient}")
         out.line()
     try:
-        planned = cli.planning().interpret_and_plan(args.goal)
-    except (InterpretationError, PlanningError) as exc:
+        pipeline = cli.planning()
+        planned = pipeline.interpret_and_plan(args.goal)
+        authorization = planned.authorization
+        if authorization is None:
+            authorization = authorization_for_supported_goal(
+                args.goal, max_recovery_attempts=cli.settings.max_recovery_attempts
+            )
+    except (InterpretationError, PlanningError, AuthorizationError) as exc:
         raise CliError(f"Goal rejected; no task was created. {exc}", EXIT_GOAL_REJECTED) from None
 
     task_id = new_id("task_")
     with task_lock(cli.lock_dir, task_id):
-        cli.runtime.create_task(
-            task_id=task_id,
-            user_goal=args.goal,
-            interpreted_goal=planned.interpreted_goal,
-            plan=planned.plan.steps,
-        )
-        state = cli.runtime.run(task_id)
+        try:
+            cli.runtime.create_task(
+                task_id=task_id,
+                user_goal=args.goal,
+                interpreted_goal=planned.interpreted_goal,
+                plan=planned.plan.steps,
+                authorization=authorization,
+            )
+        except AuthorizationError as exc:
+            raise CliError(
+                f"Plan unauthorized; no task was created. {exc}",
+                EXIT_GOAL_REJECTED,
+            ) from None
+        state = cli.runtime.run(task_id, execution_locked=True)
     _report(out, cli, state)
     return _exit_for(state)
 
@@ -425,7 +552,12 @@ def cmd_approve(
             ):
                 raise CliError("Approval declined. Nothing was changed.", EXIT_INVALID_TASK)
         try:
-            state = cli.runtime.approve_task(task_id, approver=_cli_approver())
+            state = cli.runtime.approve_task(
+                task_id,
+                approver=_cli_approver(),
+                expected_fingerprint=pending_fingerprint(state.pending_action),
+                execution_locked=True,
+            )
         except ApprovalError as exc:
             raise CliError(f"Approval failed: {exc}", EXIT_INVALID_TASK) from None
     _report(out, cli, state)
@@ -440,7 +572,10 @@ def cmd_reject(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
         _pending_or_fail(state)
         try:
             state = cli.runtime.reject_task(
-                task_id, reason=args.reason, approver=_cli_approver()
+                task_id,
+                reason=args.reason,
+                approver=_cli_approver(),
+                execution_locked=True,
             )
         except ApprovalError as exc:
             raise CliError(f"Rejection failed: {exc}", EXIT_INVALID_TASK) from None
@@ -454,7 +589,7 @@ def cmd_resume(args: argparse.Namespace, cli: CliRuntime, out: Output, _: Any) -
     with task_lock(cli.lock_dir, task_id):
         state = _load(cli, task_id)
         if state.final_status in (TaskStatus.QUEUED, TaskStatus.RUNNING):
-            state = cli.runtime.run(task_id)
+            state = cli.runtime.run(task_id, execution_locked=True)
         elif state.final_status is TaskStatus.NEEDS_APPROVAL:
             out.line("Task is awaiting approval; use 'approve' or 'reject'.")
         else:

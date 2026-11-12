@@ -10,9 +10,55 @@ from app.models.goal import SuccessCriterion
 from app.models.records import EvidenceItem
 from app.models.state import ExecutionState
 from app.tools.file import is_protected_file
+from app.verify import binding_checks, company_checks
 from app.verify.results import VerificationCheckResult, VerificationResult
 from app.verify.rules import collect_criteria, created_ticket_ids
-from app.world.repository import CompanyRepository
+from app.world.repository import EMPLOYEE_UPDATE_FIELDS, CompanyRepository
+
+_CRITERION_KINDS = {
+    "step_completed": "step",
+    "ticket_exists": "ticket",
+    "ticket": "ticket",
+    "employee_field": "employee",
+    "employee": "employee",
+    "file_exists": "file",
+    "file": "file",
+    # v0.3.0 company operations; selected only by explicit criterion_type.
+    **{name: name for name in company_checks.CHECKS},
+    "reference_binding": "reference_binding",
+}
+
+# Every key of an expected_value must be one the check actually evaluates (or a
+# provenance key); anything else would be silently ignored and is unsupported.
+_EVALUABLE_KEYS: dict[str, frozenset[str]] = {
+    "step": frozenset({"step_id", "tool", "operation"}),
+    "ticket": frozenset(
+        {
+            "ticket_id",
+            "customer_id",
+            "company",
+            "subject_contains",
+            "description_contains",
+            "text_contains",
+            "source_call_id",
+            "source_step_id",
+        }
+    ),
+    "employee": frozenset({"employee_id"}) | EMPLOYEE_UPDATE_FIELDS,
+    "file": frozenset({"path", "content_contains"}),
+    **company_checks.EVALUABLE_KEYS,
+    "reference_binding": binding_checks.EVALUABLE_KEYS,
+}
+
+
+def _unsupported(expected: Any, reason: str) -> VerificationCheckResult:
+    return VerificationCheckResult(
+        name="unsupported_criterion",
+        passed=False,
+        expected=expected,
+        actual=None,
+        message=f"Unsupported criterion: {reason}",
+    )
 
 
 class OutcomeVerifier:
@@ -39,10 +85,12 @@ class OutcomeVerifier:
                     data={"task_id": state.task_id},
                 )
             ]
+            # Nothing failed, so the task may complete, but it is reported as
+            # unverified rather than as independently verified.
             return VerificationResult(
-                status=VerificationStatus.PASSED,
+                status=VerificationStatus.UNVERIFIED,
                 passed=True,
-                summary="No verifiable outcomes required.",
+                summary="No verifiable outcomes; nothing was independently verified.",
                 checks=[],
                 evidence=evidence,
             )
@@ -88,28 +136,40 @@ class OutcomeVerifier:
         if not isinstance(expected, dict):
             expected = {"value": expected}
 
-        if ctype == "step_completed":
+        kind = _CRITERION_KINDS.get(ctype)
+        if kind is None:
+            # Other types (including the default "generic") dispatch by keys.
+            if any(k in expected for k in ("ticket_id", "customer_id", "subject_contains")):
+                kind = "ticket"
+            elif "employee_id" in expected:
+                kind = "employee"
+            elif "path" in expected:
+                kind = "file"
+        if kind is None:
+            return _unsupported(
+                expected,
+                f"criterion_type {criterion.criterion_type!r} has no verification rule",
+            ), []
+
+        unknown = sorted(str(k) for k in expected if k not in _EVALUABLE_KEYS[kind])
+        if unknown:
+            return _unsupported(
+                expected,
+                f"{kind} criteria cannot check {', '.join(unknown)} "
+                f"(checkable: {', '.join(sorted(_EVALUABLE_KEYS[kind]))})",
+            ), []
+
+        if kind == "step":
             return self._verify_step_completed(state, criterion, expected)
-        if ctype in {"ticket_exists", "ticket"}:
+        if kind == "ticket":
             return self._verify_ticket(state, criterion, expected)
-        if ctype in {"employee_field", "employee"}:
-            return self._verify_employee(criterion, expected)
-        if ctype in {"file_exists", "file"}:
-            return self._verify_file(criterion, expected)
-        # generic: dispatch by keys
-        if any(k in expected for k in ("ticket_id", "customer_id", "subject_contains")):
-            return self._verify_ticket(state, criterion, expected)
-        if "employee_id" in expected:
-            return self._verify_employee(criterion, expected)
-        if "path" in expected:
-            return self._verify_file(criterion, expected)
-        check = VerificationCheckResult(
-            name=criterion.description or "unsupported_criterion",
-            passed=False,
-            expected=expected,
-            message=f"Unsupported criterion_type: {criterion.criterion_type}",
-        )
-        return check, []
+        if kind == "employee":
+            return self._verify_employee(criterion, expected, require_field=ctype == "employee_field")
+        if kind in company_checks.CHECKS:
+            return company_checks.CHECKS[kind](self.repository, state, expected)
+        if kind == "reference_binding":
+            return binding_checks.verify_reference_binding(state, expected)
+        return self._verify_file(criterion, expected)
 
     def _verify_step_completed(
         self,
@@ -136,11 +196,47 @@ class OutcomeVerifier:
             )
             return check, []
 
+        actual_action = {
+            "tool": step.resolved_tool_name(),
+            "operation": step.arguments.get("operation"),
+        }
+        mismatched = sorted(
+            key for key in ("tool", "operation") if key in expected and expected[key] != actual_action[key]
+        )
+        if mismatched:
+            check = VerificationCheckResult(
+                name="step_completed",
+                passed=False,
+                expected=expected,
+                actual={"step_status": step.status.value, **actual_action},
+                message=f"Step '{step_id}' ran a different action than expected ({', '.join(mismatched)})",
+            )
+            return check, []
+
+        call = next(
+            c
+            for c in reversed(state.tool_calls)
+            if c.step_id == step_id and c.status is ToolCallStatus.SUCCEEDED
+        )
+        problem = binding_checks.approval_problem(call)
+        if problem:
+            check = VerificationCheckResult(
+                name="step_completed",
+                passed=False,
+                expected=expected,
+                actual={"step_status": step.status.value, "approval_fingerprint": call.approval_fingerprint},
+                message=f"Step '{step_id}' completed but {problem}",
+            )
+            return check, []
+
+        actual: dict[str, Any] = {"step_status": step.status.value, "successful_tool_call": True}
+        if call.approval_required:
+            actual["approval_fingerprint"] = call.approval_fingerprint
         check = VerificationCheckResult(
             name="step_completed",
             passed=True,
             expected=expected,
-            actual={"step_status": step.status.value, "successful_tool_call": True},
+            actual=actual,
             message=f"Planned step '{step_id}' completed with a successful tool call",
         )
         return check, []
@@ -317,7 +413,12 @@ class OutcomeVerifier:
         self,
         criterion: SuccessCriterion,
         expected: dict[str, Any],
+        *,
+        require_field: bool,
     ) -> tuple[VerificationCheckResult, list[EvidenceItem]]:
+        fields = sorted(key for key in expected if key in EMPLOYEE_UPDATE_FIELDS)
+        if require_field and not fields:
+            return _unsupported(expected, "employee_field criterion names no field to compare"), []
         employee_id = expected.get("employee_id")
         employee = (
             self.repository.get_employee(str(employee_id)) if employee_id else None
@@ -333,11 +434,10 @@ class OutcomeVerifier:
             return check, []
 
         mismatches: dict[str, Any] = {}
-        for field in ("title", "name", "email", "department"):
-            if field in expected and expected[field] is not None:
-                actual = getattr(employee, field)
-                if actual != expected[field]:
-                    mismatches[field] = {"expected": expected[field], "actual": actual}
+        for field in fields:
+            actual = getattr(employee, field)
+            if actual != expected[field]:
+                mismatches[field] = {"expected": expected[field], "actual": actual}
 
         evidence = [
             EvidenceItem(
@@ -357,11 +457,15 @@ class OutcomeVerifier:
             return check, evidence
 
         check = VerificationCheckResult(
-            name="employee_field",
+            name="employee_field" if fields else "employee_exists",
             passed=True,
             expected=expected,
             actual=employee.model_dump(mode="json"),
-            message=f"Employee {employee.employee_id} fields verified",
+            message=(
+                f"Employee {employee.employee_id} fields verified: {', '.join(fields)}"
+                if fields
+                else f"Employee {employee.employee_id} exists in company database"
+            ),
         )
         return check, evidence
 

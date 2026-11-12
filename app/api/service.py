@@ -25,6 +25,7 @@ from typing import Any
 from app.api.errors import ApiError
 from app.api.redaction import Redactor
 from app.api.schemas import (
+    CollectionProgressOut,
     CriterionOut,
     CustomerOut,
     EmployeeOut,
@@ -45,6 +46,7 @@ from app.api.schemas import (
     WorkspaceFileContent,
     WorkspaceFileOut,
 )
+from app.authz import AuthorizationError, authorization_for_supported_goal
 from app.cli import CliError, CliRuntime, build_runtime
 from app.config import Settings
 from app.models.enums import (
@@ -58,7 +60,7 @@ from app.models.ids import new_id
 from app.models.records import PendingAction
 from app.models.state import ExecutionState
 from app.planning.pipeline import PlanningResult
-from app.runtime import ApprovalError
+from app.runtime import ApprovalError, StaleApprovalError, pending_fingerprint
 from app.runtime.locking import LockBusyError, TaskLock, hold_task_lock
 from app.runtime.transitions import make_event
 
@@ -185,6 +187,21 @@ def _sha256(text: str) -> str:
 # --- Service --------------------------------------------------------------------
 
 
+def _planning_source(goal: str) -> str:
+    """How this goal was allowed to become a plan. Never taken from model text."""
+    from app.llm.mock import parse_supported_goal
+    from app.planning.intents import COLLECTION_INTENT_IDS, parse_trusted_intent
+
+    if parse_supported_goal(goal) is not None:
+        return "mock"
+    intent = parse_trusted_intent(goal)
+    if intent is None:
+        return "unknown"
+    if intent.intent_id in COLLECTION_INTENT_IDS:
+        return "trusted_collection"
+    return "dynamic_catalog"
+
+
 class TaskService:
     def __init__(self, *, jobs: JobRunner, redactor: Redactor, allow_failure_injection: bool):
         self.jobs = jobs
@@ -290,16 +307,38 @@ class TaskService:
                     headers={"Retry-After": "5"},
                 )
 
+            try:
+                authorization = planned.authorization
+                if authorization is None:
+                    authorization = authorization_for_supported_goal(
+                        goal,
+                        max_recovery_attempts=rt.settings.max_recovery_attempts,
+                    )
+            except AuthorizationError as exc:
+                raise ApiError(
+                    422,
+                    "goal_rejected",
+                    f"Goal rejected; no task was created. {exc}",
+                ) from None
+
             task_id = new_id("task_")
             lock = TaskLock(rt.lock_dir, task_id)
             try:
                 lock.acquire()
-                state = rt.runtime.create_task(
-                    task_id=task_id,
-                    user_goal=goal,
-                    interpreted_goal=planned.interpreted_goal,
-                    plan=planned.plan.steps,
-                )
+                try:
+                    state = rt.runtime.create_task(
+                        task_id=task_id,
+                        user_goal=goal,
+                        interpreted_goal=planned.interpreted_goal,
+                        plan=planned.plan.steps,
+                        authorization=authorization,
+                    )
+                except AuthorizationError as exc:
+                    raise ApiError(
+                        422,
+                        "plan_unauthorized",
+                        f"Plan unauthorized; no task was created. {exc}",
+                    ) from None
                 if inject_failure is not None:
                     rt.store.append_event(
                         make_event(
@@ -339,7 +378,8 @@ class TaskService:
                     FailureType.TRANSIENT.value,
                     INJECTED_FAILURE_MESSAGE,
                 )
-            rt.runtime.run(task_id)
+            # OS lock is already held on ``lock``; skip re-acquire (cross-thread).
+            rt.runtime.run(task_id, execution_locked=True)
         finally:
             lock.release()
 
@@ -370,24 +410,50 @@ class TaskService:
                 "nothing was changed.",
             )
 
-    def approve(self, tenant: Tenant, task_id: str, step_id: str) -> TaskDetail:
+    def approve(
+        self, tenant: Tenant, task_id: str, step_id: str, fingerprint: str | None = None
+    ) -> TaskDetail:
         rt = self.open(tenant)
         self._load(rt, task_id)
         with self._task_lock(rt, task_id):
             self._check_step(self._load(rt, task_id), step_id)
             try:
-                state = rt.runtime.approve_task(task_id, approver=tenant.approver)
-            except ApprovalError:
+                state = rt.runtime.approve_task(
+                    task_id,
+                    approver=tenant.approver,
+                    expected_fingerprint=fingerprint,
+                    execution_locked=True,
+                )
+            except StaleApprovalError as exc:
+                raise ApiError(409, "stale_approval", str(exc)) from None
+            except ApprovalError as exc:
+                if isinstance(exc.__cause__, AuthorizationError):
+                    raise ApiError(409, "unauthorized", str(exc)) from None
                 raise ApiError(409, "no_pending_approval", "No pending approval.") from None
         return self.detail(tenant, state)
 
-    def reject(self, tenant: Tenant, task_id: str, step_id: str, reason: str) -> TaskDetail:
+    def reject(
+        self,
+        tenant: Tenant,
+        task_id: str,
+        step_id: str,
+        reason: str,
+        fingerprint: str | None = None,
+    ) -> TaskDetail:
         rt = self.open(tenant)
         self._load(rt, task_id)
         with self._task_lock(rt, task_id):
             self._check_step(self._load(rt, task_id), step_id)
             try:
-                state = rt.runtime.reject_task(task_id, reason=reason, approver=tenant.approver)
+                state = rt.runtime.reject_task(
+                    task_id,
+                    reason=reason,
+                    approver=tenant.approver,
+                    expected_fingerprint=fingerprint,
+                    execution_locked=True,
+                )
+            except StaleApprovalError as exc:
+                raise ApiError(409, "stale_approval", str(exc)) from None
             except ApprovalError:
                 raise ApiError(409, "no_pending_approval", "No pending approval.") from None
         return self.detail(tenant, state)
@@ -408,7 +474,7 @@ class TaskService:
                     f"The task already ended with status {state.final_status.value}; "
                     "nothing was executed.",
                 )
-            state = rt.runtime.run(task_id)
+            state = rt.runtime.run(task_id, execution_locked=True)
         return self.detail(tenant, state)
 
     # Read-only views
@@ -568,6 +634,7 @@ class TaskService:
                     completed_at=c.completed_at,
                     error_type=c.error_type,
                     error_message=self.redact.text(c.error_message) if c.error_message else None,
+                    result=self.redact(c.result) if c.result else None,
                 )
                 for c in state.tool_calls
             ],
@@ -593,6 +660,7 @@ class TaskService:
                     arguments=self.redact(pending.arguments),
                     risk=pending.risk,
                     reason=pending.reason,
+                    fingerprint=pending_fingerprint(pending),
                     created_at=pending.created_at,
                 )
                 if pending is not None and state.approval_status is ApprovalStatus.PENDING
@@ -612,6 +680,17 @@ class TaskService:
                 state.final_status in (TaskStatus.QUEUED, TaskStatus.RUNNING) and not executing
             ),
             idempotent_replay=idempotent_replay,
+            planning_source=_planning_source(state.user_goal),
+            collection_progress=[
+                CollectionProgressOut(
+                    collection_id=item.collection_id,
+                    item_id=item.item_id,
+                    step_id=item.step_id,
+                    status=item.status,
+                    error=item.error,
+                )
+                for item in state.collections.progress
+            ],
         )
 
     # Mock company and workspace (read-only)

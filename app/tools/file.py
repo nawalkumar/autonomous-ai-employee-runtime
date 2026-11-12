@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.models.enums import FailureType
 from app.tools.base import BaseTool, RiskLevel
+from app.tools.capabilities import CAPABILITIES, operation_of
 from app.tools.result import ToolResult
 
 FileOperation = Literal["read", "write", "list"]
@@ -61,7 +62,8 @@ class FileTool(BaseTool):
     description = "Read and write files inside the sandboxed workspace directory."
     args_schema = FileToolArgs
     risk_level = RiskLevel.WRITE
-    # Workspace writes overwrite deterministically; reads are naturally retry-safe.
+    # Tool-level default reported in metadata(); per-operation retry safety comes
+    # from the capability registry.
     retry_safe = True
 
     def __init__(
@@ -83,20 +85,17 @@ class FileTool(BaseTool):
         return is_protected_file(resolved)
 
     def risk_for(self, operation: FileOperation) -> RiskLevel:
-        return RiskLevel.WRITE if operation == "write" else RiskLevel.READ
+        """Raises UnknownCapabilityError for an unregistered operation."""
+        return CAPABILITIES.require(self.name, operation).risk
 
     def is_retry_safe(self, args: BaseModel | dict[str, Any] | None = None) -> bool:
-        _ = args
-        return True
+        capability = CAPABILITIES.find(self.name, operation_of(args))
+        return capability is not None and capability.retry_safe
 
     def metadata(self) -> dict[str, Any]:
         meta = super().metadata()
         meta["workspace_root"] = str(self.workspace_root)
-        meta["operations"] = {
-            "read": RiskLevel.READ.value,
-            "write": RiskLevel.WRITE.value,
-            "list": RiskLevel.READ.value,
-        }
+        meta["operations"] = {c.operation: c.risk.value for c in CAPABILITIES.for_tool(self.name)}
         return meta
 
     def execute(

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 STEP_ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
+FINGERPRINT_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
 class _Strict(BaseModel):
@@ -27,12 +28,15 @@ class TaskCreateRequest(_Strict):
 class ApproveRequest(_Strict):
     step_id: str = Field(pattern=STEP_ID_PATTERN)
     confirm: Literal[True]
+    # Optional: the pending action's fingerprint as shown to the approver.
+    fingerprint: str | None = Field(default=None, pattern=FINGERPRINT_PATTERN)
 
 
 class RejectRequest(_Strict):
     step_id: str = Field(pattern=STEP_ID_PATTERN)
     reason: str = Field(default="Rejected via dashboard", min_length=1, max_length=300)
     confirm: Literal[True]
+    fingerprint: str | None = Field(default=None, pattern=FINGERPRINT_PATTERN)
 
 
 class ResumeRequest(_Strict):
@@ -72,12 +76,51 @@ class ScenarioOut(BaseModel):
     goals: list[str]
     requires_approval: bool
     injectable_operation: str | None
+    # mock: the two original grammars. trusted_collection: deterministic, no model.
+    # dynamic_catalog: the model may propose a plan inside a trusted grammar.
+    planning: Literal["mock", "trusted_collection", "dynamic_catalog"] = "mock"
 
 
 class ScenariosResponse(BaseModel):
     scenarios: list[ScenarioOut]
     supported_formats: list[str]
     failure_injection_enabled: bool
+    dynamic_planning_enabled: bool = False
+    # Read-only. The dashboard cannot change this.
+    replanning_enabled: bool = False
+
+
+class CapabilityOut(BaseModel):
+    tool: str
+    operation: str
+    description: str
+    risk: Literal["read", "write", "destructive"]
+    # Always required before the operation runs.
+    requires_approval: bool
+    approval_reason: str | None
+    # Approval required only for some arguments (e.g. closing a ticket), described here.
+    approval_condition: str | None
+    retry_safe: bool
+    idempotency: Literal["not_required", "keyed_transaction", "deterministic_overwrite"]
+    mutates: Literal["none", "company", "workspace"]
+    verification: Literal[
+        "none",
+        "employee_fields",
+        "ticket_record",
+        "file_content",
+        "ticket_fields",
+        "ticket_assignment",
+        "customer_record",
+        "employee_status",
+    ]
+    preconditions: list[str]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None
+
+
+class CapabilitiesResponse(BaseModel):
+    schema_version: Literal["1"]
+    capabilities: list[CapabilityOut]
 
 
 class SessionResponse(BaseModel):
@@ -89,6 +132,8 @@ class SessionResponse(BaseModel):
     task_quota: int | None
     tasks_used: int | None
     notice: str
+    dynamic_planning_enabled: bool = False
+    replanning_enabled: bool = False
 
 
 class CriterionOut(BaseModel):
@@ -104,6 +149,16 @@ class InterpretedGoalOut(BaseModel):
     constraints: list[str]
     required_information: list[str]
     success_criteria: list[CriterionOut]
+
+
+class CollectionProgressOut(BaseModel):
+    """Per-item collection progress. Empty when the task has no collection."""
+
+    collection_id: str
+    item_id: str
+    step_id: str
+    status: str
+    error: str | None = None
 
 
 class PlanStepOut(BaseModel):
@@ -129,6 +184,7 @@ class ToolCallOut(BaseModel):
     completed_at: datetime | None
     error_type: str | None
     error_message: str | None
+    result: dict[str, Any] | None = None
 
 
 class PendingActionOut(BaseModel):
@@ -138,6 +194,7 @@ class PendingActionOut(BaseModel):
     arguments: dict[str, Any]
     risk: str
     reason: str | None
+    fingerprint: str
     created_at: datetime
 
 
@@ -196,6 +253,8 @@ class TaskDetail(BaseModel):
     executing: bool
     resumable: bool
     idempotent_replay: bool = False
+    collection_progress: list[CollectionProgressOut] = Field(default_factory=list)
+    planning_source: Literal["mock", "trusted_collection", "dynamic_catalog", "unknown"] = "unknown"
 
 
 class EventOut(BaseModel):
@@ -252,6 +311,7 @@ class EmployeeOut(BaseModel):
     email: str
     title: str
     department: str
+    status: str
     updated_at: datetime
 
 
@@ -270,6 +330,7 @@ class TicketOut(BaseModel):
     description: str
     status: str
     priority: str
+    assignee_id: str | None
     created_at: datetime
     updated_at: datetime
 

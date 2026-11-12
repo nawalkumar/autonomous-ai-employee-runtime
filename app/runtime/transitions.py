@@ -6,6 +6,11 @@ from typing import Any
 
 from app.models.enums import Actor
 from app.models.events import AuditEvent
+from app.models.fingerprint import (  # noqa: F401 - re-exported
+    action_fingerprint,
+    pending_fingerprint,
+    pending_matches,
+)
 from app.tools.result import ToolResult
 
 
@@ -30,10 +35,23 @@ class EventType:
     VERIFICATION_CHECK = "verification.check"
     VERIFICATION_PASSED = "verification.passed"
     VERIFICATION_FAILED = "verification.failed"
+    VERIFICATION_UNVERIFIED = "verification.unverified"
     EVIDENCE_RECORDED = "evidence.recorded"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_APPROVED = "approval.approved"
     APPROVAL_REJECTED = "approval.rejected"
+    APPROVAL_INVALIDATED = "approval.invalidated"
+    ARGUMENTS_RESOLVED = "arguments.resolved"
+    ARGUMENTS_UNRESOLVED = "arguments.unresolved"
+    ACTION_CHANGED = "step.action_changed"
+    AUTHORIZATION_DENIED = "authorization.denied"
+    AUTHORIZATION_BOUND = "authorization.bound"
+    COLLECTION_OBSERVED = "collection.observed"
+    COLLECTION_EXPANDED = "collection.expanded"
+    REPLAN_PROPOSED = "replan.proposed"
+    REPLAN_ACCEPTED = "replan.accepted"
+    REPLAN_REJECTED = "replan.rejected"
+    REPLAN_EXHAUSTED = "replan.exhausted"
 
 
 def make_event(
@@ -68,6 +86,26 @@ def observe_tool_result(tool_name: str, result: ToolResult) -> str:
     if result.ok:
         data = result.data or {}
         if tool_name == "company_api":
+            if "tickets" in data:
+                return (
+                    f"Company API listed {data.get('count', 0)} of {data.get('total', 0)} "
+                    "matching ticket(s)."
+                )
+            if "customer" in data:
+                return f"Company API created customer {data['customer'].get('customer_id')}."
+            if "previous" in data and "ticket" in data:
+                ticket = data["ticket"]
+                return (
+                    f"Company API updated ticket {ticket.get('ticket_id')} "
+                    f"(status {ticket.get('status')}, priority {ticket.get('priority')}, "
+                    f"assignee {ticket.get('assignee_id')})."
+                )
+            if "previous" in data and "employee" in data:
+                employee = data["employee"]
+                return (
+                    f"Company API set employee {employee.get('employee_id')} "
+                    f"status to {employee.get('status')}."
+                )
             if "ticket" in data:
                 ticket = data["ticket"]
                 return (

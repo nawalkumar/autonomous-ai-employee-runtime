@@ -11,6 +11,11 @@ from pydantic import ValidationError
 
 from app.models.events import AuditEvent
 from app.models.state import ExecutionState
+from app.store.revision_guard import (
+    StaleRevisionError,
+    assert_ordinary_save,
+    plan_structure_token,
+)
 
 
 class StoredTask(NamedTuple):
@@ -127,26 +132,15 @@ class SQLiteStore:
         return tasks
 
     def save_state(self, state: ExecutionState) -> None:
-        """Upsert a full ExecutionState snapshot for a task."""
-        payload = state.model_dump_json()
+        """Upsert a full ExecutionState snapshot for a task.
+
+        A plan revision (replan counters, authorization, or step-id replacement)
+        is rejected. ``commit_checked_revision`` is the only writer for those.
+        """
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO tasks (task_id, status, created_at, updated_at, state_json)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    status = excluded.status,
-                    updated_at = excluded.updated_at,
-                    state_json = excluded.state_json
-                """,
-                (
-                    state.task_id,
-                    state.final_status.value,
-                    state.created_at.isoformat(),
-                    state.updated_at.isoformat(),
-                    payload,
-                ),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            self._reject_revision(conn, state)
+            self._upsert_state(conn, state)
 
     def get_state(self, task_id: str) -> ExecutionState | None:
         """Load the latest ExecutionState snapshot, or None if missing."""
@@ -162,29 +156,109 @@ class SQLiteStore:
     def append_event(self, event: AuditEvent) -> None:
         """Insert an immutable audit event. Duplicate event_id raises."""
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO events (
-                    event_id, task_id, timestamp, event_type, action, tool, actor,
-                    arguments_json, result_json, observation_json,
-                    failure_json, verification_result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_id,
-                    event.task_id,
-                    event.timestamp.isoformat(),
-                    event.event_type,
-                    event.action,
-                    event.tool,
-                    event.actor.value,
-                    _json_dumps(event.arguments),
-                    _json_dumps(event.result),
-                    _json_dumps(event.observation),
-                    _json_dumps(event.failure),
-                    _json_dumps(event.verification_result),
-                ),
-            )
+            self._insert_event(conn, event)
+
+    def save_state_and_events(self, state: ExecutionState, events: list[AuditEvent]) -> None:
+        """Upsert task state and append audit events in one transaction.
+
+        A failure on any write rolls the whole unit back. This path cannot
+        install a plan revision; that is ``commit_checked_revision``.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._reject_revision(conn, state)
+            self._upsert_state(conn, state)
+            for event in events:
+                self._insert_event(conn, event)
+
+    def commit_checked_revision(
+        self,
+        state: ExecutionState,
+        events: list[AuditEvent],
+        *,
+        expected_replan_count: int,
+        expected_structure: str,
+    ) -> None:
+        """Install a validated revision and its audit events, or write nothing.
+
+        The write proceeds only while the stored replan count and plan identity
+        still match the snapshot the revision was checked against.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state_json FROM tasks WHERE task_id = ?",
+                (state.task_id,),
+            ).fetchone()
+            if row is None:
+                raise StaleRevisionError("No committed task to revise.")
+            stored = ExecutionState.model_validate_json(row["state_json"])
+            if stored.replan_count != expected_replan_count:
+                raise StaleRevisionError("Replan count changed before commit.")
+            if plan_structure_token(stored.plan) != expected_structure:
+                raise StaleRevisionError("Plan changed before commit.")
+            if state.replan_limit > stored.replan_limit:
+                raise StaleRevisionError("Revision tried to raise replan_limit.")
+            if state.authorization_fingerprint != stored.authorization_fingerprint:
+                raise StaleRevisionError("Revision tried to change authorization.")
+            self._upsert_state(conn, state)
+            for event in events:
+                self._insert_event(conn, event)
+
+    def _reject_revision(self, conn: sqlite3.Connection, state: ExecutionState) -> None:
+        row = conn.execute(
+            "SELECT state_json FROM tasks WHERE task_id = ?",
+            (state.task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        stored = ExecutionState.model_validate_json(row["state_json"])
+        assert_ordinary_save(stored, state)
+
+    def _upsert_state(self, conn: sqlite3.Connection, state: ExecutionState) -> None:
+        conn.execute(
+            """
+            INSERT INTO tasks (task_id, status, created_at, updated_at, state_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                state_json = excluded.state_json
+            """,
+            (
+                state.task_id,
+                state.final_status.value,
+                state.created_at.isoformat(),
+                state.updated_at.isoformat(),
+                state.model_dump_json(),
+            ),
+        )
+
+    @staticmethod
+    def _insert_event(conn: sqlite3.Connection, event: AuditEvent) -> None:
+        conn.execute(
+            """
+            INSERT INTO events (
+                event_id, task_id, timestamp, event_type, action, tool, actor,
+                arguments_json, result_json, observation_json,
+                failure_json, verification_result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.task_id,
+                event.timestamp.isoformat(),
+                event.event_type,
+                event.action,
+                event.tool,
+                event.actor.value,
+                _json_dumps(event.arguments),
+                _json_dumps(event.result),
+                _json_dumps(event.observation),
+                _json_dumps(event.failure),
+                _json_dumps(event.verification_result),
+            ),
+        )
 
     def get_events(self, task_id: str) -> list[AuditEvent]:
         """Return audit events for a task in insertion order."""

@@ -1,7 +1,7 @@
 [project]
 name = "autonomous-ai-employee-runtime"
-version = "0.2.0"
-description = "Autonomous AI Employee Runtime — CentrAlign Founding Engineer challenge"
+version = "0.3.0"
+description = "Local-first developer preview of an accountable AI employee runtime (CentrAlign challenge)"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

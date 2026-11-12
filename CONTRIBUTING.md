@@ -1,9 +1,10 @@
 # Contributing
 
-Thanks for your interest. This project is a **local prototype**: a deterministic
-runtime with a mock planner, a CLI, and an HTTP API plus dashboard that wrap the same
-runtime. Contributions
-that improve correctness, tests, documentation and portability are welcome.
+Thanks for your interest. This project is a **local-first developer preview**
+(v0.3.0): a deterministic runtime with a mock planner (plus optional trusted
+dynamic intents), a CLI, and an HTTP API plus dashboard that wrap the same
+runtime. Contributions that improve correctness, tests, documentation and
+portability are welcome. It is not production software.
 
 ## Setup
 
@@ -14,8 +15,13 @@ uv sync
 uv run pytest -q
 uv run python -m compileall -q app tests scripts
 uv run aae --help
+./scripts/demo_local.sh --seed-only   # isolated demo DB; never touches runtime.db
 uv run playwright install chromium   # browser tests; skipped locally if unavailable
 ```
+
+For the full browser-required suite used in CI and release acceptance, see the
+README Tests section. Do not set `AAE_TEST_MODE` / `AAE_TEST_SCRIPTED_PLAN` on
+a shared server.
 
 CI sets `AAE_REQUIRE_BROWSER_TESTS=1`, which turns a missing browser into a failure.
 
@@ -27,9 +33,13 @@ app/main.py, app/api/   HTTP API v1, request guard, public-demo sessions
 app/web/                live dashboard (static HTML/CSS/JS served by the API)
 app/runtime/locking.py  per-task OS locks shared by the CLI and the API
 app/llm/mock.py         strict mock interpreter/planner (two goal formats)
-app/planning/           goal interpretation, planning, plan validation
-app/runtime/executor.py task lifecycle, approval gate, bounded retry, crash resume
-app/policy/             which tool operations need human approval
+app/planning/           goal interpretation, planning, plan validation (incl. $ref checks)
+app/authz/              goal-scoped authorization contract, trusted origin, plan/runtime gates
+app/models/references.py  typed step-output reference syntax and path reads
+app/runtime/binding.py  resolve $ref arguments before authorization, approval and each attempt
+app/runtime/executor.py task lifecycle, authz + approval gates, bounded retry, crash resume
+app/tools/capabilities.py  per-operation metadata: risk, approval, retry safety, verification
+app/policy/             which tool operations need human approval (HITL; not authorization)
 app/tools/              company API tool (idempotent writes), sandboxed file tool
 app/verify/             independent outcome verification against real state
 app/store/, app/world/  SQLite task state/audit events and the mock company data
@@ -62,14 +72,20 @@ and exit codes.
 
 - Every behaviour change or bug fix needs a regression test that fails without it.
 - Do not weaken the safeguards: task lifecycle guards, the per-step retry budget, the
-  approval gate, idempotent company writes, database isolation, or independent
-  verification. Changes to these areas need tests for the failure cases.
-- Keep the mock grammar strict. New goal formats need positive and rejection tests.
+  approval gate, goal-scoped authorization, idempotent company writes, database
+  isolation, or independent verification. Changes to these areas need tests for the
+  failure cases.
+- Authorization scopes must come from a trusted origin (mock goal derivation or an
+  independently supplied internal scope). Never let the planner, LLM text, tool
+  observations or a public API body grant or expand permissions.
+- Keep the mock grammar strict. New goal formats need positive and rejection tests,
+  plus a matching authorization scope derivation.
 - Keep the README examples and `demo-ui/index.html` consistent with real CLI output;
   `tests/test_readme.py` and `tests/test_demo_ui.py` check this.
 - No new runtime dependencies without discussion.
 - Never add an HTTP endpoint that runs arbitrary tools, plans, shell commands or file
-  writes, or that accepts unrestricted filesystem paths.
+  writes, that accepts unrestricted filesystem paths, or that lets callers grant
+  themselves arbitrary authorization.
 - Dashboard code must render data with `textContent`/`createElement`, never
   `innerHTML`, and must not show values that did not come from the API.
 

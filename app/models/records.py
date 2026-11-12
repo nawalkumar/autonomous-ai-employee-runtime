@@ -28,6 +28,13 @@ class ToolCallRecord(BaseModel):
     # 1-based position of this invocation among all attempts for the step,
     # continuous across restarts. None on records persisted before this field.
     attempt: int | None = None
+    # References resolved into ``arguments`` (which are the resolved values):
+    # [{"location": [...], "step_id": "...", "path": [...]}]. None for literal steps.
+    references: list[dict[str, Any]] | None = None
+    # Whether the policy required approval for this exact call, and the
+    # fingerprint of the approved action. None on records from before v0.3.0.
+    approval_required: bool | None = None
+    approval_fingerprint: str | None = None
     result: dict[str, Any] | None = None
     error_type: str | None = None
     error_message: str | None = None
@@ -78,5 +85,9 @@ class PendingAction(BaseModel):
     idempotency_key: str | None = None
     reason: str | None = None
     risk: str = "write"
+    # sha256 of tool, operation and canonical arguments (see
+    # app.runtime.transitions.action_fingerprint). None on records persisted
+    # before v0.3.0; those are bound to their recorded arguments instead.
+    fingerprint: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     resolved_at: datetime | None = None

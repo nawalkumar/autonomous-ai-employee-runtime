@@ -282,13 +282,170 @@ def _file_criterion_paths(goal: dict[str, Any]) -> set[str]:
     return paths
 
 
+def _dynamic_plan_payload(intent_id: str, entities: dict[str, Any]) -> dict[str, Any]:
+    """Canned valid plans for trusted dynamic intents (tests / offline mode)."""
+    if intent_id == "list_open_high_priority_tickets":
+        return {
+            "steps": [
+                {
+                    "step_id": "list_tickets",
+                    "description": "List open high-priority tickets",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "list_tickets",
+                        "filters": {"status": "open", "priority": "high"},
+                    },
+                    "expected_outcome": "Matching tickets listed",
+                }
+            ]
+        }
+    if intent_id == "list_tickets_for_customer":
+        customer_id = str(entities["customer_id"])
+        return {
+            "steps": [
+                {
+                    "step_id": "list_tickets",
+                    "description": f"List tickets for {customer_id}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "list_tickets",
+                        "filters": {"customer_id": customer_id},
+                    },
+                    "expected_outcome": "Customer tickets listed",
+                }
+            ]
+        }
+    if intent_id == "create_ticket_for_customer":
+        customer_id = str(entities["customer_id"])
+        subject = str(entities["subject"])
+        description = str(entities.get("description") or subject)
+        return {
+            "steps": [
+                {
+                    "step_id": "create_ticket",
+                    "description": f"Create support ticket for {customer_id}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "create_ticket",
+                        "customer_id": customer_id,
+                        "subject": subject,
+                        "description": description,
+                        "priority": "medium",
+                    },
+                    "expected_outcome": "Ticket created",
+                }
+            ]
+        }
+    if intent_id == "update_ticket_status":
+        ticket_id = str(entities["ticket_id"])
+        status = str(entities["status"])
+        return {
+            "steps": [
+                {
+                    "step_id": "update_ticket",
+                    "description": f"Set {ticket_id} status to {status}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "update_ticket",
+                        "ticket_id": ticket_id,
+                        "fields": {"status": status},
+                    },
+                    "expected_outcome": "Ticket status updated",
+                }
+            ]
+        }
+    if intent_id == "assign_ticket":
+        ticket_id = str(entities["ticket_id"])
+        employee_id = str(entities["employee_id"])
+        return {
+            "steps": [
+                {
+                    "step_id": "assign_ticket",
+                    "description": f"Assign {ticket_id} to {employee_id}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "assign_ticket",
+                        "ticket_id": ticket_id,
+                        "employee_id": employee_id,
+                    },
+                    "expected_outcome": "Ticket assigned",
+                }
+            ]
+        }
+    if intent_id == "update_employee_title":
+        employee_id = str(entities["employee_id"])
+        title = str(entities["title"])
+        return {
+            "steps": [
+                {
+                    "step_id": "update_employee",
+                    "description": f"Update {employee_id} title to {title}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "update_employee",
+                        "employee_id": employee_id,
+                        "fields": {"title": title},
+                    },
+                    "expected_outcome": "Employee title updated",
+                }
+            ]
+        }
+    if intent_id == "create_customer_and_welcome_ticket":
+        name = str(entities["name"])
+        company = str(entities["company"])
+        email = str(entities["email"])
+        subject = str(entities.get("subject") or "Welcome")
+        description = str(
+            entities.get("description") or f"Welcome ticket for {name} at {company}."
+        )
+        return {
+            "steps": [
+                {
+                    "step_id": "create_customer",
+                    "description": f"Create customer {name}",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "create_customer",
+                        "name": name,
+                        "company": company,
+                        "email": email,
+                    },
+                    "expected_outcome": "Customer created",
+                },
+                {
+                    "step_id": "create_ticket",
+                    "description": "Create welcome support ticket",
+                    "tool_name": "company_api",
+                    "arguments": {
+                        "operation": "create_ticket",
+                        "customer_id": {
+                            "$ref": {
+                                "step_id": "create_customer",
+                                "path": ["customer", "customer_id"],
+                            }
+                        },
+                        "subject": subject,
+                        "description": description,
+                        "priority": "low",
+                    },
+                    "expected_outcome": "Welcome ticket created",
+                },
+            ]
+        }
+    raise ValueError(f"MockLLM has no canned plan for intent {intent_id!r}")
+
+
 class MockLLMClient(LLMClient):
-    """Deterministic responses for exactly two allowlisted goal contracts."""
+    """Deterministic responses for mock scenarios and trusted dynamic intents."""
 
     provider_name = "mock"
 
+    def __init__(self, *, call_log: list[str] | None = None) -> None:
+        self.call_log = call_log if call_log is not None else []
+
     async def complete(self, request: LLMRequest) -> LLMResponse:
         kind = str(request.metadata.get("kind", "")).lower()
+        self.call_log.append(kind)
         user_text = next(
             (m.content for m in reversed(request.messages) if m.role == "user"),
             "",
@@ -302,6 +459,8 @@ class MockLLMClient(LLMClient):
                     [m.content for m in request.messages if m.role == "user"]
                 )
             )
+        elif kind == "dynamic_plan":
+            payload = self._dynamic_plan_from_request(request, user_text)
         else:
             payload = {"message": f"[mock] acknowledged: {user_text[:200]}"}
 
@@ -311,6 +470,22 @@ class MockLLMClient(LLMClient):
             provider=self.provider_name,
             raw={"kind": kind, "scenario": payload.get("_scenario")},
         )
+
+    def _dynamic_plan_from_request(self, request: LLMRequest, user_text: str) -> dict[str, Any]:
+        intent_id = str(request.metadata.get("intent_id") or "")
+        entities: dict[str, Any] = {}
+        try:
+            payload = json.loads(user_text)
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict):
+            intent_id = intent_id or str(payload.get("intent_id") or "")
+            goal = payload.get("goal") if isinstance(payload.get("goal"), dict) else {}
+            if isinstance(goal, dict) and isinstance(goal.get("entities"), dict):
+                entities = dict(goal["entities"])
+        if not intent_id:
+            raise ValueError("MockLLM dynamic planner requires intent_id")
+        return _dynamic_plan_payload(intent_id, entities)
 
     def _interpret_payload(self, text: str) -> dict:
         goal = parse_supported_goal(text)

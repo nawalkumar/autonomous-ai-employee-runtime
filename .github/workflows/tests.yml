@@ -40,6 +40,12 @@ jobs:
       - name: Compile
         run: uv run python -m compileall -q app tests scripts
 
+      - name: Packaging and import check
+        run: |
+          uv build
+          uv run python -c "from app import __version__; import app.main, app.cli; print(__version__)"
+          test -x scripts/demo_local.sh
+
       - name: Test
         run: uv run pytest -q -rs
 

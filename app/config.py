@@ -27,6 +27,25 @@ class Settings(BaseSettings):
     xai_api_key: str = ""
     xai_model: str = "grok-2-latest"
     xai_base_url: str = "https://api.x.ai/v1"
+    # Optional planning for a trusted intent catalog. Default off: disabled mode
+    # preserves the two deterministic mock goal contracts only. When enabled,
+    # bounded collection grammars are planned deterministically (no provider
+    # call); other catalog intents may call the configured provider.
+    aae_dynamic_planning_enabled: bool = False
+    # Provider reliability bounds (dynamic planner / xAI adapter). Unused when
+    # dynamic planning is disabled.
+    llm_request_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
+    llm_max_tokens: int = Field(default=4096, ge=256, le=16_384)
+    llm_max_response_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
+    llm_max_provider_retries: int = Field(default=1, ge=0, le=3)
+
+    # Optional bounded replanning. Default off; independent of dynamic planning.
+    # When enabled, the executor may replace remaining work after a supported
+    # business-state conflict. The model cannot change authorization, approval
+    # or verification. Ordinary saves cannot install a revision.
+    # Never expands the original trusted authorization scope.
+    aae_replanning_enabled: bool = False
+    aae_max_replan_rounds: int = Field(default=2, ge=0, le=5)
 
     # "local": one persistent SQLite database and workspace shared with the CLI,
     # served to localhost only. "public": per-browser-session sandboxes in

@@ -8,8 +8,11 @@ name to read. Tasks can only come from goals accepted by the mock planner.
 from __future__ import annotations
 
 import hmac
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
+from pathlib import Path as FsPath
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
@@ -20,6 +23,8 @@ from app.api.errors import ApiError
 from app.api.schemas import (
     TASK_ID_PATTERN,
     ApproveRequest,
+    CapabilitiesResponse,
+    CapabilityOut,
     CustomersResponse,
     EmployeesResponse,
     ErrorResponse,
@@ -41,9 +46,11 @@ from app.api.schemas import (
 )
 from app.api.service import IDEMPOTENCY_KEY, TaskService, Tenant
 from app.api.sessions import SESSION_COOKIE, SessionManager
+from app.cli import RUNTIME_TOOLS
 from app.config import Settings
 from app.llm.mock import SUPPORTED_GOALS
 from app.planning import InterpretationError, PlanningError
+from app.tools.capabilities import CAPABILITIES
 
 LOCAL_APPROVER = "local-dashboard"
 
@@ -90,6 +97,16 @@ LOCAL_NOTICE = (
     "SQLite database shared with the CLI."
 )
 
+_LIST_EXAMPLE = (
+    "List up to 5 open high-priority tickets."
+)
+_ASSIGN_EXAMPLE = (
+    "Assign up to 2 open high-priority tickets to employee E-40."
+)
+_BATCH_EXAMPLE = (
+    "Mark tickets T-10002 and T-10004 as resolved."
+)
+
 _ERRORS = {
     400: {"model": ErrorResponse},
     401: {"model": ErrorResponse},
@@ -102,6 +119,142 @@ _ERRORS = {
 }
 
 TaskId = Annotated[str, Path(pattern=TASK_ID_PATTERN)]
+
+
+def _example_database(request: Request, ctx: AppContext) -> FsPath | None:
+    """The database whose records may be offered as example goals.
+
+    A missing file is left untouched. Fixture-specific ids are offered only
+    when those rows are actually stored.
+    """
+    if ctx.public:
+        if ctx.sessions is None:
+            return None
+        session = ctx.sessions.resolve(request.cookies.get(SESSION_COOKIE))
+        if session is None:
+            return None
+        path = FsPath(SessionManager.settings_for(session, ctx.settings).database_path)
+    else:
+        path = FsPath(ctx.settings.database_path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    return path
+
+
+def _collection_examples(request: Request, ctx: AppContext) -> list[ScenarioOut]:
+    """Trusted collection grammars. Hidden unless dynamic planning is on."""
+    if not ctx.settings.aae_dynamic_planning_enabled:
+        return []
+    examples = [
+        ScenarioOut(
+            scenario_id="list_bounded",
+            title="List up to 5 open high-priority tickets",
+            description=(
+                "Deterministic trusted plan. One read-only list_tickets step. "
+                "The model is not asked to plan it, and it does not mutate anything."
+            ),
+            goals=[_LIST_EXAMPLE],
+            requires_approval=False,
+            injectable_operation=None,
+            planning="trusted_collection",
+        )
+    ]
+    path = _example_database(request, ctx)
+    if path is None:
+        return examples
+    assign, batch = _fixture_examples_available(path)
+    if assign:
+        examples.append(
+            ScenarioOut(
+                scenario_id="assign_bounded",
+                title="Assign up to 2 open high-priority tickets",
+                description=(
+                    "Deterministic trusted plan for employee E-40. Ticket ids come "
+                    "only from the sealed list snapshot. The model cannot widen it."
+                ),
+                goals=[_ASSIGN_EXAMPLE],
+                requires_approval=False,
+                injectable_operation=None,
+                planning="trusted_collection",
+            )
+        )
+    if batch:
+        examples.append(
+            ScenarioOut(
+                scenario_id="batch_status",
+                title="Mark T-10002 and T-10004 resolved",
+                description=(
+                    "Deterministic trusted plan. One update per listed ticket, and "
+                    "only those tickets. This is not a collection."
+                ),
+                goals=[_BATCH_EXAMPLE],
+                requires_approval=False,
+                injectable_operation=None,
+                planning="trusted_collection",
+            )
+        )
+    return examples
+
+
+def _fixture_examples_available(path: FsPath) -> tuple[bool, bool]:
+    """Whether the open database contains the assignment and batch examples.
+
+    Opens SQLite with ``mode=ro`` and ``query_only``. A missing table, a missing
+    column, or any read error yields no fixture-specific examples. This function
+    does not create, seed, or migrate the file.
+    """
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False, False
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        employees = _column_names(conn, "company_employees")
+        tickets = _column_names(conn, "company_tickets")
+        if employees is None or tickets is None:
+            return False, False
+        if not {"employee_id", "department", "status"} <= employees:
+            return False, False
+        if not {"ticket_id", "status", "priority"} <= tickets:
+            return False, False
+        employee = conn.execute(
+            "SELECT department, status FROM company_employees WHERE employee_id = ?",
+            ("E-40",),
+        ).fetchone()
+        open_high = conn.execute(
+            "SELECT 1 FROM company_tickets WHERE status = ? AND priority = ? LIMIT 1",
+            ("open", "high"),
+        ).fetchone()
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT ticket_id FROM company_tickets WHERE ticket_id IN (?, ?)",
+                ("T-10002", "T-10004"),
+            )
+        }
+    except sqlite3.Error:
+        return False, False
+    finally:
+        conn.close()
+    assign = (
+        employee is not None
+        and employee[0] == "Support"
+        and employee[1] == "active"
+        and open_high is not None
+    )
+    return assign, present == {"T-10002", "T-10004"}
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str] | None:
+    if table not in {"company_employees", "company_tickets"}:
+        return None
+    found = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if found is None:
+        return None
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 @dataclass
@@ -163,12 +316,31 @@ def health(ctx: Ctx) -> HealthResponse:
 
 
 @router.get("/scenarios", response_model=ScenariosResponse, tags=["meta"])
-def scenarios(ctx: Ctx) -> ScenariosResponse:
+def scenarios(request: Request, ctx: Ctx) -> ScenariosResponse:
     return ScenariosResponse(
-        scenarios=list(SCENARIOS),
+        scenarios=[*SCENARIOS, *_collection_examples(request, ctx)],
         supported_formats=list(SUPPORTED_GOALS),
         failure_injection_enabled=ctx.settings.allow_failure_injection,
+        dynamic_planning_enabled=ctx.settings.aae_dynamic_planning_enabled,
+        replanning_enabled=ctx.settings.aae_replanning_enabled,
     )
+
+
+@lru_cache(maxsize=1)
+def _capabilities() -> CapabilitiesResponse:
+    # Static metadata: registered operations only, built from the tools'
+    # argument models (classes), never from tool instances or settings, so no
+    # paths, secrets or per-tenant state can appear in it.
+    described = CAPABILITIES.describe({tool.name: tool.args_schema for tool in RUNTIME_TOOLS})
+    return CapabilitiesResponse(
+        schema_version="1",
+        capabilities=[CapabilityOut(**item) for item in described],
+    )
+
+
+@router.get("/capabilities", response_model=CapabilitiesResponse, tags=["meta"])
+def capabilities() -> CapabilitiesResponse:
+    return _capabilities()
 
 
 def _session_response(ctx: AppContext, current: Tenant | None) -> SessionResponse:
@@ -182,6 +354,8 @@ def _session_response(ctx: AppContext, current: Tenant | None) -> SessionRespons
             task_quota=None,
             tasks_used=None,
             notice=LOCAL_NOTICE,
+            dynamic_planning_enabled=ctx.settings.aae_dynamic_planning_enabled,
+            replanning_enabled=ctx.settings.aae_replanning_enabled,
         )
     ttl = ctx.settings.public_session_ttl_seconds
     tasks_used = None
@@ -196,6 +370,8 @@ def _session_response(ctx: AppContext, current: Tenant | None) -> SessionRespons
         task_quota=ctx.settings.public_max_tasks_per_session,
         tasks_used=tasks_used,
         notice=PUBLIC_NOTICE.format(ttl=ttl // 60),
+        dynamic_planning_enabled=ctx.settings.aae_dynamic_planning_enabled,
+        replanning_enabled=ctx.settings.aae_replanning_enabled,
     )
 
 
@@ -313,14 +489,14 @@ def task_verification(task_id: TaskId, ctx: Ctx, current: CurrentTenant) -> Veri
 def approve_task(
     task_id: TaskId, body: ApproveRequest, ctx: Ctx, current: CurrentTenant
 ) -> TaskDetail:
-    return ctx.service.approve(current, task_id, body.step_id)
+    return ctx.service.approve(current, task_id, body.step_id, body.fingerprint)
 
 
 @router.post("/tasks/{task_id}/reject", response_model=TaskDetail, tags=["approval"])
 def reject_task(
     task_id: TaskId, body: RejectRequest, ctx: Ctx, current: CurrentTenant
 ) -> TaskDetail:
-    return ctx.service.reject(current, task_id, body.step_id, body.reason)
+    return ctx.service.reject(current, task_id, body.step_id, body.reason, body.fingerprint)
 
 
 @router.post("/tasks/{task_id}/resume", response_model=TaskDetail, tags=["tasks"])

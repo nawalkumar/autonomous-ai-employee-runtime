@@ -1,10 +1,13 @@
-"""Exclusive, OS-backed per-task locks shared by the CLI and the HTTP API.
+"""Exclusive, OS-backed per-task locks shared by the CLI, HTTP API and runtime.
 
 A lock is a byte-range/flock lock on ``<lock_dir>/lock-<task_id>.lock``. The OS
 releases it when the descriptor closes, including on process termination, so a
-leftover lock file never blocks a later command. Locks belong to the open file
-description, not to a thread: they exclude other threads of the same process and
-may be released from a different thread than the one that acquired them.
+leftover lock file never blocks a later command. Separate open descriptors
+exclude each other across threads and processes.
+
+Nested acquire of the same task from the same stack is **not** supported: callers
+that already hold the lock (CLI/API) must pass ``execution_locked=True`` into
+``ExecutionRuntime`` instead of re-entering ``hold_task_lock``.
 """
 
 from __future__ import annotations

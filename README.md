@@ -1,26 +1,31 @@
 # Autonomous AI Employee Runtime
 
-Prototype runtime for CentrAlign AI's Founding Engineer challenge: an AI worker that
-interprets a goal, plans tool calls, executes them against a mock company system,
-recovers from transient failures, pauses for human approval before sensitive writes,
-and independently verifies the outcome before reporting success.
+Prototype runtime that turns a narrow natural-language goal into a bounded,
+authorized plan, executes tools against a fictional company system, pauses for
+human approval on sensitive writes, retries transient failures within a budget,
+and independently verifies outcomes before reporting success.
 
-**Status (v0.2.0):** working prototype, not production software. The planner is a
-deterministic mock that accepts exactly two goal formats (below). Tasks can be run from
-the CLI or from a live web dashboard backed by an HTTP API; both use the same runtime,
-SQLite database and per-task locks. All company data is fictional.
+**Status (v0.3.0):** local-first **developer preview**, not production software.
+With dynamic planning off (default), the mock planner accepts exactly two goal
+formats (below). With the flag on, a trusted intent catalog and three collection
+grammars are also available. Tasks run from the CLI or a live dashboard backed by
+the same HTTP API, SQLite store and per-task locks. All company data is fictional.
 
 ![Dashboard after a ticket task with one simulated 503, a bounded retry and 6/6 verification checks](docs/images/dashboard-recovery.png)
 
 ## Contents
 
-- [What v0.2.0 adds](#what-v020-adds)
+- [What v0.3.0 includes](#what-v030-includes)
 - [Platform support](#platform-support)
 - [Quick start](#quick-start)
 - [Supported goals](#supported-goals-mock-planner)
 - [Dashboard](#dashboard)
 - [CLI walkthrough](#cli-walkthrough)
 - [HTTP API](#http-api)
+- [Capability registry](#capability-registry)
+- [Step-output references](#step-output-references)
+- [Goal-scoped plan authorization](#goal-scoped-plan-authorization)
+- [Company data model and demo company](#company-data-model-and-demo-company)
 - [Local mode and public demo mode](#local-mode-and-public-demo-mode)
 - [Security model](#security-model)
 - [Configuration](#configuration)
@@ -29,21 +34,47 @@ SQLite database and per-task locks. All company data is fictional.
 - [Limitations](#limitations)
 - [How it works](#how-it-works)
 - [Tests](#tests)
+- [Changelog](CHANGELOG.md)
+- [Local demo guide](docs/LOCAL_DEMO.md)
 
-## What v0.2.0 adds
+## What v0.3.0 includes
 
-- A **live dashboard** served by FastAPI. It submits real goals, shows the real task ID,
-  plan, tool calls, retries, audit events, approval requests and verification evidence,
-  and lets you approve, reject or resume tasks. Nothing in it is scripted.
-- An **HTTP API** (`/api/v1`) that wraps the existing planner, executor, approval policy,
-  verifier and SQLite store. There is no endpoint for arbitrary tools, plans, shell
-  commands or file writes.
-- **Shared OS locks** between CLI and API processes, so the same task can never be
-  executed, approved or rejected by two processes at once.
-- Two run modes: **local** (persistent, localhost only) and **public demo** (per-browser
-  sandboxes of fictional data on ephemeral storage), plus a Render Free Blueprint.
-- Approval events record the approver (`local-dashboard`, `demo-session:<id>`, or
-  `cli:<user>`).
+Carried forward from v0.2.0:
+
+- A **live dashboard** served by FastAPI. It submits real goals and shows the real
+  task ID, plan, tool calls, retries, audit events, approvals and verification
+  evidence. Approve, reject and resume hit the same API as the CLI. Nothing in the
+  live dashboard is a scripted offline simulation (`demo-ui/` remains separate).
+- An **HTTP API** (`/api/v1`) over the planner, executor, approval policy, verifier
+  and SQLite store. There is no endpoint for arbitrary tools, plans, shell commands
+  or file writes.
+- **Shared OS locks** between CLI and API processes.
+- **Local** (persistent, localhost-oriented) and **public demo** modes, plus a
+  Render Free Blueprint.
+- Approval events record the approver label (`local-dashboard`,
+  `demo-session:<id>`, or `cli:<user>`).
+
+New in v0.3.0:
+
+- Safety hardening: `update_employee` rejects invalid updates; verification reports
+  `unverified` / `unsupported_criterion` honestly; approvals are fingerprint-bound
+  (`stale_approval` when the action changes).
+- Operation-level [capability registry](#capability-registry) at
+  `GET /api/v1/capabilities`.
+- Five company operations (`list_tickets`, `update_ticket`, `assign_ticket`,
+  `create_customer`, `deactivate_employee`), additive schema migration, and a
+  separately seeded [demo company](#company-data-model-and-demo-company).
+- Typed step-output [`$ref`](#step-output-references) bindings for explicit plans.
+- Goal-scoped [plan authorization](#goal-scoped-plan-authorization) with per-step
+  shapes and budgets. This is not LLM autonomy.
+- Optional [dynamic LLM planning](#dynamic-llm-planning)
+  (`AAE_DYNAMIC_PLANNING_ENABLED`, default **false**) over a trusted intent catalog.
+- [Bounded collection workflows](#bounded-collection-workflows) as API/CLI/dashboard
+  grammars when dynamic planning is on (list / assign / batch status).
+- Optional [bounded replanning](#bounded-replanning) (`AAE_REPLANNING_ENABLED`,
+  default **false**) that cannot widen the original authorization scope.
+- Reproducible local demo helper: `./scripts/demo_local.sh` (see
+  [docs/LOCAL_DEMO.md](docs/LOCAL_DEMO.md)).
 
 ## Platform support
 
@@ -64,18 +95,32 @@ git clone <repository-url>
 cd Autonomous-AI-Employee-Runtime
 uv sync
 uv run aae --help
+```
+
+### Default local API (empty-ish runtime DB)
+
+```bash
 uv run aae-api
 ```
 
-`uv run aae-api` starts the API and dashboard in **local mode** on
-<http://127.0.0.1:8000>. Open that address in a browser. The server listens on the
-loopback interface only and answers only requests addressed to `localhost`,
-`127.0.0.1` or `[::1]`.
+Starts the API and dashboard in **local mode** on <http://127.0.0.1:8000>. The
+server defaults to the loopback interface and answers only requests addressed to
+`localhost`, `127.0.0.1` or `[::1]`. Database default: `./data/runtime.db`;
+workspace default: `./workspace`. The CLI and dashboard share them.
 
-By default the database is `./data/runtime.db` and the file workspace is `./workspace`,
-relative to the directory you start from. The CLI and the dashboard share them, so a
-task started in one can be inspected, approved or resumed in the other. Optionally copy
-`.env.example` to `.env` to change paths or settings.
+### Recommended demo (isolated fixture DB)
+
+```bash
+./scripts/demo_local.sh
+```
+
+Seeds `data/demo.db` (never `data/runtime.db`), enables the trusted collection
+grammars with `LLM_PROVIDER=mock`, keeps replanning and test scripted providers
+off, and starts the API on loopback. Full walkthrough:
+[docs/LOCAL_DEMO.md](docs/LOCAL_DEMO.md).
+
+Optionally copy `.env.example` to `.env` to change paths or settings. Never commit
+`.env` or real secrets.
 
 ## Supported goals (mock planner)
 
@@ -101,29 +146,94 @@ The dashboard keeps the dark design and eight-stage pipeline of the original dem
 every value comes from the API:
 
 - **Goal:** one button per supported goal; free text is allowed and sent to the server,
-  which rejects unsupported goals (`422`, no task created). For the ticket scenario an
-  explicitly labelled control injects **one simulated 503** into `create_ticket`.
-- **Execution:** real task ID and status, interpreted goal, plan steps with attempt
-  counts, tool arguments (secret-looking values redacted), retries, errors, and the
-  persisted audit events with their stored timestamps. Pipeline stages are derived from
-  those events.
+  which rejects unsupported goals (`422`, no task created). Creating a task is not
+  shown as a successful execution. For the ticket scenario an explicitly labelled
+  control injects **one simulated 503** into `create_ticket`. With
+  `AAE_DYNAMIC_PLANNING_ENABLED=true`, the three collection grammars appear as
+  trusted plans. Assignment and batch examples are shown only when the open
+  database actually contains `E-40`, `T-10002` and `T-10004` (seed
+  `python -m app.world.demo_fixture --database <DATABASE_PATH>` into an empty
+  file first). Those plans are deterministic. Other catalog goals may call the
+  configured provider. The page labels which kind of plan a task used.
+- **Execution:** real task ID and status, interpreted goal, and each plan step's
+  id, tool, operation, status, approval, tool-result summary, error and
+  verification. Tool arguments are shown with secret-looking values redacted.
+  The audit timeline uses persisted events and their stored timestamps.
+- **Collection:** `collection_progress` from the task, including selected and
+  processed counts and each ticket id with its step status. `completed` and
+  `verified` are separate. A task with no collection says so.
 - **Approval:** when the policy gate pauses a task, the card shows the pending step,
   operation, arguments, risk and reason. Approve and Reject each require confirmation in
-  a dialog and send an API request; the server enforces the decision and the card shows
-  the resulting status.
-- **Verification:** result, each independent check (expected vs actual), failure reasons
-  and evidence.
+  a dialog and send the existing API request with the displayed fingerprint. The
+  server enforces the decision. A stale fingerprint is an error, not a second approval.
+- **Verification:** the independent result, each check (expected vs actual), failure
+  reasons and evidence. The page does not treat a model explanation as verification.
+- **Replanning:** read-only `replan.proposed`, `replan.accepted`, `replan.rejected`
+  and `replan.exhausted` events, with revision, trigger, outcome, plan identity and
+  budget figures when the audit row has them. The page shows whether
+  `AAE_REPLANNING_ENABLED` is on and has no control that changes it or submits a plan.
 - **History:** persisted tasks (including ones started from the CLI); select one to
-  reload it, or resume a queued or interrupted task. `#task=<id>` in the URL reopens it.
+  reload it, or resume a queued or interrupted task. `#task=<id>` in the URL reopens
+  the task from the API, not from browser storage.
 - **Company and workspace:** read-only employees, tickets, customers, and the files
-  written to the workspace.
+  written to the workspace. Values are inserted as text, not HTML.
 - While a task executes the page polls every second (at most 120 times), stops when the
   task is settled, and shows a banner if the backend is unreachable or has restarted.
+  Local mode has no login; it is the same loopback API as the CLI. Public mode still
+  requires its existing session cookie. The dashboard does not add a new authority.
 
 ![Approval card for update_employee on step_1](docs/images/dashboard-approval.png)
 
 `demo-ui/index.html` is the earlier **scripted simulation** for offline presentations.
 It is clearly labelled, is not served by the API, and does not execute anything.
+
+### Reproducible local demo
+
+This is a local demonstration of the real API and SQLite database. It is not a
+production deployment, and a scripted provider is not live model reasoning.
+
+```text
+uv run python -m app.world.demo_fixture --database data/demo.db
+DATABASE_PATH=data/demo.db AAE_DYNAMIC_PLANNING_ENABLED=true uv run aae-api
+```
+
+Open http://127.0.0.1:8000. The seeder writes only a new, empty, or already marked
+demo file. `--reset` recreates a marked demo file. It refuses any other database,
+including a normal `data/runtime.db`, and it refuses a directory. Loading the
+dashboard does not seed or migrate the company tables.
+
+With dynamic planning on, the page can show:
+
+- `List up to 5 open high-priority tickets.` Read-only. The ids on the page are the
+  ids the tool returned. The demo fixture has three open high-priority tickets.
+- `Assign up to 2 open high-priority tickets to employee E-40.` Collection progress
+  comes from the API. `completed` means the step ran. `verified` means independent
+  verification passed.
+- `Mark tickets T-10009 and T-10010 as closed.` The page pauses once per ticket.
+  Approve only after reading the pending arguments. Both tickets stay resolved
+  until those approvals.
+- `Assign ticket T-10018 to eligible Support employee E-45.` This fails the company
+  rule. The page shows `failed`.
+
+Each plan step says whether approval was not required, is awaiting, was approved,
+or was rejected. A finished task does not mark every step approved.
+
+Automatic replanning stays off unless `AAE_REPLANNING_ENABLED=true` in the server
+environment. The page cannot change that flag. A trusted batch such as "mark these
+tickets as open" cannot recover by switching to another status, because that would
+widen the original authorization. An accepted revision is visible when a task was
+actually committed with a replacement inside its existing scope. Integration tests
+that show `replan.accepted` use a scripted provider in the test process. Set
+`AAE_MAX_REPLAN_ROUNDS=0` to show `replan.exhausted` with no provider call.
+
+Browser tests, including those scripted cases:
+
+```text
+AAE_REQUIRE_BROWSER_TESTS=1 AAE_TEST_MODE=1 uv run pytest -q tests/test_dashboard_operations.py
+```
+
+`AAE_TEST_MODE=1` alone does not replace the model. The fixed plan is used only when
+`AAE_TEST_SCRIPTED_PLAN` is also set, and only in that process.
 
 ## CLI walkthrough
 
@@ -219,14 +329,15 @@ or filesystem paths. In local mode interactive docs are at `/docs`.
 |--------|------|---------|
 | GET | `/health`, `/api/v1/health` | Liveness; v1 also returns mode, version, persistence and a per-process `boot_id` |
 | GET | `/api/v1/scenarios` | The supported goals |
+| GET | `/api/v1/capabilities` | Registered tool operations and their metadata ([below](#capability-registry)) |
 | GET / POST | `/api/v1/session` | Session status; start a public demo session |
 | POST | `/api/v1/tasks` | Plan and start a goal: `{"goal": "...", "inject_failure": "create_ticket"}` (injection optional) |
 | GET | `/api/v1/tasks` | Persisted tasks, newest first (`limit`, `offset`) |
 | GET | `/api/v1/tasks/{task_id}` | Task state: plan, tool calls, retries, failures, pending action, verification summary |
 | GET | `/api/v1/tasks/{task_id}/history` | Audit events in order |
 | GET | `/api/v1/tasks/{task_id}/verification` | Checks, failure reasons and evidence |
-| POST | `/api/v1/tasks/{task_id}/approve` | `{"step_id": "step_1", "confirm": true}` |
-| POST | `/api/v1/tasks/{task_id}/reject` | `{"step_id": "step_1", "reason": "...", "confirm": true}` |
+| POST | `/api/v1/tasks/{task_id}/approve` | `{"step_id": "step_1", "confirm": true}`, optionally `"fingerprint": "sha256:..."` |
+| POST | `/api/v1/tasks/{task_id}/reject` | `{"step_id": "step_1", "reason": "...", "confirm": true}`, optionally `"fingerprint"` |
 | POST | `/api/v1/tasks/{task_id}/resume` | `{"confirm": true}` for a queued or interrupted task |
 | GET | `/api/v1/company/employees`, `/customers`, `/tickets` | Mock company data (read-only) |
 | GET | `/api/v1/workspace/files`, `/api/v1/workspace/file?path=...` | Workspace files (read-only; only listed files can be read) |
@@ -240,12 +351,696 @@ Behaviour worth knowing:
   repeating it returns the same task (`200`); reusing it for a different body is `409`.
 - Approve, reject and resume take the task's lock (waiting up to 2 s). Concurrent or
   repeated approvals execute the write once; the others get `409`.
+- `pending_action.fingerprint` identifies the exact action awaiting approval (tool,
+  operation and canonical arguments). The documented request may omit it, because the
+  CLI loads the pending action and sends that fingerprint itself, and older API clients
+  send only `step_id` and `confirm`. A fingerprint that is present must match; a
+  mismatch returns `409 stale_approval` and changes nothing. Requiring the field on
+  every request would reject those clients, so local mode still accepts a missing
+  fingerprint. That is not authentication. Anyone who can reach the local API can
+  approve. The dashboard always sends the fingerprint it displayed. Approve also
+  returns `409 stale_approval` when the planned step no longer matches the pending
+  action; the server then records `approval.invalidated` and requests a fresh approval
+  for the current action. A changed mutation does not reuse the previous approval.
+- `verification_status` is `pending`, `passed`, `failed` or `unverified`. `unverified`
+  means the task completed but had no outcome to check independently (for example a
+  read-only plan); it is never reported as `passed`.
 - Mutating requests must be `application/json`, at most 8 KiB, and same-origin.
 
 ```bash
 curl -s http://127.0.0.1:8000/api/v1/health
 curl -s -X POST http://127.0.0.1:8000/api/v1/tasks -H 'Content-Type: application/json' -H 'Idempotency-Key: example-0001' -d '{"goal": "Update employee E-17 title to Senior Engineer."}'
+curl -s http://127.0.0.1:8000/api/v1/capabilities
 ```
+
+## Capability registry
+
+`app/tools/capabilities.py` holds one immutable `Capability` per registered tool
+operation. It is the single source of operation metadata: the approval policy, the
+tools' risk and retry-safety answers, the planner's tool catalog and the verifier's
+"mutating operation" set all read from it. The verifier still performs every
+independent check itself; a capability only names which strategy applies.
+
+Each capability declares:
+
+| Field | Meaning |
+|-------|---------|
+| `tool`, `operation`, `description` | Identity and a human-readable summary |
+| `input_schema` | JSON schema for this operation, derived from the tool's argument model (required inputs, at-least-one-of inputs, constraints) |
+| `output_schema` | JSON schema of the result data (checked against real tool results in tests) |
+| `risk` | `read`, `write` or `destructive` (destructive operations always need approval) |
+| `requires_approval`, `approval_reason` | Whether the policy gate always pauses before the operation |
+| `approval_condition` | Approval required only for some arguments, described in words (for example closing a ticket) |
+| `retry_safe` | Whether a transient failure may be retried within the per-step budget |
+| `idempotency` | `not_required` (reads), `keyed_transaction` (company writes keyed by `task_id:step_id` in the same SQLite transaction), `deterministic_overwrite` (file writes) |
+| `mutates` | `none`, `company` or `workspace` |
+| `verification` | `none`, `employee_fields`, `ticket_record`, `file_content`, `ticket_fields`, `ticket_assignment`, `customer_record` or `employee_status` |
+| `preconditions` | Human-readable conditions the tool enforces |
+
+The thirteen registered operations:
+
+| Operation | Risk | Approval | Retry-safe | Idempotency | Mutates | Verification |
+|-----------|------|----------|------------|-------------|---------|--------------|
+| `company_api.get_employee` | read | no | yes | not_required | none | none |
+| `company_api.update_employee` | write | **yes** | yes | keyed_transaction | company | employee_fields |
+| `company_api.find_customer` | read | no | yes | not_required | none | none |
+| `company_api.create_ticket` | write | no | yes | keyed_transaction | company | ticket_record |
+| `company_api.get_ticket` | read | no | yes | not_required | none | none |
+| `company_api.list_tickets` | read | no | yes | not_required | none | none |
+| `company_api.update_ticket` | write | **when closing** | yes | keyed_transaction | company | ticket_fields |
+| `company_api.assign_ticket` | write | no | yes | keyed_transaction | company | ticket_assignment |
+| `company_api.create_customer` | write | **yes** | yes | keyed_transaction | company | customer_record |
+| `company_api.deactivate_employee` | destructive | **yes** | yes | keyed_transaction | company | employee_status |
+| `file.read` | read | no | yes | not_required | none | none |
+| `file.write` | write | no | yes | deterministic_overwrite | workspace | file_content |
+| `file.list` | read | no | yes | not_required | none | none |
+
+The five operations added in v0.3.0 reject any argument they do not declare (their
+input schemas set `additionalProperties: false`) and validate identifier formats
+(`T-<n>`, `E-<n>`, `C-<n>`). The original eight keep their v0.2.0 argument handling.
+
+An operation that is not registered has no capability and therefore no permissions:
+it is never classified as a read, never retry-safe, rejected by plan validation and by
+the tool's argument schema, and absent from discovery.
+
+`GET /api/v1/capabilities` returns `{"schema_version": "1", "capabilities": [...]}` with
+the fields above for the operations of the tools the runtime registers, in the order
+shown. The response is static: it is built from the tools' argument models, not from
+tool instances or settings, so it contains no filesystem paths, secrets, configuration
+or task data. Like `/api/v1/scenarios` it needs no demo session, and the `Host`
+allowlist and rate limits apply.
+
+**What it is not:** the registry describes the existing deterministic runtime. With
+dynamic planning disabled (the default), the mock planner still accepts only its two
+goal formats. Optional LLM planning for a [trusted intent catalog](#dynamic-llm-planning)
+is feature-flagged and still cannot expand authorization. Generic replanning and
+unrestricted natural-language autonomy are out of scope. Step-output references
+(below) work for both explicit plans and accepted dynamic plans.
+
+## Dynamic LLM planning
+
+Feature flag (default off):
+
+```bash
+AAE_DYNAMIC_PLANNING_ENABLED=false
+```
+
+| Mode | Behavior |
+|------|----------|
+| **Disabled (default)** | Identical to prior releases: only the two deterministic mock goal contracts; no external provider calls from CLI/API planning. |
+| **Enabled** | Goals matching the trusted intent catalog (or the original two mock scenarios) may produce plans via `DynamicPlanner`. Unsupported goals fail closed. Authorization never falls back to a permissive planner. |
+
+### Trusted goal intents
+
+Intent parsing is **deterministic and independent of the LLM**. Entity IDs and bounded
+fields are taken from the matched grammar. Ambiguous or vague goals are rejected.
+
+Supported when the flag is on (in addition to the original two mock scenarios):
+
+- List open high-priority tickets
+- List / retrieve / get tickets for customer `C-<id>`
+- Create a support ticket for customer `C-<id>` about `<subject>`
+- Mark ticket `T-<id>` as `<status>` (or update ticket status to …)
+- Assign ticket `T-<id>` to [eligible Support] employee `E-<id>`
+- Update employee `E-<id>` title to `<title>`
+- Create a new customer named … at company … with email … and a welcome ticket
+- Assign up to N open or in-progress priority tickets to an explicit employee
+- Mark two or more explicit tickets as an explicit status
+- List up to N tickets with an explicit status and priority
+
+The three collection grammars are planned deterministically. The configured
+provider is not asked to invent their steps, filters, bounds or identities.
+Other catalog intents still use the provider when the flag is on.
+
+Excluded on purpose (cannot be safely authorized from text alone): unrestricted
+searches, "assign all", missing bounds, department transfers without explicit
+fields, `deactivate_employee`, and any goal that would require inventing entity IDs.
+
+### Planner interface
+
+`DynamicPlanner` accepts the original goal (as a trusted `InterpretedGoal`), the
+independently derived `AuthorizationScope`, capability descriptions filtered to that
+scope, typed argument schemas, `$ref` syntax, and plan limits. It returns a structured
+`Plan` compatible with the existing Pydantic models. Provider adapters implement
+`LLMClient`; tests use `MockLLMClient` canned plans or scripted doubles. Live xAI is
+optional via `LLM_PROVIDER=xai` and `XAI_API_KEY` when the flag is on — unit tests
+never call the network.
+
+Provider knobs (ignored when dynamic planning is disabled):
+`LLM_REQUEST_TIMEOUT_SECONDS`, `LLM_MAX_TOKENS`, `LLM_MAX_RESPONSE_BYTES`,
+`LLM_MAX_PROVIDER_RETRIES`. Missing credentials still allow disabled-mode operation;
+enabled mode with `LLM_PROVIDER=xai` and no key fails closed with a classified error
+(no secret leakage).
+
+### Validation and authorization sequence
+
+1. Parse provider JSON into a strict plan draft (`extra=forbid`)
+2. Validate against the plan schema and tool registry
+3. Validate dependencies and typed `$ref`s
+4. Validate capability argument contracts
+5. Run goal-scoped `authorize_plan`
+6. Enforce plan budgets from the trusted scope
+7. Reject the **entire** plan if any check fails — no partial execution, no automatic
+   approval of mutations, no silent repair of unauthorized plans
+
+Prompt-injection text in the user goal fails the trusted grammar. Malicious plan JSON
+(extra operations, expanded entities, raised budgets) is rejected by the same
+deterministic checks — system-prompt wording is not the safety boundary.
+
+### Example (mocked LLM, no API key)
+
+```bash
+AAE_DYNAMIC_PLANNING_ENABLED=true \
+LLM_PROVIDER=mock \
+uv run python -m app.cli run 'List open high-priority tickets.'
+```
+
+### Limitations
+
+Not every natural-language goal is supported. There is no unrestricted goal
+interpretation, shell execution, or public plan-submission endpoint. The three
+bounded collection grammars below are API and CLI workflows. Arbitrary
+collection plans are not. Automatic replanning is a separate opt-in and does
+not widen those plans. See also [Limitations](#limitations).
+
+## Authorization hardening (per-step shapes)
+
+Every executable step must **independently** satisfy the authorization constraints
+for its operation. A constrained argument present on one step does not authorize a
+sibling step that omits it.
+
+- Flat `constraints` are an AND map: every listed argument must be present and valid
+  on that step.
+- `constraint_alternatives` is an OR of complete `ConstraintShape` objects for
+  operations that legitimately have more than one argument form (for example
+  `find_customer` by `company` vs by `customer_id`). A step must fully match one
+  shape.
+- Empty alternative shapes are forbidden.
+- Plan-time and runtime enforcement are aligned. `$ref` and `$collection_item`
+  placeholders count as presence; concrete membership / equality is checked after
+  binding.
+- Fingerprints omit empty `constraint_alternatives` so older persisted scopes remain
+  stable.
+
+## Bounded collection workflows
+
+**Status:** three natural-language workflows are available through the API and CLI
+when `AAE_DYNAMIC_PLANNING_ENABLED=true`. They use this collection engine. The
+engine also still accepts explicit in-process plans. Neither path is a general
+loop. Automatic replanning is a separate flag and is off by default. The dashboard
+renders `collection_progress` from the API when a task has a collection. Not a
+production-ready autonomous product.
+
+### API and CLI grammars
+
+The whole request must match. Extra sentences, missing bounds, missing filters
+and invented ids are rejected before a task exists. The bound is an explicit
+integer from 1 to 20 (the default collection limit, also capped by the hard
+ceiling of 50). Examples use seeded fixture ids:
+
+```text
+python -m app.cli run "Assign up to 2 open high-priority tickets to employee E-40."
+python -m app.cli run "Mark tickets T-10002 and T-10004 as resolved."
+python -m app.cli run "List up to 5 open high-priority tickets."
+python -m app.cli run "Mark tickets T-10009 and T-10010 as closed."
+```
+
+Set `AAE_DYNAMIC_PLANNING_ENABLED=true`. `LLM_PROVIDER` is not consulted for
+these four sentences; a mock or xAI provider is used only for the other catalog
+intents. `AAE_REPLANNING_ENABLED` is independent and stays off unless set.
+
+| Grammar | Plan | Authority |
+| --- | --- | --- |
+| Assign up to N `<open\|in_progress>` `<priority>`-priority tickets to employee `E-<id>` | `list_tickets`, then one `assign_ticket` collection template | Filters, limit, offset 0 and employee id are exact. Ticket ids must come from that sealed snapshot. At most N assignments. |
+| Mark tickets `T-<id>` and `T-<id>` as `<status>` | One ordinary `update_ticket` step per id | Only those ids, only that status. At least two unique ids, at most 20. |
+| List up to N `<status>` `<priority>`-priority tickets | One `list_tickets` step | Read only. `max_mutations` is 0. |
+
+`open` cannot move directly to `closed`. The company tool rejects that
+transition and does not write the ticket. Setting status to `closed` from
+`resolved` asks for approval; assignment and a non-closing status change do
+not. Independent verification is the only thing that marks a collection item
+`verified`. An empty assignment selection does not assign anyone; the task
+fails closed because the unused mutation step was skipped.
+
+`status` and `history` show per-item progress and the ticket ids a list call
+actually returned. The task-detail JSON adds `collection_progress` and each
+tool call's `result`. The dashboard renders those fields as text.
+
+What remains library-only: choosing an arbitrary collection path, item field or
+iteration expression. A replan cannot add those.
+
+Registered collection source today: `company_api.list_tickets` only.
+
+Contract (`app/models/collections.py`):
+
+- Ordered `CollectionSnapshot` sealed from a successful list call (max 50 items;
+  default limit 20). Snapshots are persisted on `ExecutionState.collections`.
+- Unique `item_id` values; duplicates dropped and recorded.
+- Typed `$collection_item` placeholders in plan arguments (not JSONPath).
+- `PlanStep.collection` declares selection (`first_n` or `explicit_ids`) and
+  `max_items`. The runtime seals the snapshot and saves it before replacing the
+  template, authorizes the expanded plan, then persists that plan and executes
+  each item with normal approval, idempotency and verification.
+- `FromCollectionConstraint` authorizes item ids only if they appear in the sealed
+  snapshot for `source_step_id` — appearing in a live query is not enough.
+
+**Progress:** `collections.progress` is a projection of the linked plan step, the
+task approval and independent verification. It is rewritten on every state save
+and again when a task is loaded, so a restart cannot leave an item looking
+successful when the step or the verifier does not. Status values:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Not started |
+| `running` | Step execution has started |
+| `awaiting_approval` | This item is the pending approval |
+| `completed` | Step finished; verification has not passed |
+| `verified` | Step finished and independent verification passed |
+| `failed` | Execution failed, or verification failed after execution |
+| `rejected` | Approval for this item was rejected |
+| `skipped` | Step was skipped |
+
+A model reply is never treated as success. `verified` is set only when
+`verification_status` is `passed`.
+
+## Bounded replanning
+
+**Status:** opt-in executor behavior. Default off. The CLI, API and dashboard
+do not expose a replan control. Not production-ready.
+
+```bash
+AAE_REPLANNING_ENABLED=false
+# AAE_MAX_REPLAN_ROUNDS=2
+```
+
+`AAE_REPLANNING_ENABLED=false` is the default. The executor does not call the
+provider and does not change the plan. A direct `Replanner` call fails closed
+unless the caller passes a `ReplanEnablement` built from validated settings
+(`ReplanEnablement.from_settings` / `enablement_for_runtime`). Independent of
+dynamic planning. The dashboard shows the persisted replan events and cannot
+change this flag.
+
+When the flag is on, the existing executor may replace **remaining** work after
+exactly these tool failures:
+
+| Trigger | Failure | Message the tool must return |
+| --- | --- | --- |
+| `ticket_state_conflict` | invalid arguments | contains `cannot change from` |
+| `ticket_state_conflict` | policy blocked | contains `only open or in-progress tickets can be assigned` |
+| `entity_missing_transient` | unexpected environment | starts with `Ticket not found:` |
+
+Anything else fails the task with no provider call. That includes authorization
+denials, approval rejection, budget exhaustion, malformed plans, verification
+failures, inactive employees, the wrong department, a missing employee, and a
+generic `invalid_args` or `policy_blocked` message.
+
+Rules:
+
+- The task's original `AuthorizationScope` is authoritative. A wider scope object
+  passed by the caller is ignored.
+- `AAE_MAX_REPLAN_ROUNDS` (0–5, default 2) is copied onto the task as
+  `replan_limit` at creation. Restart keeps that limit and `replan_count`.
+  A later caller cannot raise either above the persisted values, and cannot
+  raise the limit above the trusted enablement cap.
+- Completed steps are retained. The effective plan is those steps plus the
+  replacement, with each collection template counted as its expansion (the
+  sealed selection, or the declared upper bound when no snapshot exists yet).
+  That total must fit the original `max_steps`. Historical tool-call attempts
+  and historical mutating attempts (from capability `mutating` metadata,
+  including failures) stay consumed. A proposal that would exceed any original
+  budget is rejected and not installed.
+- An accepted revision is installed only by `commit_replan`, which re-reads
+  the last committed task and writes the new plan together with
+  `replan.proposed` and `replan.accepted` in one transaction. A rejected
+  proposal writes `replan.proposed` and `replan.rejected` and consumes one
+  round. `replan.exhausted` is written when the round cap has already been
+  reached, and that write does not consume another round. A concurrent commit
+  that lost the race writes nothing and returns `rejected:stale_revision`.
+  `save_state` and `save_state_and_events` refuse a change to the replan
+  counters, the authorization fingerprint, or the step-id sequence (a
+  collection expansion is the one ordinary step-id change they still allow).
+  An edit that keeps the same step ids can still be saved and is authorized
+  again before it runs. `apply_replan` only changes the in-memory copy.
+- Event metadata is task id, revision, trigger, plan identities, authorization
+  outcome, budget figures and a short reason. It does not include prompts,
+  secrets or raw tool payloads.
+- A changed mutation does not keep an earlier approval. Closing a ticket still
+  asks for a fresh approval. Rejecting that approval aborts the task and does
+  not ask the provider again. Replacement outcomes go through the same
+  independent verifier as any other step.
+- A proposal that repeats the unfinished steps is `rejected:no_progress`.
+- Provider output is untrusted structured JSON with the existing timeout and
+  size bounds (mocked in tests). The model cannot set authorization or the
+  verification result. Replacement steps are stored as pending.
+
+## Step-output references
+
+Later plan steps can consume earlier tool results with an explicit typed reference
+object. There is no string templating, JSONPath, expression language or iteration.
+
+### Syntax
+
+Anywhere inside a step's `arguments` except the `operation` key:
+
+```json
+{
+  "$ref": {
+    "step_id": "create_customer",
+    "path": ["customer", "customer_id"]
+  }
+}
+```
+
+- The object has exactly one key, `$ref`. Its value has exactly `step_id` and `path`.
+  Any other shape that contains `$ref` is rejected, so `$ref` is reserved as a
+  dictionary key in arguments.
+- `path` addresses the producer step's successful tool result `data`: 1–8 segments.
+  Each segment is either an identifier (`[A-Za-z][A-Za-z0-9_]{0,63}`, never starting
+  with `_`) for a dictionary key, or an integer `0`–`99` for a list index.
+- Strings are never interpreted: `"$ref"` or `"{{step_1.customer}}"` stay literal text.
+- The substituted value keeps its JSON type (string, number, object, array, boolean).
+
+### Example (customer → welcome ticket)
+
+```json
+[
+  {
+    "step_id": "create_customer",
+    "tool_name": "company_api",
+    "arguments": {
+      "operation": "create_customer",
+      "name": "Iris Novak",
+      "company": "Lumen Studios",
+      "email": "iris@lumen.example"
+    }
+  },
+  {
+    "step_id": "welcome",
+    "tool_name": "company_api",
+    "arguments": {
+      "operation": "create_ticket",
+      "customer_id": {
+        "$ref": { "step_id": "create_customer", "path": ["customer", "customer_id"] }
+      },
+      "subject": "Welcome to CentrAlign",
+      "description": "Onboarding call and account setup.",
+      "priority": "low"
+    }
+  }
+]
+```
+
+`create_customer` still pauses for approval. After it succeeds, the runtime reads the
+persisted `customer.customer_id` and runs `create_ticket` with that concrete value. The
+plan itself is never rewritten.
+
+### Static validation
+
+At plan creation the validator rejects missing / forward / self references, circular
+dependencies, malformed paths, `$ref` on `operation`, and destinations whose input
+schema cannot accept the producer capability's declared output type when that type is
+known. When the output schema is free-form, type checks are deferred to execution.
+Literal-only plans (including both mock-planner scenarios) are unchanged.
+
+### Runtime resolution
+
+Before the approval gate and before every tool attempt (including retries):
+
+1. Load the step's declared arguments (with any `$ref` objects still in place).
+2. Resolve each reference from exactly one successful tool call of a completed earlier
+   step. Failed, pending, interrupted or missing outputs are typed failures
+   (`missing_info` / `invalid_args` / `environment_unexpected`); null and empty strings
+   are never substituted.
+3. Validate the fully resolved arguments against the tool's argument schema.
+4. Persist the resolved arguments (and a description of which references were used) on
+   the tool-call record. The original plan stays immutable.
+
+### Approval, fingerprints and idempotency
+
+- Approval is evaluated on resolved arguments. The pending-action fingerprint covers
+  the exact tool and resolved arguments the human saw.
+- If a re-resolve would change the action (for example after a producer output was
+  altered), a stale approval is replaced and a changed prior attempt refuses to reuse
+  the step's `task_id:step_id` idempotency key.
+- Retries and crash recovery keep the same key and the same resolved arguments when
+  producer outputs are unchanged.
+
+### Verification
+
+For mutating steps that used references, the verifier checks that the world change
+matches the resolved arguments (for example the ticket's `customer_id` is the one
+produced by the earlier step) and that required approval covered that exact action.
+Unsupported criteria still fail; read-only tasks remain `unverified`.
+
+### Limits
+
+- Explicit plans only; the mock planner does not emit references.
+- No generic iteration over a listing (W6 still needs the caller to pick concrete
+  tickets).
+- No filesystem, environment, private-attribute or code access through paths.
+- No public HTTP endpoint for submitting arbitrary plans.
+
+## Goal-scoped plan authorization
+
+Authorization answers **what the task is permitted to do**. It is separate from
+human approval (whether a gated action should run) and from independent verification
+(what actually happened). A technically valid plan is still rejected if any operation,
+entity, field mutation or execution volume falls outside the independently granted
+scope.
+
+This is **not** an LLM-autonomous system. Scopes come from trusted deterministic
+origins; the planner cannot grant or expand permissions.
+
+### Authorization contract
+
+Each task persists a versioned `AuthorizationScope` (`version: 1`) with:
+
+| Field | Meaning |
+|-------|---------|
+| `allowed_operations` | Explicit `tool.operation` allowlist (e.g. `company_api.create_ticket`) |
+| `constraints` | Per-operation argument constraints |
+| `budgets` | `max_steps`, `max_mutations`, `max_tool_calls` |
+
+Supported constraint types (fail-closed on anything else; no regex or executable
+policy language):
+
+- `exact` — argument must equal a concrete value
+- `allowed_values` — argument must be one of a fixed set
+- `int_range` — inclusive integer bounds
+- `field_keys` — dictionary payloads (e.g. `fields`) may contain only listed keys
+- `from_step_output` — argument must equal a prior authorized step's successful output
+  path (narrow W8-style binding, not a wildcard entity permission)
+
+Unknown operations and unsupported constraint types are denied.
+
+### Trusted scope origin
+
+| Path | How scope is established |
+|------|--------------------------|
+| CLI / HTTP API | Derived from the deterministic mock goal grammar (`parse_supported_goal`), **not** from planner output or the request body |
+| Explicit internal plans (tests) | Independently supplied at `create_task`; test-only `tests.authz_support.matching_scope_for_plan` may build a matching narrow scope. Production never imports that helper; the planner never supplies a scope |
+| Legacy tasks without a persisted scope | Mapped only for the two known mock scenarios from trusted persisted goal text; otherwise fail closed |
+
+The public API does **not** accept a caller-provided scope. Plans cannot declare their
+own permissions. LLM text and tool observations cannot increase authority. After task
+creation the scope is immutable (no public re-authorization path in this milestone).
+
+### Plan-time enforcement
+
+Before a task is persisted, the entire plan is checked against the scope:
+
+- every operation is allowed and registered
+- literal arguments satisfy constraints
+- `$ref`-bearing arguments are **not** treated as authorized concrete values; concrete
+  checks run after binding (except a plan `$ref` that exactly matches a
+  `from_step_output` constraint)
+- step count and planned mutating steps fit budgets
+
+Failures use reason code `PLAN_UNAUTHORIZED` (or `BUDGET_EXCEEDED` /
+`UNKNOWN_OPERATION` / `UNSUPPORTED_CONSTRAINT`). Nothing is executed.
+
+### Runtime enforcement
+
+After `$ref` resolution and schema validation, immediately before approval and every
+tool attempt (retries and resume included):
+
+1. Load the trusted persisted task scope (fingerprint-checked).
+2. Authorize the exact resolved operation and arguments.
+3. Enforce tool-call and mutation budgets from durable `tool_calls` records.
+4. Then evaluate approval, fingerprint, and invoke the tool.
+
+Bypassing via direct executor use, retry, approval continuation, restart, or reference
+resolution is refused by the same gate. Denials use `ACTION_UNAUTHORIZED` /
+`BUDGET_EXCEEDED` / `MALFORMED_AUTHORIZATION` and failure type `unauthorized`.
+
+### `$ref` interaction
+
+A reference is never authorized solely because the destination operation is allowed.
+The resolved value must satisfy the scope (e.g. ticket creation for `C-1001` only).
+W8 uses `from_step_output` so a welcome ticket may use only the customer ID produced by
+the authorized `create_customer` step.
+
+### Approval interaction
+
+**An approver cannot approve an action outside the task scope.** Authorization failure
+prevents creating or continuing an approval. A valid fingerprint does not override
+entity or field constraints. Reapproval does not expand the task scope. Stale-approval
+protections from earlier milestones remain.
+
+### Budget semantics
+
+| Budget | Counts |
+|--------|--------|
+| `max_steps` | Plan length (plan-time) |
+| `max_mutations` | Plan-time: number of mutating steps. Runtime: mutating tool-call **attempts** including failures and retries (reads do not count). Trusted default scopes size this as `mutating_steps × (1 + max_recovery_attempts)` so one authorized retry remains possible; the cap is still finite. |
+| `max_tool_calls` | Every recorded tool-call attempt (reads, writes, failures, retries). Authorization denials that never create a tool-call record fail the task instead of retrying. |
+
+Restarts cannot reset consumed budget (counters come from persisted `tool_calls`).
+Reusing an idempotency key does not bypass authorization. `ExecutionRuntime` takes the
+same OS-backed per-task lock as the CLI/API; callers that already hold that lock pass
+`execution_locked=True`. Direct concurrent runtime callers cannot overspend budgets
+across processes.
+
+### Persistence and audit
+
+Scope and its fingerprint are stored on `ExecutionState` in the existing SQLite
+`state_json` snapshot (additive; no demo-company rewrite). Audit events include
+`authorization.bound` and `authorization.denied` with reason codes; secrets and full
+private payloads are not logged. Corrupted or fingerprint-mismatched scopes fail closed.
+
+### Legacy compatibility
+
+Both original deterministic mock scenarios continue to work under scopes derived from
+their grammars. Unmappable legacy tasks fail closed rather than receiving unrestricted
+permissions.
+
+### Known limitations
+
+- No natural-language-general authorization: scopes come only from trusted grammars
+  (mock scenarios, dynamic intents when flagged, or trusted internal `create_task`).
+- No public plan-submission or self-granted permission endpoints.
+- No generic collection iteration or unbounded replanning. API and CLI collection
+  support is the three grammars in [Bounded collection workflows](#bounded-collection-workflows).
+  Automatic replanning is opt-in, off by default, and cannot widen a collection
+  scope. The dashboard has no replan control.
+- Constraint vocabulary is intentionally small and typed.
+- The LLM cannot create, widen, or replace an `AuthorizationScope`.
+
+## Company data model and demo company
+
+### Schema and migration
+
+The v0.3.0 company schema adds two columns to the v0.2.0 tables:
+
+- `company_employees.status`: `active` or `inactive` (default `active`, `CHECK`
+  constraint).
+- `company_tickets.assignee_id`: the assigned employee, or `NULL` (default). It
+  references `company_employees.employee_id`; employees are deactivated, never deleted,
+  so the reference never dangles.
+
+The sequence table `company_ticket_seq` gains a `customer` row, starting after the
+highest existing `C-<n>` (at least `C-1004`).
+
+The migration runs automatically whenever a database is opened and is additive and
+idempotent:
+- It never drops or rewrites columns, rows or identifiers, and it never re-seeds.
+- Existing employees become `active`; existing tickets stay unassigned.
+- Concurrent processes migrate once: the column check is repeated under an exclusive
+  write lock.
+
+Rollback limitations: there is no down-migration. v0.2.0 can still open an upgraded
+database, but it ignores employee status and assignments. Data written by v0.3.0 (new
+customers, assignments, inactive employees) is not undone.
+
+### Business rules
+
+| From status | Allowed new status |
+|-------------|--------------------|
+| `open` | `in_progress`, `resolved` |
+| `in_progress` | `open`, `resolved` |
+| `resolved` | `in_progress`, `closed` (closing needs approval) |
+| `closed` | none (terminal) |
+
+- **Ticket status:** setting a ticket's current status again is a no-op. Only status
+  and priority can be updated; any other field rejects the whole request.
+- **Assignment:** only `open` or `in_progress` tickets can be assigned, and only to an
+  active employee in Support. Reassigning replaces the previous assignee.
+- **New customers:** customers get the next `C-<n>`. Name, company and email are
+  required. The email is stored in lower case and must be unique, compared
+  case-insensitively.
+- **Deactivation:** an employee with any `open` or `in_progress` ticket assigned cannot
+  be deactivated. The error lists the tickets to reassign; nothing else is changed.
+  Deactivating an inactive employee changes nothing.
+- **Failure types:**
+  - Rule violations fail as `policy_blocked`; they are never retried.
+  - Invalid input or a disallowed transition fails as `invalid_args`.
+  - Unknown records fail as `environment_unexpected`.
+- **Verification:** each change re-reads the database. Ticket updates, assignments and
+  deactivations also compare every field that should not have changed against the
+  before-state recorded in the same transaction.
+
+### Demo company
+
+A deterministic, fictional company for exercising these operations, seeded into a
+separate database:
+
+```bash
+uv run python -m app.world.demo_fixture --database data/demo.db
+DATABASE_PATH=data/demo.db uv run aae-api
+uv run python -m app.world.demo_fixture --database data/demo.db --reset
+```
+
+Safety rules:
+- The seeder only writes to a new or empty file, or to a database it created itself
+  (marked by a `demo_fixture_meta` table).
+- It refuses any other database, including your normal `data/runtime.db`, even with
+  `--reset`.
+- Re-running it changes nothing; `--reset` recreates a marked demo database.
+- There is no HTTP endpoint for seeding or resetting.
+
+Contents: 20 employees, 10 customers and 60 tickets; the next ticket is `T-10061` and
+the next customer `C-1011`. Totals by group:
+
+| Group | Breakdown |
+|-------|-----------|
+| Departments | Support 7, Engineering 4, Product 3, Finance 3, Operations 3 |
+| Ticket status | open 22, in_progress 11, resolved 16, closed 11 |
+| Ticket priority | low 15, medium 18, high 14, urgent 13 |
+
+The default records (E-17, E-23, E-31, C-1001–C-1003) are included unchanged, so both
+mock goals work on it.
+
+| Scenario | Records |
+|----------|---------|
+| High-priority unassigned open tickets | `T-10001`–`T-10004` |
+| Globex (`C-1002`) open low/medium tickets to escalate | `T-10005`–`T-10008` |
+| Resolved tickets eligible for closing | `T-10009`–`T-10012` |
+| Offboarding candidate with open tickets | `E-44` Rina Patel: `T-10013`–`T-10015` |
+| Duplicate-looking tickets (review only) | `T-10016`, `T-10017` |
+| Eligible assignees (active Support) | `E-31`, `E-40`–`E-44` |
+| Ineligible assignees | `E-45` (inactive; only a closed ticket), everyone outside Support |
+
+### Workflow readiness
+
+`tests/test_business_workflows.py` exercises ten workflows on the demo company.
+
+| Workflow | Status | What works today | Blocked until later milestones |
+|----------|--------|------------------|--------------------------------|
+| W1 Change an employee title | Supported | Natural-language goal (mock format A), approval, verification | — |
+| W2 Create a billing discrepancy ticket | Supported | Natural-language goal (mock format B), verification | — |
+| W3 Transfer an employee between departments | Operations supported | Explicit `update_employee` plan with approval | Dynamic NL (department field not in title intent) |
+| W4 Correct an employee email | Operations supported | Explicit plan; a duplicate email fails with no change | Dynamic NL (email updates not catalogued) |
+| W5 Resolve or close a ticket | Operations supported | Allowed transitions; closing paused for approval | Dynamic NL for status updates when flag on |
+| W6 Escalate matching customer tickets | Partial | `list_tickets` and per-ticket `update_ticket`; `$ref` can bind one listed ticket | Generic iteration over a listing's output |
+| W7 Assign a ticket to a support engineer | Supported when dynamic planning is on | Eligibility rules enforced and verified; trusted assign intent | Flag off → explicit plan only |
+| W8 Create a customer and welcome ticket | Supported (explicit plan; dynamic when flag on) | `$ref` binds the new `customer_id` into `create_ticket`; approval and verification | — |
+| W9 Produce a daily ticket summary | Partial | Counts match an independent recount; summary file verified | Writing content derived from a listing |
+| W10 Deactivate an employee safely | Partial | Refusal with open tickets; reassign, then deactivate with approval | Finding and reassigning blocking tickets automatically |
+
+W8 is covered end-to-end by `tests/test_reference_execution.py` and, with the feature
+flag, by `tests/test_dynamic_planning.py`. Other partial workflows may still pass
+earlier results between steps in the test harness when the scenario needs iteration
+the runtime does not provide.
 
 ## Local mode and public demo mode
 
@@ -268,10 +1063,19 @@ erased. Public demo data is fictional and may be reset at any time.
 
 Enforced on the server, in both modes:
 
-- Tasks come only from goals accepted by the strict mock grammar. There is no endpoint
+- Tasks come only from goals accepted by the strict mock grammar (and, when enabled,
+  the trusted dynamic intent catalog). There is no endpoint
   that runs a tool, plan, shell command or file write directly.
+- Each task is bound to a [goal-scoped authorization](#goal-scoped-plan-authorization)
+  contract derived from that grammar (not from the planner or the caller). Plans and
+  resolved actions outside the scope fail closed before side effects; approval cannot
+  expand the scope.
 - The approval policy pauses `company_api.update_employee` (and any destructive tool)
-  before it runs. Approval requires `confirm: true` and the exact pending `step_id`.
+  before it runs. Approval requires `confirm: true` and the exact pending `step_id`, and
+  is bound to a fingerprint of the exact action; it is re-checked immediately before
+  every tool call, so a changed action is never executed on an old approval.
+- Only operations in the capability registry have permissions; anything else is
+  rejected before it can run.
 - Workspace reads accept only plain relative names that the sandboxed file tool lists;
   traversal, absolute paths, escaping symlinks and database files are refused.
 - The `Host` header must be on the allowlist (blocks DNS rebinding of the localhost
@@ -317,6 +1121,8 @@ See `.env.example`. Settings are read from the environment and an optional `.env
 | `WORKSPACE_PATH` | File tool sandbox (default `workspace`) |
 | `MAX_RECOVERY_ATTEMPTS` | Retries allowed after a step's first attempt (default `2`) |
 | `LLM_PROVIDER`, `XAI_API_KEY`, `XAI_MODEL`, `XAI_BASE_URL` | Provider settings for library use; ignored by the CLI and the API |
+| `AAE_REPLANNING_ENABLED` | Default `false`. When `true`, the executor may replan only the supported ticket conflicts in [Bounded replanning](#bounded-replanning). Not a CLI, API or dashboard control |
+| `AAE_MAX_REPLAN_ROUNDS` | Default `2`, valid range 0–5. Copied onto each new task as `replan_limit` and kept across restart |
 
 Never commit `.env` or real secrets.
 
@@ -342,8 +1148,8 @@ macOS, file ownership and lock behaviour on shared folders have not been verifie
 To try public mode locally the way Render runs it:
 
 ```bash
-docker build -t aae-runtime:0.2.0 .
-docker run --rm -p 127.0.0.1:10000:10000 --memory 512m --cpus 0.1 --read-only --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges -e APP_MODE=public -e PORT=10000 -e ALLOWED_HOSTS=127.0.0.1,localhost -e SESSION_COOKIE_SECURE=false aae-runtime:0.2.0
+docker build -t aae-runtime:0.3.0 .
+docker run --rm -p 127.0.0.1:10000:10000 --memory 512m --cpus 0.1 --read-only --tmpfs /tmp:rw,size=64m --cap-drop ALL --security-opt no-new-privileges -e APP_MODE=public -e PORT=10000 -e ALLOWED_HOSTS=127.0.0.1,localhost -e SESSION_COOKIE_SECURE=false aae-runtime:0.3.0
 ```
 
 ## Deploying the public demo on Render Free
@@ -380,8 +1186,17 @@ one instance.
 
 ## Limitations
 
-- **Mock planner only.** Exactly two goal formats; no live LLM planning. `--provider xai`
-  is refused by the CLI and `LLM_PROVIDER` does not affect the CLI or the API.
+- **Not LLM-autonomous by default.** With `AAE_DYNAMIC_PLANNING_ENABLED=false`
+  (default), exactly two mock goal formats apply and no external planner calls are
+  made. With the flag enabled, only the [trusted intent catalog](#dynamic-llm-planning)
+  is accepted; authorization is still independently granted from those grammars, not
+  from free-form model text. The three collection grammars do not call the provider
+  at all. Other catalog intents use `LLM_PROVIDER` (`mock` by default). The CLI
+  still refuses `--provider xai`; set `LLM_PROVIDER=xai` (with `XAI_API_KEY`) when
+  the flag is on if you want the live adapter for those other intents. Unit tests
+  never make live provider calls. Automatic replanning stays off unless
+  `AAE_REPLANNING_ENABLED` is set, and then only for the supported ticket
+  conflicts. It cannot grant authorization or mark verification passed.
 - **Fictional world.** The company API, employees, customers and tickets are a seeded
   SQLite mock; there are no real integrations.
 - **Locks protect cooperating processes only** (the CLI and the API). Code that calls
@@ -392,8 +1207,21 @@ one instance.
 - **Public demo state is ephemeral and single-instance** (see above). Rate limits are in
   memory; behind Render's proxy all clients may share one rate-limit key if the last
   forwarded hop is a proxy address, which makes limits stricter, not looser.
-- **No accounts or roles.** Local mode trusts whoever can reach localhost. In public mode
-  the session that creates a task is the one that approves it.
+- **No accounts or roles.** Local mode trusts whoever can reach the local API. In
+  public mode the session that creates a task is the one that approves it. A missing
+  approval fingerprint is still accepted so the documented CLI and API bodies keep
+  working. The dashboard sends the fingerprint it showed. There is no public
+  user-account system in this release.
+- **Local bind misconfiguration.** Default `APP_HOST` is `127.0.0.1`. The Docker
+  image sets `APP_HOST=0.0.0.0` so the process can listen inside the container;
+  compose still publishes only on `127.0.0.1`. If you bind local mode to a
+  non-loopback address on a shared network while keeping localhost Host names
+  allowed, remote clients that send `Host: 127.0.0.1` can reach the
+  unauthenticated local API. Prefer loopback on the host, or `APP_MODE=public`
+  with `ALLOWED_HOSTS` for any network-facing demo.
+- **Scripted plans are tests.** `AAE_TEST_SCRIPTED_PLAN` replaces the provider only
+  when `AAE_TEST_MODE=1` as well. Do not set either on a shared server. Those
+  responses are not live model reasoning.
 - **Approver identity** is a label (`local-dashboard`, `demo-session:<id>`, `cli:<user>`),
   not an authenticated person.
 - **Interrupted writes** are re-invoked with the same idempotency key within the retry
@@ -404,16 +1232,30 @@ one instance.
 ## How it works
 
 ```text
-Goal → mock interpreter (strict grammar) → plan validated against the tool registry
-     → policy gate (approval for employee writes) → tool calls with bounded retry
+Goal → trusted grammar (mock scenarios and/or dynamic intents)
+     → independently derived authorization scope
+     → plan (mock planner, or DynamicPlanner proposal when flag enabled)
+     → validate schema / refs / capabilities → authorize_plan
+     → resolve $ref arguments from earlier step outputs
+     → authorize resolved action → policy gate (HITL) → tool calls with bounded retry
      → independent verification of database + workspace → COMPLETED / FAILED
 ```
 
-- **Human-in-the-loop:** the pending action is persisted, so approval works across
-  restarts and processes. Approving twice, or after a rejection, is refused.
+- **Authorization:** independently granted scope checked at plan time and again after
+  every reference binding, before approval and each tool attempt. See
+  [Goal-scoped plan authorization](#goal-scoped-plan-authorization).
+- **Step-output references:** explicit plans may declare `$ref` bindings; they are
+  resolved before authorization, approval and every attempt. See [Step-output references](#step-output-references).
+- **Human-in-the-loop:** the pending action and its fingerprint are persisted, so
+  approval works across restarts and processes. Approving twice, after a rejection, or
+  for an action that has since changed is refused. Tasks persisted before fingerprints
+  existed are bound to the arguments recorded on their pending action. Approval never
+  overrides authorization.
 - **Independent verification:** completion is never based on tool responses alone. The
   verifier checks the requested and planned outcomes against the actual database and
-  files, and a task cannot complete while any step is unfinished.
+  files, and a task cannot complete while any step is unfinished. A criterion the
+  verifier cannot evaluate fails as `unsupported_criterion`; a task with no outcome to
+  check completes as `unverified`.
 - **Recovery:** failures are classified; only transient failures of retry-safe
   operations are retried, within the per-step budget.
 - **Idempotency:** company writes are recorded with a `task_id:step_id` key in the same
@@ -449,18 +1291,20 @@ app/
   api/        # v1 routes, service layer, sessions, request guard, errors, redaction
   web/        # live dashboard (index.html, app.css, app.js)
   llm/        # LLM clients; mock.py holds the strict two-goal grammar
-  planning/   # goal interpreter, planner, plan validation
+  planning/   # interpreter, mock/dynamic planners, trusted intents, validation
+  authz/      # goal-scoped authorization contract, trusted origin, plan/runtime gates
   runtime/    # ExecutionRuntime, recovery, audit event types, shared task locks
-  policy/     # approval policy
-  tools/      # company API tool, file tool, registry, failure injection
+  policy/     # approval policy (HITL; distinct from authorization)
+  tools/      # company API and file tools, capability registry, tool registry, failure injection
   verify/     # independent outcome verifier
   store/      # SQLite task state and audit events
-  world/      # mock company database and seed data
+  world/      # mock company database, additive migrations, seed data, demo_fixture.py
   models/     # domain models
 demo-ui/      # scripted simulation page (offline presentations only)
-docs/images/  # dashboard screenshots
-scripts/      # smoke_demo.py deployment check
+docs/         # local demo guide, storyboard, presentation drafts, screenshots
+scripts/      # demo_local.sh, smoke_demo.py
 tests/
+CHANGELOG.md  # release history
 render.yaml   # Render Free Blueprint (public demo)
 data/         # runtime database and locks (local, gitignored)
 workspace/    # file tool sandbox (local, gitignored)
@@ -468,9 +1312,14 @@ workspace/    # file tool sandbox (local, gitignored)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Demo recording and social drafts for
+maintainers live in [docs/DEMO_VIDEO_STORYBOARD.md](docs/DEMO_VIDEO_STORYBOARD.md)
+and [docs/RELEASE_PRESENTATION_DRAFTS.md](docs/RELEASE_PRESENTATION_DRAFTS.md)
+(drafts only — not published by this repository).
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). Third-party dependencies are licensed
-under their own terms.
+Licensed under the [Apache License 2.0](LICENSE). That license grants rights to
+use, modify and redistribute under its terms (including attribution and patent
+conditions). Third-party dependencies are licensed under their own terms. This
+preview makes no additional warranty of fitness for production use.

@@ -194,11 +194,11 @@
     verification: function (id, signal) {
       return request("GET", "/api/v1/tasks/" + encodeURIComponent(id) + "/verification", undefined, { signal: signal });
     },
-    approve: function (id, stepId) {
-      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/approve", { step_id: stepId, confirm: true });
+    approve: function (id, stepId, fingerprint) {
+      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/approve", { step_id: stepId, fingerprint: fingerprint, confirm: true });
     },
-    reject: function (id, stepId, reason) {
-      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/reject", { step_id: stepId, reason: reason, confirm: true });
+    reject: function (id, stepId, reason, fingerprint) {
+      return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/reject", { step_id: stepId, reason: reason, fingerprint: fingerprint, confirm: true });
     },
     resume: function (id) {
       return request("POST", "/api/v1/tasks/" + encodeURIComponent(id) + "/resume", { confirm: true });
@@ -231,6 +231,8 @@
     poll: null,
     submitting: false,
     acting: false,
+    // Bumped for every confirm dialog open; stale closes cannot resolve a newer wait.
+    confirmEpoch: 0,
     pendingSubmit: null,
     worldTab: "employees",
     worldSeq: 0
@@ -244,9 +246,10 @@
     "runBtn", "newTaskBtn", "formMsg", "mRecovery", "mVerify", "mStatus", "mEvidence", "explainBox",
     "pipeline", "approvalCard", "apStep", "apOperation", "apRisk", "apReason", "apArgs", "rejectReason",
     "approveBtn", "rejectBtn", "approvalMsg", "timeline", "eventCount", "planList", "runtimeState",
-    "refreshTaskBtn", "resumeBtn", "taskMsg", "verificationPanel", "interpretedGoal", "taskList",
+    "refreshTaskBtn", "resumeBtn", "taskMsg", "verificationPanel", "interpretedGoal",
+    "collectionPanel", "replanPanel", "taskList",
     "refreshListBtn", "worldPanel", "refreshWorldBtn", "confirmDialog", "confirmTitle", "confirmBody",
-    "confirmDetail", "confirmCancel"
+    "confirmDetail", "confirmCancel", "confirmOk"
   ].forEach(function (id) { els[id] = $(id); });
 
   // --- Connection and session ------------------------------------------------------
@@ -284,7 +287,9 @@
 
   function renderSession() {
     var s = state.session;
-    els.modeNotice.textContent = s.notice;
+    els.modeNotice.textContent = s.notice +
+      " Automatic replanning is " + (s.replanning_enabled ? "enabled" : "off") +
+      " in server configuration. This page cannot change it.";
     els.modeNotice.className = "disclaimer" + (s.mode === "public" ? " public" : "");
     var needSession = s.mode === "public" && !s.authenticated;
     show(els.sessionCard, needSession);
@@ -366,7 +371,13 @@
         var button = el("button", {
           className: "ghost",
           text: scenario.title + (index > 0 ? " + note" : ""),
-          attrs: { type: "button", "aria-pressed": "false", "data-goal": goal, title: scenario.description }
+          attrs: {
+            type: "button",
+            "aria-pressed": "false",
+            "data-goal": goal,
+            "data-planning": scenario.planning || "mock",
+            title: scenario.description
+          }
         });
         button.addEventListener("click", function () {
           els.goalInput.value = goal;
@@ -414,10 +425,25 @@
     if (!injectable) els.injectToggle.checked = false;
   }
 
+  function approvalPending(task) {
+    // Approve/reject only for a durable pause: not mid-flight, status paused for
+    // approval, approval_status pending, and a concrete fingerprinted action.
+    // Matching the API's pending_action serialization (PENDING only) and the
+    // server-side wait_for(... and not executing) contract avoids advertising
+    // a ready control against a transitional revision the next GET will miss.
+    if (!task || task.executing) return null;
+    if (task.status !== "needs_approval") return null;
+    if (task.approval_status && task.approval_status !== "pending") return null;
+    if (!task.pending_action) return null;
+    var pending = task.pending_action;
+    if (!pending.step_id || !pending.fingerprint) return null;
+    return pending;
+  }
+
   function updateControls() {
     var blocked = !state.online || !hasAccess();
     els.runBtn.disabled = blocked || state.submitting;
-    var pending = state.task && state.task.pending_action;
+    var pending = approvalPending(state.task);
     els.approveBtn.disabled = blocked || state.acting || !pending;
     els.rejectBtn.disabled = blocked || state.acting || !pending;
     els.resumeBtn.disabled = blocked || state.acting;
@@ -528,12 +554,19 @@
   async function refreshTask(signal) {
     var id = state.taskId;
     if (!id) return true;
+    // Never let a poll overwrite task state while an approve/reject/resume is in
+    // flight — that raced with the confirmation dialog and disabled #approveBtn.
+    if (state.acting) return false;
     try {
       // Task first, then history: once the task reports it is no longer executing,
       // a history read that starts afterwards includes every event of that run.
       var task = await api.task(id, signal);
       var history = await api.history(id, signal);
-      if (state.taskId !== id) return true;
+      if (state.acting || state.taskId !== id) return true;
+      if (!task.data || !task.data.task_id || !history.data || !history.data.events) {
+        setMsg(els.taskMsg, "The server returned a response this page could not read.", "error");
+        return false;
+      }
       state.task = task.data;
       state.events = history.data.events;
       if (!state.online) setOnline(true);
@@ -541,9 +574,10 @@
       var settled = !t.executing && (!!TERMINAL[t.status] || t.status === "needs_approval" || t.resumable);
       if (settled) {
         var verification = await api.verification(id, signal);
-        if (state.taskId !== id) return true;
+        if (state.acting || state.taskId !== id) return true;
         state.verification = verification.data;
       }
+      if (state.acting) return false;
       renderTask();
       if (settled) {
         loadTaskList();
@@ -562,6 +596,7 @@
       }
       if (err.code === "network") {
         setOnline(false);
+        setMsg(els.taskMsg, "The backend did not answer. Press Refresh to try this task again.", "error");
         return false;
       }
       setMsg(els.taskMsg, err.message, "error");
@@ -594,8 +629,14 @@
     kvRows(els.runtimeState, [["task_id", null], ["status", null]]);
     clear(els.verificationPanel);
     els.verificationPanel.appendChild(el("div", { className: "empty", text: "Run or select a task to see its verification." }));
-    kvRows(els.interpretedGoal, [["objective", null], ["planner", "mock (deterministic; two supported goal formats)"]]);
+    kvRows(els.interpretedGoal, [["objective", null], ["planner", plannerLine()]]);
+    renderCollection(null);
+    renderReplan();
     els.approvalCard.classList.remove("visible");
+    els.approvalCard.setAttribute("data-approval-ready", "0");
+    els.approvalCard.setAttribute("data-task-id", "");
+    els.approvalCard.removeAttribute("data-pending-step");
+    els.approvalCard.removeAttribute("data-pending-fingerprint");
     show(els.resumeBtn, false);
     els.refreshTaskBtn.disabled = true;
     highlightTaskList();
@@ -616,6 +657,8 @@
     renderApproval(t);
     renderVerification(t);
     renderInterpreted(t);
+    renderCollection(t);
+    renderReplan();
     renderExplain(t);
     show(els.resumeBtn, !!t.resumable);
     updateControls();
@@ -629,7 +672,8 @@
       verification += " " + t.verification_checks_passed + "/" + t.verification_checks_total;
     }
     els.mVerify.textContent = verification;
-    els.mVerify.className = "v" + (t.verification_status === "passed" ? " ok" : t.verification_status === "failed" ? " bad" : "");
+    els.mVerify.className =
+      "v" + (t.verification_status === "passed" ? " ok" : t.verification_status === "failed" ? " bad" : t.verification_status === "unverified" ? " warn" : "");
     els.mStatus.textContent = t.status.toUpperCase();
     els.mStatus.className =
       "v" + (t.status === "completed" ? " ok" : t.status === "failed" || t.status === "aborted" ? " bad" : t.status === "needs_approval" ? " warn" : "");
@@ -678,6 +722,10 @@
     } else s.Adapt = TERMINAL[t.status] ? "skipped" : "pending";
     if (c["verification.passed"]) s.Verify = "success";
     else if (c["verification.failed"]) s.Verify = "failure";
+    else if (c["verification.unverified"]) {
+      s.Verify = "warning";
+      labels.Verify = "nothing to verify";
+    }
     else if (c["verification.started"]) s.Verify = "active";
     else s.Verify = TERMINAL[t.status] ? "skipped" : "pending";
     if (t.status === "completed") s.Complete = "success";
@@ -752,6 +800,11 @@
       case "verification.started": return "independent checks against the database and workspace";
       case "verification.check": return (r.passed ? "PASS " : "FAIL ") + str(r.name) + " — " + str(r.message);
       case "evidence.recorded": return str(r.type) + ": " + str(r.description);
+      case "replan.proposed":
+      case "replan.accepted":
+      case "replan.rejected":
+      case "replan.exhausted":
+        return "revision " + str(r.revision) + " · " + str(r.trigger) + " · " + str(r.outcome);
       case "verification.passed": return str(r.summary);
       case "verification.failed":
       case "TASK_FAILED": return str(f.message);
@@ -819,15 +872,26 @@
         status = "not executed";
       }
       els.planList.appendChild(
-        el("li", { className: cls, attrs: { "data-step-id": step.step_id, "data-status": step.status } }, [
+        el("li", {
+          className: cls,
+          attrs: {
+            "data-step-id": step.step_id,
+            "data-status": step.status,
+            "data-approval": approvalLabel(t, step)
+          }
+        }, [
           el("div", { className: "step-badge", text: String(i + 1) }),
           el("div", null, [
             el("div", { className: "title", text: step.step_id + ": " + step.description }),
             el("div", {
               className: "meta",
               text: str(step.tool) + " / " + str(step.operation) + " · " + status.toUpperCase() +
+                " · approval " + approvalLabel(t, step) +
                 " · " + step.attempts + " attempt" + (step.attempts === 1 ? "" : "s")
             }),
+            el("div", { className: "meta", text: "result: " + callSummary(latestCall(t, step.step_id)), attrs: { "data-result": step.step_id } }),
+            el("div", { className: "meta", text: "error: " + stepError(t, step.step_id) }),
+            el("div", { className: "meta", text: "verification: " + stepVerificationLabel(step.step_id), attrs: { "data-step-verification": step.step_id } }),
             details("arguments", step.arguments)
           ])
         ])
@@ -854,9 +918,17 @@
   }
 
   function renderApproval(t) {
-    var pending = t.status === "needs_approval" ? t.pending_action : null;
+    var pending = approvalPending(t);
     els.approvalCard.classList.toggle("visible", !!pending);
-    if (!pending) return;
+    els.approvalCard.setAttribute("data-approval-ready", pending ? "1" : "0");
+    els.approvalCard.setAttribute("data-task-id", t && t.task_id ? String(t.task_id) : "");
+    if (!pending) {
+      els.approvalCard.removeAttribute("data-pending-step");
+      els.approvalCard.removeAttribute("data-pending-fingerprint");
+      return;
+    }
+    els.approvalCard.setAttribute("data-pending-step", String(pending.step_id));
+    els.approvalCard.setAttribute("data-pending-fingerprint", String(pending.fingerprint));
     els.apStep.textContent = str(pending.step_id) + " · " + pending.tool;
     els.apOperation.textContent = str(pending.operation);
     els.apRisk.textContent = pending.risk;
@@ -883,10 +955,14 @@
       }
       return;
     }
+    panel.appendChild(el("p", {
+      className: "note",
+      text: "Independent verification reads the database and workspace. A model explanation is not a verification result."
+    }));
     panel.appendChild(
       el("div", { className: "kv" }, [
         el("div", { className: "k", text: "result" }),
-        el("div", { className: "v " + (v.status === "passed" ? "ok" : "bad"), text: v.status.toUpperCase() + " · " + v.checks_passed + "/" + v.checks_total + " checks", attrs: { "data-field": "verification_result" } }),
+        el("div", { className: "v " + (v.status === "passed" ? "ok" : v.status === "unverified" ? "warn" : "bad"), text: v.status.toUpperCase() + " · " + v.checks_passed + "/" + v.checks_total + " checks", attrs: { "data-field": "verification_result" } }),
         el("div", { className: "k", text: "summary" }),
         el("div", { className: "v", text: str(v.summary) })
       ])
@@ -939,8 +1015,184 @@
       ["entities", entities],
       ["required_info", g.required_information.join("; ")],
       ["success_criteria", criteria],
-      ["planner", "mock (deterministic; two supported goal formats)"]
+      ["planner", planningLabel(t.planning_source)]
     ]);
+  }
+
+  function plannerLine() {
+    if (state.session && state.session.dynamic_planning_enabled) {
+      return "mock for the two original goals; collection grammars are deterministic; other catalog goals use the configured provider";
+    }
+    return "mock (deterministic; two supported goal formats)";
+  }
+
+  function planningLabel(source) {
+    if (source === "trusted_collection") return "trusted collection plan (deterministic; the model did not choose the steps)";
+    if (source === "dynamic_catalog") return "catalog grammar; a model may have proposed the plan inside that grammar";
+    if (source === "mock") return "mock (deterministic; two supported goal formats)";
+    return plannerLine();
+  }
+
+  function latestCall(task, stepId) {
+    var found = null;
+    (task.tool_calls || []).forEach(function (call) {
+      if (call.step_id === stepId) found = call;
+    });
+    return found;
+  }
+
+  function callSummary(call) {
+    if (!call) return "no tool result yet";
+    if (call.error_message) return call.error_message;
+    var data = call.result && (call.result.data || call.result);
+    if (data && data.tickets) {
+      var ids = data.tickets.map(function (ticket) { return ticket.ticket_id; }).filter(Boolean);
+      return ids.length ? "tickets " + ids.join(", ") : "0 tickets";
+    }
+    if (data && data.ticket) {
+      return "ticket " + str(data.ticket.ticket_id) + " status " + str(data.ticket.status);
+    }
+    if (data && data.employee) return "employee " + str(data.employee.employee_id);
+    return call.status || "no tool result yet";
+  }
+
+  function stepError(task, stepId) {
+    var messages = (task.failures || []).filter(function (failure) {
+      return failure.step_id === stepId;
+    }).map(function (failure) { return failure.message; });
+    if (messages.length) return messages[messages.length - 1];
+    var call = latestCall(task, stepId);
+    return call && call.error_message ? call.error_message : "none";
+  }
+
+  function approvalLabel(task, step) {
+    // A task-wide approval_status must not mark steps that never required approval.
+    var awaiting = approvalPending(task);
+    if (awaiting && awaiting.step_id === step.step_id) {
+      return "Awaiting approval.";
+    }
+    var related = (state.events || []).filter(function (event) {
+      var type = String(event.event_type || "");
+      var result = event.result || {};
+      return type.indexOf("approval.") === 0 && result.step_id === step.step_id;
+    });
+    var latest = related.length ? related[related.length - 1].event_type : "";
+    if (latest === "approval.approved") return "Approved.";
+    if (
+      latest === "approval.rejected" ||
+      (task.approval_status === "rejected" && task.pending_action && task.pending_action.step_id === step.step_id)
+    ) {
+      return "Rejected.";
+    }
+    if (latest === "approval.invalidated") return "Superseded.";
+    if (latest === "approval.requested") return "Awaiting approval.";
+    if (!related.length) return "Not required.";
+    return "Unknown.";
+  }
+
+  function stepVerificationLabel(stepId) {
+    var verification = state.verification;
+    if (!verification || !verification.checks) return "not run";
+    var related = verification.checks.filter(function (check) {
+      var expected = check.expected || {};
+      return expected.step_id === stepId || expected.source_step_id === stepId;
+    });
+    if (!related.length) return verification.status === "pending" ? "not run" : "no step-specific check";
+    return related.every(function (check) { return check.passed; }) ? "passed" : "failed";
+  }
+
+  var COLLECTION_STATUSES = [
+    "pending", "running", "awaiting_approval", "completed", "verified", "failed", "rejected", "skipped"
+  ];
+
+  function renderCollection(task) {
+    var panel = els.collectionPanel;
+    clear(panel);
+    var items = task && task.collection_progress ? task.collection_progress : [];
+    if (!items.length) {
+      panel.appendChild(el("div", { className: "empty", text: "No collection on this task." }));
+      return;
+    }
+    var source = items[0].collection_id;
+    var counts = {};
+    COLLECTION_STATUSES.forEach(function (name) { counts[name] = 0; });
+    items.forEach(function (item) { counts[item.status] = (counts[item.status] || 0) + 1; });
+    // Same rows the API returned. Processed leaves out items that have not
+    // finished or are still running. Verified is never counted as completed.
+    var processed = items.filter(function (item) {
+      return item.status !== "pending" && item.status !== "running";
+    }).length;
+    panel.appendChild(el("p", {
+      className: "note",
+      text: "Completed means the step ran. Verified is set only when independent verification passed. A successful tool result is not verification."
+    }));
+    panel.appendChild(el("div", { className: "kv" }, [
+      el("div", { className: "k", text: "source" }),
+      el("div", { className: "v", text: source, attrs: { "data-field": "collection_source" } }),
+      el("div", { className: "k", text: "selected" }),
+      el("div", { className: "v", text: String(items.length), attrs: { "data-field": "collection_selected" } }),
+      el("div", { className: "k", text: "processed" }),
+      el("div", { className: "v", text: String(processed), attrs: { "data-field": "collection_processed" } }),
+      el("div", { className: "k", text: "total" }),
+      el("div", { className: "v", text: String(items.length), attrs: { "data-field": "collection_total" } })
+    ]));
+    var chips = el("div", { className: "counts" });
+    COLLECTION_STATUSES.forEach(function (name) {
+      chips.appendChild(el("span", {
+        className: "count-chip " + name,
+        text: name + " " + (counts[name] || 0),
+        attrs: { "data-collection-count": name }
+      }));
+    });
+    panel.appendChild(chips);
+    var list = el("ul", { className: "plan-list" });
+    items.forEach(function (item) {
+      list.appendChild(el("li", { attrs: { "data-collection-item": item.item_id, "data-status": item.status } }, [
+        el("div", null, [
+          el("div", { className: "title", text: item.item_id }),
+          el("div", { className: "meta", text: item.step_id + " · " + item.status + (item.error ? " · " + item.error : "") })
+        ])
+      ]));
+    });
+    panel.appendChild(list);
+  }
+
+  function renderReplan() {
+    var panel = els.replanPanel;
+    clear(panel);
+    var enabled = !!(state.session && state.session.replanning_enabled);
+    panel.appendChild(el("p", {
+      className: "note",
+      text: enabled
+        ? "Automatic replanning is enabled by server configuration. This page cannot turn it off or submit a replacement plan."
+        : "Automatic replanning is off. Server configuration AAE_REPLANNING_ENABLED is false. This page cannot turn it on."
+    }));
+    var events = (state.events || []).filter(function (event) {
+      return String(event.event_type || "").indexOf("replan.") === 0;
+    });
+    if (!events.length) {
+      panel.appendChild(el("div", { className: "empty", text: "No replan events for this task." }));
+      return;
+    }
+    events.forEach(function (event) {
+      var result = event.result || {};
+      var budgets = result.budgets || {};
+      var budgetText = Object.keys(budgets).length
+        ? "steps " + str(budgets.effective_steps) + "/" + str(budgets.max_steps) +
+          " · mutations remaining " + str(budgets.mutations_remaining)
+        : "no budget summary";
+      panel.appendChild(el("div", {
+        className: "ev-row",
+        attrs: { "data-replan-event": event.event_id, "data-event-type": event.event_type }
+      }, [
+        el("strong", { text: event.event_type }),
+        " · revision " + str(result.revision),
+        " · " + str(result.trigger),
+        " · " + str(result.outcome),
+        el("div", { className: "meta", text: "plan " + str(result.previous_plan_id) + " → " + str(result.accepted_plan_id || result.proposed_plan_id) }),
+        el("div", { className: "meta", text: budgetText })
+      ]));
+    });
   }
 
   function renderExplain(t) {
@@ -964,6 +1216,34 @@
 
   // --- Confirmation dialog ------------------------------------------------------------
 
+  function suppressGhostClicks() {
+    // When a modal closes under the cursor, some engines deliver the same click to
+    // whatever is now underneath (Approve/Reject). Swallow pointer/click for two
+    // animation frames — event-loop based, not a wall-clock sleep.
+    var block = function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    document.addEventListener("click", block, true);
+    document.addEventListener("pointerup", block, true);
+    document.addEventListener("mouseup", block, true);
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        document.removeEventListener("click", block, true);
+        document.removeEventListener("pointerup", block, true);
+        document.removeEventListener("mouseup", block, true);
+      });
+    });
+  }
+
+  function afterGhostClickWindow() {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(resolve);
+      });
+    });
+  }
+
   function confirmAction(title, body, detail) {
     return new Promise(function (resolve) {
       var dialog = els.confirmDialog;
@@ -971,15 +1251,47 @@
         resolve(window.confirm(title + "\n\n" + body));
         return;
       }
+      var epoch = ++state.confirmEpoch;
+      var settled = false;
       els.confirmTitle.textContent = title;
       els.confirmBody.textContent = body;
       els.confirmDetail.textContent = detail || "";
       show(els.confirmDetail, !!detail);
-      dialog.returnValue = "";
-      dialog.addEventListener("close", function onClose() {
-        dialog.removeEventListener("close", onClose);
-        resolve(dialog.returnValue === "confirm");
-      });
+
+      function finish(ok) {
+        if (settled || epoch !== state.confirmEpoch) return;
+        settled = true;
+        cleanup();
+        suppressGhostClicks();
+        if (dialog.open) dialog.close();
+        resolve(ok);
+      }
+
+      function onOk(event) {
+        event.preventDefault();
+        finish(true);
+      }
+
+      function onCancel(event) {
+        event.preventDefault();
+        finish(false);
+      }
+
+      function onDialogCancel(event) {
+        // ESC / implicit cancel — do not treat as confirm.
+        event.preventDefault();
+        finish(false);
+      }
+
+      function cleanup() {
+        els.confirmOk.removeEventListener("click", onOk);
+        els.confirmCancel.removeEventListener("click", onCancel);
+        dialog.removeEventListener("cancel", onDialogCancel);
+      }
+
+      els.confirmOk.addEventListener("click", onOk);
+      els.confirmCancel.addEventListener("click", onCancel);
+      dialog.addEventListener("cancel", onDialogCancel);
       dialog.showModal();
       els.confirmCancel.focus();
     });
@@ -988,91 +1300,134 @@
   // --- Approval, rejection, resume ----------------------------------------------------
 
   function afterAction(task, message, msgNode) {
+    // Apply the action response without restarting polls — callers resume
+    // polling only after state.acting is cleared so a late refresh cannot
+    // disable the approval controls mid-click.
     state.task = task;
     state.verification = null;
     renderTask();
     setMsg(msgNode || els.approvalMsg, message, "ok");
-    startPolling();
   }
 
   async function onApprove() {
     var t = state.task;
-    if (!t || !t.pending_action || state.acting) return;
-    var pending = t.pending_action;
-    var ok = await confirmAction(
-      "Approve this write?",
-      "The server will execute " + pending.tool + "." + pending.operation + " for " + pending.step_id +
-        " in task " + t.task_id + ", then continue the plan and verify the outcome.",
-      pretty(pending.arguments)
-    );
-    if (!ok) return;
+    var pending = approvalPending(t);
+    if (!pending || state.acting) return;
+    // Freeze the target and disable controls before the dialog. Acting must be
+    // set first: when Confirm closes the modal, some engines deliver a ghost
+    // click to whatever sits under the button (often Approve again), which would
+    // otherwise open a second dialog for the next pending step and race the test.
+    var taskId = t.task_id;
+    var stepId = pending.step_id;
+    var fingerprint = pending.fingerprint;
+    var operation = pending.tool + "." + pending.operation;
+    var args = pending.arguments;
     state.acting = true;
     updateControls();
+    stopPolling();
+    var ok = await confirmAction(
+      "Approve this write?",
+      "The server will execute " + operation + " for " + stepId +
+        " in task " + taskId + ", then continue the plan and verify the outcome.",
+      pretty(args)
+    );
+    if (!ok) {
+      await afterGhostClickWindow();
+      state.acting = false;
+      updateControls();
+      startPolling();
+      return;
+    }
     setMsg(els.approvalMsg, "Sending approval…");
     try {
-      var res = await api.approve(t.task_id, pending.step_id);
+      var res = await api.approve(taskId, stepId, fingerprint);
       afterAction(res.data, "Approved. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.approvalMsg, err.message, "error");
-      refreshTask();
+      await refreshTask();
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 
   async function onReject() {
     var t = state.task;
-    if (!t || !t.pending_action || state.acting) return;
+    var pending = approvalPending(t);
+    if (!pending || state.acting) return;
     var reason = els.rejectReason.value.trim();
     if (!reason) {
       setMsg(els.approvalMsg, "Enter a rejection reason.", "error");
       els.rejectReason.focus();
       return;
     }
-    var pending = t.pending_action;
-    var ok = await confirmAction(
-      "Reject this write?",
-      "The task will be aborted and " + pending.tool + "." + pending.operation + " will not run. Reason: " + reason
-    );
-    if (!ok) return;
+    var taskId = t.task_id;
+    var stepId = pending.step_id;
+    var fingerprint = pending.fingerprint;
+    var operation = pending.tool + "." + pending.operation;
     state.acting = true;
     updateControls();
+    stopPolling();
+    var ok = await confirmAction(
+      "Reject this write?",
+      "The task will be aborted and " + operation + " will not run. Reason: " + reason
+    );
+    if (!ok) {
+      await afterGhostClickWindow();
+      state.acting = false;
+      updateControls();
+      startPolling();
+      return;
+    }
     setMsg(els.approvalMsg, "Sending rejection…");
     try {
-      var res = await api.reject(t.task_id, pending.step_id, reason);
+      var res = await api.reject(taskId, stepId, reason, fingerprint);
       afterAction(res.data, "Rejected. Resulting task status: " + res.data.status + ".");
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.approvalMsg, err.message, "error");
-      refreshTask();
+      await refreshTask();
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 
   async function onResume() {
     var t = state.task;
     if (!t || !t.resumable || state.acting) return;
-    var ok = await confirmAction(
-      "Resume this task?",
-      "The server will continue task " + t.task_id + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
-    );
-    if (!ok) return;
+    var taskId = t.task_id;
     state.acting = true;
     updateControls();
+    stopPolling();
+    var ok = await confirmAction(
+      "Resume this task?",
+      "The server will continue task " + taskId + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
+    );
+    if (!ok) {
+      await afterGhostClickWindow();
+      state.acting = false;
+      updateControls();
+      startPolling();
+      return;
+    }
     setMsg(els.taskMsg, "Resuming…");
     try {
-      var res = await api.resume(t.task_id);
+      var res = await api.resume(taskId);
       afterAction(res.data, "Resumed. Resulting task status: " + res.data.status + ".", els.taskMsg);
     } catch (err) {
       if (err.status === 401) sessionLost(err.message);
       setMsg(els.taskMsg, err.message, "error");
     } finally {
+      await afterGhostClickWindow();
       state.acting = false;
       updateControls();
+      startPolling();
     }
   }
 
@@ -1241,6 +1596,10 @@
       button.addEventListener("click", function () { selectTab(button.getAttribute("data-tab")); });
     });
     window.addEventListener("pagehide", stopPolling);
+    window.addEventListener("hashchange", function () {
+      var match = /^#task=([A-Za-z0-9_-]{1,128})$/.exec(location.hash);
+      if (match) selectTask(match[1]);
+    });
   }
 
   async function init() {

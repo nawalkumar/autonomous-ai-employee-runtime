@@ -125,14 +125,17 @@ def test_approval_through_the_dashboard(page, server: LiveServer, tmp_path: Path
     expect(page.locator("#apReason")).to_have_text(pending["reason"])
     assert employee_title(tmp_path / "data" / "runtime.db") == "Software Engineer"
 
-    page.click("#approveBtn")
+    expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "1", timeout=20_000)
+    expect(page.locator("#approveBtn")).to_be_enabled()
+    page.locator("#approveBtn").click()
     expect(page.locator("#confirmDialog")).to_be_visible()
-    page.click("#confirmCancel")
+    page.locator("#confirmCancel").click()
     expect(page.locator("#statusPill")).to_have_text("needs_approval")
     assert api(server, f"/api/v1/tasks/{task_id}")["status"] == "needs_approval"
 
-    page.click("#approveBtn")
-    page.click("#confirmOk")
+    expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "1")
+    page.locator("#approveBtn").click()
+    page.locator("#confirmOk").click()
     expect(page.locator("#statusPill")).to_have_text("completed", timeout=20_000)
     expect(page.locator("#approvalMsg")).to_contain_text("Resulting task status: completed")
     assert employee_title(tmp_path / "data" / "runtime.db") == "Senior Engineer"
@@ -146,10 +149,11 @@ def test_approval_through_the_dashboard(page, server: LiveServer, tmp_path: Path
 def test_rejection_through_the_dashboard(page, server: LiveServer, tmp_path: Path) -> None:
     page.goto(server.url)
     task_id = run_goal(page, EMPLOYEE_GOAL)
-    expect(page.locator("#approvalCard")).to_be_visible(timeout=20_000)
+    expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "1", timeout=20_000)
     page.fill("#rejectReason", "Budget freeze")
-    page.click("#rejectBtn")
-    page.click("#confirmOk")
+    expect(page.locator("#rejectBtn")).to_be_enabled()
+    page.locator("#rejectBtn").click()
+    page.locator("#confirmOk").click()
     expect(page.locator("#statusPill")).to_have_text("aborted", timeout=20_000)
     detail = api(server, f"/api/v1/tasks/{task_id}")
     assert detail["status"] == "aborted" and detail["tool_calls"] == []

@@ -23,6 +23,9 @@ class VerificationStatus(str, Enum):
     PENDING = "pending"
     PASSED = "passed"
     FAILED = "failed"
+    # Execution finished but there was no outcome to check independently
+    # (for example a read-only plan). Never reported as passed.
+    UNVERIFIED = "unverified"
 
 
 class PlanStepStatus(str, Enum):
@@ -45,6 +48,7 @@ class FailureType(str, Enum):
     MISSING_INFO = "missing_info"
     ENVIRONMENT_UNEXPECTED = "environment_unexpected"
     POLICY_BLOCKED = "policy_blocked"
+    UNAUTHORIZED = "unauthorized"
     VERIFICATION_FAILED = "verification_failed"
     REPEATED = "repeated"
 

@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.models.collections import CollectionWork
 from app.models.enums import PlanStepStatus
 from app.models.ids import new_id
 
@@ -18,6 +19,10 @@ class PlanStep(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     expected_outcome: str = ""
     status: PlanStepStatus = PlanStepStatus.PENDING
+    # Optional bounded collection expansion (Milestone 6). When set, the runtime
+    # expands this template into ordinary steps after the source collection is
+    # observed — it is never sent directly to a tool.
+    collection: CollectionWork | None = None
 
     def resolved_tool_name(self) -> str | None:
         """Prefer explicit tool_name; fall back to tool_hint for compatibility."""

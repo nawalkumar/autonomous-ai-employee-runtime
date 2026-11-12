@@ -151,6 +151,21 @@
       </div>
 
       <div class="grid-bottom">
+        <section class="card" aria-labelledby="collectionTitle">
+          <div class="card-hd"><h2 id="collectionTitle">Collection progress</h2></div>
+          <div class="card-bd">
+            <div id="collectionPanel"></div>
+          </div>
+        </section>
+        <section class="card" aria-labelledby="replanTitle">
+          <div class="card-hd"><h2 id="replanTitle">Replanning history</h2></div>
+          <div class="card-bd">
+            <div id="replanPanel"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="grid-bottom">
         <section class="card" aria-labelledby="historyTitle">
           <div class="card-hd">
             <h2 id="historyTitle">Task history</h2>
@@ -185,15 +200,13 @@
   </div>
 
   <dialog id="confirmDialog" aria-labelledby="confirmTitle" aria-describedby="confirmBody">
-    <form method="dialog">
-      <h3 id="confirmTitle">Confirm</h3>
-      <p id="confirmBody"></p>
-      <pre id="confirmDetail" hidden></pre>
-      <div class="btn-row">
-        <button type="submit" value="cancel" id="confirmCancel">Cancel</button>
-        <button type="submit" value="confirm" class="primary" id="confirmOk">Confirm</button>
-      </div>
-    </form>
+    <h3 id="confirmTitle">Confirm</h3>
+    <p id="confirmBody"></p>
+    <pre id="confirmDetail" hidden></pre>
+    <div class="btn-row">
+      <button type="button" id="confirmCancel">Cancel</button>
+      <button type="button" class="primary" id="confirmOk">Confirm</button>
+    </div>
   </dialog>
 
   <script src="/static/app.js"></script>
