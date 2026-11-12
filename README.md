@@ -394,10 +394,17 @@ Supported when the flag is on (in addition to the original two mock scenarios):
 - Assign ticket `T-<id>` to [eligible Support] employee `E-<id>`
 - Update employee `E-<id>` title to `<title>`
 - Create a new customer named … at company … with email … and a welcome ticket
+- Assign up to N open or in-progress priority tickets to an explicit employee
+- Mark two or more explicit tickets as an explicit status
+- List up to N tickets with an explicit status and priority
+
+The three collection grammars are planned deterministically. The configured
+provider is not asked to invent their steps, filters, bounds or identities.
+Other catalog intents still use the provider when the flag is on.
 
 Excluded on purpose (cannot be safely authorized from text alone): unrestricted
-searches, bulk/collection workflows, department transfers without explicit fields,
-`deactivate_employee`, and any goal that would require inventing entity IDs.
+searches, "assign all", missing bounds, department transfers without explicit
+fields, `deactivate_employee`, and any goal that would require inventing entity IDs.
 
 ### Planner interface
 
@@ -441,10 +448,10 @@ uv run python -m app.cli run 'List open high-priority tickets.'
 ### Limitations
 
 Not every natural-language goal is supported. There is no unrestricted goal
-interpretation, shell execution, or public plan-submission endpoint. Collection
-expansion and library-level replanning are separate experimental mechanisms
-(below); they are not exposed as CLI, API or dashboard end-user workflows.
-See also [Limitations](#limitations).
+interpretation, shell execution, or public plan-submission endpoint. The three
+bounded collection grammars below are API and CLI workflows. Arbitrary
+collection plans and library-level replanning are not. Replanning is not
+automatic. See also [Limitations](#limitations).
 
 ## Authorization hardening (per-step shapes)
 
@@ -467,9 +474,49 @@ sibling step that omits it.
 
 ## Bounded collection workflows
 
-**Status:** experimental runtime/library mechanism for explicit plans that include
-`PlanStep.collection`. Not a CLI, API or dashboard end-user feature. Not
-production-ready as a product workflow.
+**Status:** three natural-language workflows are available through the API and CLI
+when `AAE_DYNAMIC_PLANNING_ENABLED=true`. They use this collection engine. The
+engine also still accepts explicit in-process plans. Neither path is a general
+loop, and neither path replans automatically. The dashboard does not render
+collection progress. Not a production-ready autonomous product.
+
+### API and CLI grammars
+
+The whole request must match. Extra sentences, missing bounds, missing filters
+and invented ids are rejected before a task exists. The bound is an explicit
+integer from 1 to 20 (the default collection limit, also capped by the hard
+ceiling of 50). Examples use seeded fixture ids:
+
+```text
+python -m app.cli run "Assign up to 2 open high-priority tickets to employee E-40."
+python -m app.cli run "Mark tickets T-10002 and T-10004 as resolved."
+python -m app.cli run "List up to 5 open high-priority tickets."
+python -m app.cli run "Mark tickets T-10009 and T-10010 as closed."
+```
+
+Set `AAE_DYNAMIC_PLANNING_ENABLED=true`. `LLM_PROVIDER` is not consulted for
+these four sentences; a mock or xAI provider is used only for the other catalog
+intents. `AAE_REPLANNING_ENABLED` does not enable automatic replanning.
+
+| Grammar | Plan | Authority |
+| --- | --- | --- |
+| Assign up to N `<open\|in_progress>` `<priority>`-priority tickets to employee `E-<id>` | `list_tickets`, then one `assign_ticket` collection template | Filters, limit, offset 0 and employee id are exact. Ticket ids must come from that sealed snapshot. At most N assignments. |
+| Mark tickets `T-<id>` and `T-<id>` as `<status>` | One ordinary `update_ticket` step per id | Only those ids, only that status. At least two unique ids, at most 20. |
+| List up to N `<status>` `<priority>`-priority tickets | One `list_tickets` step | Read only. `max_mutations` is 0. |
+
+`open` cannot move directly to `closed`. The company tool rejects that
+transition and does not write the ticket. Setting status to `closed` from
+`resolved` asks for approval; assignment and a non-closing status change do
+not. Independent verification is the only thing that marks a collection item
+`verified`. An empty assignment selection does not assign anyone; the task
+fails closed because the unused mutation step was skipped.
+
+`status` and `history` show per-item progress and the ticket ids a list call
+actually returned. The task-detail JSON adds `collection_progress` and each
+tool call's `result`. The current dashboard ignores those fields.
+
+What remains library-only: choosing an arbitrary collection path, item field or
+iteration expression, and every replanning API in `app/runtime/replan.py`.
 
 Registered collection source today: `company_api.list_tickets` only.
 
@@ -778,9 +825,9 @@ permissions.
 - No natural-language-general authorization: scopes come only from trusted grammars
   (mock scenarios, dynamic intents when flagged, or trusted internal `create_task`).
 - No public plan-submission or self-granted permission endpoints.
-- No generic collection iteration or unbounded replanning. Collection expansion and
-  the `Replanner` library are experimental; they are not CLI/API/dashboard product
-  features and are not production-ready end-user workflows.
+- No generic collection iteration or unbounded replanning. API and CLI collection
+  support is the three grammars in [Bounded collection workflows](#bounded-collection-workflows).
+  The `Replanner` library is not an executor, CLI, API or dashboard feature.
 - Constraint vocabulary is intentionally small and typed.
 - The LLM cannot create, widen, or replace an `AuthorizationScope`.
 
@@ -1048,9 +1095,11 @@ one instance.
   (default), exactly two mock goal formats apply and no external planner calls are
   made. With the flag enabled, only the [trusted intent catalog](#dynamic-llm-planning)
   is accepted; authorization is still independently granted from those grammars, not
-  from free-form model text. The CLI still refuses `--provider xai`; set
-  `LLM_PROVIDER=xai` (with `XAI_API_KEY`) when the flag is on if you want the live
-  adapter. Unit tests never make live provider calls.
+  from free-form model text. The three collection grammars do not call the provider
+  at all. Other catalog intents use `LLM_PROVIDER` (`mock` by default). The CLI
+  still refuses `--provider xai`; set `LLM_PROVIDER=xai` (with `XAI_API_KEY`) when
+  the flag is on if you want the live adapter for those other intents. Unit tests
+  never make live provider calls. Automatic replanning stays disabled.
 - **Fictional world.** The company API, employees, customers and tickets are a seeded
   SQLite mock; there are no real integrations.
 - **Locks protect cooperating processes only** (the CLI and the API). Code that calls
