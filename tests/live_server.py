@@ -12,9 +12,14 @@ from pathlib import Path
 import httpx
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Drop host-process overrides so each LiveServer starts from explicit ``extra`` only.
+# Test-mode / scripted / replanning flags must not leak from earlier pytest cases
+# that mutate ``os.environ`` or from the developer's shell.
 _CLEARED = {
     "XAI_API_KEY", "LLM_PROVIDER", "DATABASE_PATH", "WORKSPACE_PATH", "APP_MODE", "PORT",
     "ALLOWED_HOSTS", "PUBLIC_DATA_ROOT", "PUBLIC_ACCESS_CODE", "RENDER_EXTERNAL_HOSTNAME",
+    "AAE_DYNAMIC_PLANNING_ENABLED", "AAE_REPLANNING_ENABLED", "AAE_MAX_REPLAN_ROUNDS",
+    "AAE_TEST_MODE", "AAE_TEST_SCRIPTED_PLAN",
 }
 
 
