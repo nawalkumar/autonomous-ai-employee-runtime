@@ -244,7 +244,8 @@
     "runBtn", "newTaskBtn", "formMsg", "mRecovery", "mVerify", "mStatus", "mEvidence", "explainBox",
     "pipeline", "approvalCard", "apStep", "apOperation", "apRisk", "apReason", "apArgs", "rejectReason",
     "approveBtn", "rejectBtn", "approvalMsg", "timeline", "eventCount", "planList", "runtimeState",
-    "refreshTaskBtn", "resumeBtn", "taskMsg", "verificationPanel", "interpretedGoal", "taskList",
+    "refreshTaskBtn", "resumeBtn", "taskMsg", "verificationPanel", "interpretedGoal",
+    "collectionPanel", "replanPanel", "taskList",
     "refreshListBtn", "worldPanel", "refreshWorldBtn", "confirmDialog", "confirmTitle", "confirmBody",
     "confirmDetail", "confirmCancel"
   ].forEach(function (id) { els[id] = $(id); });
@@ -284,7 +285,9 @@
 
   function renderSession() {
     var s = state.session;
-    els.modeNotice.textContent = s.notice;
+    els.modeNotice.textContent = s.notice +
+      " Automatic replanning is " + (s.replanning_enabled ? "enabled" : "off") +
+      " in server configuration. This page cannot change it.";
     els.modeNotice.className = "disclaimer" + (s.mode === "public" ? " public" : "");
     var needSession = s.mode === "public" && !s.authenticated;
     show(els.sessionCard, needSession);
@@ -366,7 +369,13 @@
         var button = el("button", {
           className: "ghost",
           text: scenario.title + (index > 0 ? " + note" : ""),
-          attrs: { type: "button", "aria-pressed": "false", "data-goal": goal, title: scenario.description }
+          attrs: {
+            type: "button",
+            "aria-pressed": "false",
+            "data-goal": goal,
+            "data-planning": scenario.planning || "mock",
+            title: scenario.description
+          }
         });
         button.addEventListener("click", function () {
           els.goalInput.value = goal;
@@ -534,6 +543,10 @@
       var task = await api.task(id, signal);
       var history = await api.history(id, signal);
       if (state.taskId !== id) return true;
+      if (!task.data || !task.data.task_id || !history.data || !history.data.events) {
+        setMsg(els.taskMsg, "The server returned a response this page could not read.", "error");
+        return false;
+      }
       state.task = task.data;
       state.events = history.data.events;
       if (!state.online) setOnline(true);
@@ -562,6 +575,7 @@
       }
       if (err.code === "network") {
         setOnline(false);
+        setMsg(els.taskMsg, "The backend did not answer. Press Refresh to try this task again.", "error");
         return false;
       }
       setMsg(els.taskMsg, err.message, "error");
@@ -594,7 +608,9 @@
     kvRows(els.runtimeState, [["task_id", null], ["status", null]]);
     clear(els.verificationPanel);
     els.verificationPanel.appendChild(el("div", { className: "empty", text: "Run or select a task to see its verification." }));
-    kvRows(els.interpretedGoal, [["objective", null], ["planner", "mock (deterministic; two supported goal formats)"]]);
+    kvRows(els.interpretedGoal, [["objective", null], ["planner", plannerLine()]]);
+    renderCollection(null);
+    renderReplan();
     els.approvalCard.classList.remove("visible");
     show(els.resumeBtn, false);
     els.refreshTaskBtn.disabled = true;
@@ -616,6 +632,8 @@
     renderApproval(t);
     renderVerification(t);
     renderInterpreted(t);
+    renderCollection(t);
+    renderReplan();
     renderExplain(t);
     show(els.resumeBtn, !!t.resumable);
     updateControls();
@@ -757,6 +775,11 @@
       case "verification.started": return "independent checks against the database and workspace";
       case "verification.check": return (r.passed ? "PASS " : "FAIL ") + str(r.name) + " — " + str(r.message);
       case "evidence.recorded": return str(r.type) + ": " + str(r.description);
+      case "replan.proposed":
+      case "replan.accepted":
+      case "replan.rejected":
+      case "replan.exhausted":
+        return "revision " + str(r.revision) + " · " + str(r.trigger) + " · " + str(r.outcome);
       case "verification.passed": return str(r.summary);
       case "verification.failed":
       case "TASK_FAILED": return str(f.message);
@@ -831,8 +854,12 @@
             el("div", {
               className: "meta",
               text: str(step.tool) + " / " + str(step.operation) + " · " + status.toUpperCase() +
+                " · approval " + approvalLabel(t, step) +
                 " · " + step.attempts + " attempt" + (step.attempts === 1 ? "" : "s")
             }),
+            el("div", { className: "meta", text: "result: " + callSummary(latestCall(t, step.step_id)), attrs: { "data-result": step.step_id } }),
+            el("div", { className: "meta", text: "error: " + stepError(t, step.step_id) }),
+            el("div", { className: "meta", text: "verification: " + stepVerificationLabel(step.step_id), attrs: { "data-step-verification": step.step_id } }),
             details("arguments", step.arguments)
           ])
         ])
@@ -888,6 +915,10 @@
       }
       return;
     }
+    panel.appendChild(el("p", {
+      className: "note",
+      text: "Independent verification reads the database and workspace. A model explanation is not a verification result."
+    }));
     panel.appendChild(
       el("div", { className: "kv" }, [
         el("div", { className: "k", text: "result" }),
@@ -944,8 +975,163 @@
       ["entities", entities],
       ["required_info", g.required_information.join("; ")],
       ["success_criteria", criteria],
-      ["planner", "mock (deterministic; two supported goal formats)"]
+      ["planner", planningLabel(t.planning_source)]
     ]);
+  }
+
+  function plannerLine() {
+    if (state.session && state.session.dynamic_planning_enabled) {
+      return "mock for the two original goals; collection grammars are deterministic; other catalog goals use the configured provider";
+    }
+    return "mock (deterministic; two supported goal formats)";
+  }
+
+  function planningLabel(source) {
+    if (source === "trusted_collection") return "trusted collection plan (deterministic; the model did not choose the steps)";
+    if (source === "dynamic_catalog") return "catalog grammar; a model may have proposed the plan inside that grammar";
+    if (source === "mock") return "mock (deterministic; two supported goal formats)";
+    return plannerLine();
+  }
+
+  function latestCall(task, stepId) {
+    var found = null;
+    (task.tool_calls || []).forEach(function (call) {
+      if (call.step_id === stepId) found = call;
+    });
+    return found;
+  }
+
+  function callSummary(call) {
+    if (!call) return "no tool result yet";
+    if (call.error_message) return call.error_message;
+    var data = call.result && (call.result.data || call.result);
+    if (data && data.tickets) {
+      var ids = data.tickets.map(function (ticket) { return ticket.ticket_id; }).filter(Boolean);
+      return ids.length ? "tickets " + ids.join(", ") : "0 tickets";
+    }
+    if (data && data.ticket) {
+      return "ticket " + str(data.ticket.ticket_id) + " status " + str(data.ticket.status);
+    }
+    if (data && data.employee) return "employee " + str(data.employee.employee_id);
+    return call.status || "no tool result yet";
+  }
+
+  function stepError(task, stepId) {
+    var messages = (task.failures || []).filter(function (failure) {
+      return failure.step_id === stepId;
+    }).map(function (failure) { return failure.message; });
+    if (messages.length) return messages[messages.length - 1];
+    var call = latestCall(task, stepId);
+    return call && call.error_message ? call.error_message : "none";
+  }
+
+  function approvalLabel(task, step) {
+    if (task.pending_action && task.pending_action.step_id === step.step_id && task.status === "needs_approval") {
+      return "awaiting approval";
+    }
+    if (task.approval_status === "rejected" && step.status !== "completed") return "rejected";
+    return task.approval_status === "approved" ? "approved" : "not pending";
+  }
+
+  function stepVerificationLabel(stepId) {
+    var verification = state.verification;
+    if (!verification || !verification.checks) return "not run";
+    var related = verification.checks.filter(function (check) {
+      var expected = check.expected || {};
+      return expected.step_id === stepId || expected.source_step_id === stepId;
+    });
+    if (!related.length) return verification.status === "pending" ? "not run" : "no step-specific check";
+    return related.every(function (check) { return check.passed; }) ? "passed" : "failed";
+  }
+
+  var COLLECTION_STATUSES = [
+    "pending", "running", "awaiting_approval", "completed", "verified", "failed", "rejected", "skipped"
+  ];
+
+  function renderCollection(task) {
+    var panel = els.collectionPanel;
+    clear(panel);
+    var items = task && task.collection_progress ? task.collection_progress : [];
+    if (!items.length) {
+      panel.appendChild(el("div", { className: "empty", text: "No collection on this task." }));
+      return;
+    }
+    var source = items[0].collection_id;
+    var counts = {};
+    COLLECTION_STATUSES.forEach(function (name) { counts[name] = 0; });
+    items.forEach(function (item) { counts[item.status] = (counts[item.status] || 0) + 1; });
+    var processed = items.filter(function (item) {
+      return item.status !== "pending" && item.status !== "running";
+    }).length;
+    panel.appendChild(el("p", {
+      className: "note",
+      text: "Completed means the step ran. Verified is set only when independent verification passed. A successful tool result is not verification."
+    }));
+    panel.appendChild(el("div", { className: "kv" }, [
+      el("div", { className: "k", text: "source" }),
+      el("div", { className: "v", text: source, attrs: { "data-field": "collection_source" } }),
+      el("div", { className: "k", text: "selected" }),
+      el("div", { className: "v", text: String(items.length), attrs: { "data-field": "collection_selected" } }),
+      el("div", { className: "k", text: "processed" }),
+      el("div", { className: "v", text: String(processed), attrs: { "data-field": "collection_processed" } })
+    ]));
+    var chips = el("div", { className: "counts" });
+    COLLECTION_STATUSES.forEach(function (name) {
+      chips.appendChild(el("span", {
+        className: "count-chip " + name,
+        text: name + " " + (counts[name] || 0),
+        attrs: { "data-collection-count": name }
+      }));
+    });
+    panel.appendChild(chips);
+    var list = el("ul", { className: "plan-list" });
+    items.forEach(function (item) {
+      list.appendChild(el("li", { attrs: { "data-collection-item": item.item_id, "data-status": item.status } }, [
+        el("div", null, [
+          el("div", { className: "title", text: item.item_id }),
+          el("div", { className: "meta", text: item.step_id + " · " + item.status + (item.error ? " · " + item.error : "") })
+        ])
+      ]));
+    });
+    panel.appendChild(list);
+  }
+
+  function renderReplan() {
+    var panel = els.replanPanel;
+    clear(panel);
+    var enabled = !!(state.session && state.session.replanning_enabled);
+    panel.appendChild(el("p", {
+      className: "note",
+      text: enabled
+        ? "Automatic replanning is enabled by server configuration. This page cannot turn it off or submit a replacement plan."
+        : "Automatic replanning is off. Server configuration AAE_REPLANNING_ENABLED is false. This page cannot turn it on."
+    }));
+    var events = (state.events || []).filter(function (event) {
+      return String(event.event_type || "").indexOf("replan.") === 0;
+    });
+    if (!events.length) {
+      panel.appendChild(el("div", { className: "empty", text: "No replan events for this task." }));
+      return;
+    }
+    events.forEach(function (event) {
+      var result = event.result || {};
+      var budgets = result.budgets || {};
+      var budgetText = Object.keys(budgets).length
+        ? "steps " + str(budgets.effective_steps) + "/" + str(budgets.max_steps) +
+          " · mutations remaining " + str(budgets.mutations_remaining)
+        : "no budget summary";
+      panel.appendChild(el("div", {
+        className: "ev-row",
+        attrs: { "data-replan-event": event.event_id, "data-event-type": event.event_type }
+      }, [
+        el("strong", { text: event.event_type }),
+        " · revision " + str(result.revision),
+        " · " + str(result.trigger),
+        " · " + str(result.outcome),
+        el("div", { className: "meta", text: "plan " + str(result.previous_plan_id) + " → " + str(result.accepted_plan_id || result.proposed_plan_id) }),
+        el("div", { className: "meta", text: budgetText })
+      ]));
+    });
   }
 
   function renderExplain(t) {
@@ -1246,6 +1432,10 @@
       button.addEventListener("click", function () { selectTab(button.getAttribute("data-tab")); });
     });
     window.addEventListener("pagehide", stopPolling);
+    window.addEventListener("hashchange", function () {
+      var match = /^#task=([A-Za-z0-9_-]{1,128})$/.exec(location.hash);
+      if (match) selectTask(match[1]);
+    });
   }
 
   async function init() {
