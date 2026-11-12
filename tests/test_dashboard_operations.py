@@ -156,14 +156,49 @@ def _approval_diagnostic_snapshot(
     }
 
 
-def _with_recent_events(
+def _with_approval_evidence(
     server: LiveServer, task_id: str, snapshot: dict[str, Any]
 ) -> dict[str, Any]:
+    """Attach redacted planning, audit, and ticket evidence for CI diagnosis."""
+    detail = api(server, f"/api/v1/tasks/{task_id}")
     history = api(server, f"/api/v1/tasks/{task_id}/history")
+    events = [event["event_type"] for event in history.get("events", [])]
+    tickets = {
+        ticket["ticket_id"]: ticket["status"]
+        for ticket in api(server, "/api/v1/company/tickets")["tickets"]
+        if ticket["ticket_id"] in {"T-10009", "T-10010"}
+    }
+    requested = events.count("approval.requested")
+    approved = events.count("approval.approved")
     enriched = dict(snapshot)
-    enriched["recent_events"] = [
-        event["event_type"] for event in history.get("events", [])[-8:]
-    ]
+    enriched.update(
+        {
+            "planning_source": detail.get("planning_source"),
+            "plan_operations": [
+                {
+                    "step_id": step.get("step_id"),
+                    "operation": step.get("operation"),
+                    "status": step.get("status"),
+                }
+                for step in detail.get("plan") or []
+            ],
+            "approval_requested_count": requested,
+            "approval_approved_count": approved,
+            "ticket_statuses": tickets,
+            "recent_events": events[-12:],
+            "classification": (
+                "protected_mutation_without_approval"
+                if detail.get("status") == "completed"
+                and approved == 0
+                and tickets.get("T-10009") == "closed"
+                else "approved_without_test_click"
+                if detail.get("status") == "completed" and approved > 0
+                else "unprotected_or_incomplete"
+                if detail.get("status") == "completed"
+                else "awaiting_or_other"
+            ),
+        }
+    )
     return enriched
 
 
@@ -190,6 +225,9 @@ def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
     UI-ready alone is not enough: a transitional poll can advertise approval while
     a later GET sees no pending_action. Align with API wait_for semantics
     (needs_approval and not executing) plus fingerprint agreement.
+
+    Unexpected terminal states fail immediately with redacted evidence so CI can
+    distinguish a skipped approval gate from a missing/unprotected operation.
     """
     last: dict[str, Any] = {}
     deadline = time.monotonic() + 20.0
@@ -199,6 +237,15 @@ def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
         snapshot = _approval_diagnostic_snapshot(page, server, task_id, detail=detail)
         last = snapshot
         pending = detail.get("pending_action")
+        status = snapshot["api_status"]
+
+        if status in {"completed", "failed", "aborted"} and snapshot["api_executing"] is False:
+            diagnostic = _with_approval_evidence(server, task_id, snapshot)
+            print("approval_diagnostic", json.dumps(diagnostic, sort_keys=True, default=str))
+            raise AssertionError(
+                "task reached terminal state before dashboard approval agreement: "
+                f"{json.dumps(diagnostic, sort_keys=True, default=str)}"
+            )
 
         if pending is not None and _approval_states_agree(snapshot, task_id):
             # Re-check one more GET so we never click a revision that just moved.
@@ -223,7 +270,7 @@ def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
             and snapshot["api_approval_status"] == "pending"
             and pending is None
         ):
-            diagnostic = _with_recent_events(server, task_id, snapshot)
+            diagnostic = _with_approval_evidence(server, task_id, snapshot)
             print("approval_diagnostic", json.dumps(diagnostic, sort_keys=True, default=str))
             raise AssertionError(
                 "backend reports needs_approval/pending without pending_action: "
@@ -233,7 +280,7 @@ def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
         # In-flight execution or UI catching up — do not click.
         time.sleep(0.05)
 
-    diagnostic = _with_recent_events(server, task_id, last)
+    diagnostic = _with_approval_evidence(server, task_id, last)
     print("approval_diagnostic", json.dumps(diagnostic, sort_keys=True, default=str))
     raise AssertionError(
         "timed out waiting for backend and dashboard approval agreement: "
@@ -245,7 +292,9 @@ def approve_through_dashboard(page, server: LiveServer, task_id: str) -> dict:
     """Approve the current pending step only after UI and API agree on the target."""
     pending = wait_until_approvable(page, server, task_id)
     page.locator("#approveBtn").click()
+    expect(page.locator("#confirmDialog")).to_be_visible()
     page.locator("#confirmOk").click()
+    expect(page.locator("#confirmDialog")).to_be_hidden()
     expect(page.locator("#approvalMsg")).to_contain_text(
         "Resulting task status:", timeout=20_000
     )
@@ -306,11 +355,19 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
         pending = wait_until_approvable(page, server, task_id)
         expect(page.locator("#apOperation")).to_have_text(pending["operation"])
         expect(page.locator("#apArgs")).to_contain_text("closed")
-        plan = api(server, f"/api/v1/tasks/{task_id}")["plan"]
-        for step in plan:
+        detail = api(server, f"/api/v1/tasks/{task_id}")
+        assert detail["planning_source"] == "trusted_collection"
+        assert [step["operation"] for step in detail["plan"]] == [
+            "update_ticket",
+            "update_ticket",
+        ]
+        history = api(server, f"/api/v1/tasks/{task_id}/history")
+        events = [event["event_type"] for event in history["events"]]
+        assert events.count("approval.requested") == 1
+        assert events.count("approval.approved") == 0
+        for step in detail["plan"]:
             label = "Awaiting approval." if step["step_id"] == pending["step_id"] else "Not required."
             expect_approval(page, step["step_id"], label)
-        assert api(server, "/api/v1/company/tickets")
         before = {
             ticket["ticket_id"]: ticket["status"]
             for ticket in api(server, "/api/v1/company/tickets")["tickets"]
@@ -320,15 +377,27 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
         seen_fingerprints: list[str] = []
         for _ in range(4):
             detail = api(server, f"/api/v1/tasks/{task_id}")
-            if detail["status"] != "needs_approval":
+            if detail["status"] in {"completed", "failed", "aborted"} and not detail["executing"]:
                 break
+            if detail["status"] != "needs_approval" or detail["executing"]:
+                time.sleep(0.05)
+                continue
             approved = approve_through_dashboard(page, server, task_id)
             assert approved["fingerprint"] not in seen_fingerprints
             seen_fingerprints.append(approved["fingerprint"])
-        assert seen_fingerprints, "expected at least one dashboard approval"
+        assert len(seen_fingerprints) == 2, (
+            "close-batch must pause once per ticket; "
+            f"got {len(seen_fingerprints)} dashboard approval(s)"
+        )
         expect(page.locator("#statusPill")).to_have_text("completed", timeout=20_000)
         expect(page.locator("#approvalCard")).to_have_attribute("data-approval-ready", "0")
         finished = api(server, f"/api/v1/tasks/{task_id}")
+        finished_events = [
+            event["event_type"]
+            for event in api(server, f"/api/v1/tasks/{task_id}/history")["events"]
+        ]
+        assert finished_events.count("approval.requested") == 2
+        assert finished_events.count("approval.approved") == 2
         for step in finished["plan"]:
             expect_approval(page, step["step_id"], "Approved.")
         after = {

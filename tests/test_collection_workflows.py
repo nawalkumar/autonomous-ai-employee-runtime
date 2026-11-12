@@ -605,7 +605,27 @@ def test_api_closing_batch_requires_approval(tmp_path: Path) -> None:
     with TestClient(create_app(settings)) as client:
         created = submit(client, CLOSE)
         detail = wait_for(client, created["task_id"], {"needs_approval"})
+        assert detail["planning_source"] == "trusted_collection"
         assert detail["pending_action"]["operation"] == "update_ticket"
+        assert detail["pending_action"]["arguments"]["fields"] == {"status": "closed"}
+        assert [step["operation"] for step in detail["plan"]] == [
+            "update_ticket",
+            "update_ticket",
+        ]
+        tickets = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in client.get("/api/v1/company/tickets").json()["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010"}
+        }
+        assert tickets == {"T-10009": "resolved", "T-10010": "resolved"}
+        events = [
+            event["event_type"]
+            for event in client.get(f"/api/v1/tasks/{created['task_id']}/history").json()[
+                "events"
+            ]
+        ]
+        assert events.count("approval.requested") == 1
+        assert events.count("approval.approved") == 0
         rejected = client.post(
             f"/api/v1/tasks/{created['task_id']}/reject",
             json={
@@ -617,11 +637,20 @@ def test_api_closing_batch_requires_approval(tmp_path: Path) -> None:
         )
         assert rejected.status_code == 200
         assert rejected.json()["status"] == "aborted"
+        tickets = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in client.get("/api/v1/company/tickets").json()["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010"}
+        }
+        assert tickets == {"T-10009": "resolved", "T-10010": "resolved"}
 
         created = submit(client, CLOSE)
         detail = wait_for(client, created["task_id"], {"needs_approval"})
+        approvals = 0
         while detail["status"] == "needs_approval":
             pending = detail["pending_action"]
+            assert pending is not None
+            assert pending["arguments"]["fields"]["status"] == "closed"
             response = client.post(
                 f"/api/v1/tasks/{created['task_id']}/approve",
                 json={
@@ -631,13 +660,29 @@ def test_api_closing_batch_requires_approval(tmp_path: Path) -> None:
                 },
             )
             assert response.status_code == 200, response.text
+            approvals += 1
             detail = wait_for(
                 client,
                 created["task_id"],
                 {"needs_approval", "completed", "failed"},
             )
+        assert approvals == 2
         assert detail["status"] == "completed"
         assert detail["verification_status"] == "passed"
+        events = [
+            event["event_type"]
+            for event in client.get(f"/api/v1/tasks/{created['task_id']}/history").json()[
+                "events"
+            ]
+        ]
+        assert events.count("approval.requested") == 2
+        assert events.count("approval.approved") == 2
+        tickets = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in client.get("/api/v1/company/tickets").json()["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010"}
+        }
+        assert tickets == {"T-10009": "closed", "T-10010": "closed"}
 
 
 def test_cli_assignment_resume_and_rejection(tmp_path: Path, capsys) -> None:
