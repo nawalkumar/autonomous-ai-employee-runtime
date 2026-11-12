@@ -847,7 +847,14 @@
         status = "not executed";
       }
       els.planList.appendChild(
-        el("li", { className: cls, attrs: { "data-step-id": step.step_id, "data-status": step.status } }, [
+        el("li", {
+          className: cls,
+          attrs: {
+            "data-step-id": step.step_id,
+            "data-status": step.status,
+            "data-approval": approvalLabel(t, step)
+          }
+        }, [
           el("div", { className: "step-badge", text: String(i + 1) }),
           el("div", null, [
             el("div", { className: "title", text: step.step_id + ": " + step.description }),
@@ -1026,11 +1033,27 @@
   }
 
   function approvalLabel(task, step) {
+    // A task-wide approval_status must not mark steps that never required approval.
     if (task.pending_action && task.pending_action.step_id === step.step_id && task.status === "needs_approval") {
-      return "awaiting approval";
+      return "Awaiting approval.";
     }
-    if (task.approval_status === "rejected" && step.status !== "completed") return "rejected";
-    return task.approval_status === "approved" ? "approved" : "not pending";
+    var related = (state.events || []).filter(function (event) {
+      var type = String(event.event_type || "");
+      var result = event.result || {};
+      return type.indexOf("approval.") === 0 && result.step_id === step.step_id;
+    });
+    var latest = related.length ? related[related.length - 1].event_type : "";
+    if (latest === "approval.approved") return "Approved.";
+    if (
+      latest === "approval.rejected" ||
+      (task.approval_status === "rejected" && task.pending_action && task.pending_action.step_id === step.step_id)
+    ) {
+      return "Rejected.";
+    }
+    if (latest === "approval.invalidated") return "Superseded.";
+    if (latest === "approval.requested") return "Awaiting approval.";
+    if (!related.length) return "Not required.";
+    return "Unknown.";
   }
 
   function stepVerificationLabel(stepId) {
@@ -1060,6 +1083,8 @@
     var counts = {};
     COLLECTION_STATUSES.forEach(function (name) { counts[name] = 0; });
     items.forEach(function (item) { counts[item.status] = (counts[item.status] || 0) + 1; });
+    // Same rows the API returned. Processed leaves out items that have not
+    // finished or are still running. Verified is never counted as completed.
     var processed = items.filter(function (item) {
       return item.status !== "pending" && item.status !== "running";
     }).length;
@@ -1073,7 +1098,9 @@
       el("div", { className: "k", text: "selected" }),
       el("div", { className: "v", text: String(items.length), attrs: { "data-field": "collection_selected" } }),
       el("div", { className: "k", text: "processed" }),
-      el("div", { className: "v", text: String(processed), attrs: { "data-field": "collection_processed" } })
+      el("div", { className: "v", text: String(processed), attrs: { "data-field": "collection_processed" } }),
+      el("div", { className: "k", text: "total" }),
+      el("div", { className: "v", text: String(items.length), attrs: { "data-field": "collection_total" } })
     ]));
     var chips = el("div", { className: "counts" });
     COLLECTION_STATUSES.forEach(function (name) {
