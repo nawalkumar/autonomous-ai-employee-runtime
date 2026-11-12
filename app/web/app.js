@@ -424,11 +424,15 @@
   }
 
   function approvalPending(task) {
-    // Approve/reject only when the selected task is paused on a concrete pending
-    // action with a fingerprint. Status alone is not enough: a poll can briefly
-    // show needs_approval before pending_action is present, which left the
-    // button disabled or unstable under Playwright.
-    if (!task || task.status !== "needs_approval" || !task.pending_action) return null;
+    // Approve/reject only for a durable pause: not mid-flight, status paused for
+    // approval, approval_status pending, and a concrete fingerprinted action.
+    // Matching the API's pending_action serialization (PENDING only) and the
+    // server-side wait_for(... and not executing) contract avoids advertising
+    // a ready control against a transitional revision the next GET will miss.
+    if (!task || task.executing) return null;
+    if (task.status !== "needs_approval") return null;
+    if (task.approval_status && task.approval_status !== "pending") return null;
+    if (!task.pending_action) return null;
     var pending = task.pending_action;
     if (!pending.step_id || !pending.fingerprint) return null;
     return pending;
@@ -628,6 +632,7 @@
     renderReplan();
     els.approvalCard.classList.remove("visible");
     els.approvalCard.setAttribute("data-approval-ready", "0");
+    els.approvalCard.setAttribute("data-task-id", "");
     els.approvalCard.removeAttribute("data-pending-step");
     els.approvalCard.removeAttribute("data-pending-fingerprint");
     show(els.resumeBtn, false);
@@ -914,6 +919,7 @@
     var pending = approvalPending(t);
     els.approvalCard.classList.toggle("visible", !!pending);
     els.approvalCard.setAttribute("data-approval-ready", pending ? "1" : "0");
+    els.approvalCard.setAttribute("data-task-id", t && t.task_id ? String(t.task_id) : "");
     if (!pending) {
       els.approvalCard.removeAttribute("data-pending-step");
       els.approvalCard.removeAttribute("data-pending-fingerprint");
