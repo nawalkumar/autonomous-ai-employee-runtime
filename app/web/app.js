@@ -1251,12 +1251,17 @@
     var t = state.task;
     var pending = approvalPending(t);
     if (!pending || state.acting) return;
-    // Freeze the target before the dialog; polls must not retarget the approve.
+    // Freeze the target and disable controls before the dialog. Acting must be
+    // set first: when Confirm closes the modal, some engines deliver a ghost
+    // click to whatever sits under the button (often Approve again), which would
+    // otherwise open a second dialog for the next pending step and race the test.
     var taskId = t.task_id;
     var stepId = pending.step_id;
     var fingerprint = pending.fingerprint;
     var operation = pending.tool + "." + pending.operation;
     var args = pending.arguments;
+    state.acting = true;
+    updateControls();
     stopPolling();
     var ok = await confirmAction(
       "Approve this write?",
@@ -1265,11 +1270,11 @@
       pretty(args)
     );
     if (!ok) {
+      state.acting = false;
+      updateControls();
       startPolling();
       return;
     }
-    state.acting = true;
-    updateControls();
     setMsg(els.approvalMsg, "Sending approval…");
     try {
       var res = await api.approve(taskId, stepId, fingerprint);
@@ -1299,17 +1304,19 @@
     var stepId = pending.step_id;
     var fingerprint = pending.fingerprint;
     var operation = pending.tool + "." + pending.operation;
+    state.acting = true;
+    updateControls();
     stopPolling();
     var ok = await confirmAction(
       "Reject this write?",
       "The task will be aborted and " + operation + " will not run. Reason: " + reason
     );
     if (!ok) {
+      state.acting = false;
+      updateControls();
       startPolling();
       return;
     }
-    state.acting = true;
-    updateControls();
     setMsg(els.approvalMsg, "Sending rejection…");
     try {
       var res = await api.reject(taskId, stepId, reason, fingerprint);
@@ -1329,17 +1336,19 @@
     var t = state.task;
     if (!t || !t.resumable || state.acting) return;
     var taskId = t.task_id;
+    state.acting = true;
+    updateControls();
     stopPolling();
     var ok = await confirmAction(
       "Resume this task?",
       "The server will continue task " + taskId + " from its persisted state. Interrupted calls are retried only within the retry budget and with the same idempotency key."
     );
     if (!ok) {
+      state.acting = false;
+      updateControls();
       startPolling();
       return;
     }
-    state.acting = true;
-    updateControls();
     setMsg(els.taskMsg, "Resuming…");
     try {
       var res = await api.resume(taskId);
