@@ -403,15 +403,21 @@ def test_unknown_operation_is_rejected_by_plan_validation(registry: ToolRegistry
 def test_unknown_operation_at_runtime_fails_without_side_effects(
     runtime: ExecutionRuntime, workspace: Path
 ) -> None:
+    from app.authz import AuthorizationError, AuthorizationReason
+
     (workspace / "keep.txt").write_text("keep", encoding="utf-8")
-    task = runtime.create_task(
-        user_goal="delete",
-        plan=[PlanStep(step_id="s", description="x", tool_name="file", arguments={"operation": "delete", "path": "keep.txt"})],
-    )
-    final = runtime.run(task.task_id)
-    assert final.final_status is TaskStatus.FAILED
-    assert [c.error_type for c in final.tool_calls] == [FailureType.INVALID_ARGS.value]
-    assert final.retry_count == 0
+    plan = [
+        PlanStep(
+            step_id="s",
+            description="x",
+            tool_name="file",
+            arguments={"operation": "delete", "path": "keep.txt"},
+        )
+    ]
+    # Goal-scoped authorization rejects unknown operations before any side effects.
+    with pytest.raises(AuthorizationError) as caught:
+        runtime.create_task(user_goal="delete", plan=plan)
+    assert caught.value.reason is AuthorizationReason.UNKNOWN_OPERATION
     assert (workspace / "keep.txt").read_text(encoding="utf-8") == "keep"
 
 
@@ -525,11 +531,11 @@ TICKET_GOAL = (
 # Event sequence recorded for this goal with one injected 503 before Phase 4
 # (v0.2.0), excluding the dashboard-only demo.failure_injected event.
 PRE_MIGRATION_TICKET_EVENTS = (
-    ["TASK_CREATED", "PLAN_STARTED", "STEP_STARTED", "TOOL_CALLED", "TOOL_SUCCEEDED",
-     "STEP_SUCCEEDED", "STEP_STARTED", "TOOL_CALLED", "TOOL_FAILED", "failure.detected",
-     "recovery.evaluated", "recovery.retry_started", "TOOL_CALLED", "recovery.retry_succeeded",
-     "TOOL_SUCCEEDED", "STEP_SUCCEEDED", "STEP_STARTED", "TOOL_CALLED", "TOOL_SUCCEEDED",
-     "STEP_SUCCEEDED", "verification.started"]
+    ["TASK_CREATED", "authorization.bound", "PLAN_STARTED", "STEP_STARTED", "TOOL_CALLED",
+     "TOOL_SUCCEEDED", "STEP_SUCCEEDED", "STEP_STARTED", "TOOL_CALLED", "TOOL_FAILED",
+     "failure.detected", "recovery.evaluated", "recovery.retry_started", "TOOL_CALLED",
+     "recovery.retry_succeeded", "TOOL_SUCCEEDED", "STEP_SUCCEEDED", "STEP_STARTED",
+     "TOOL_CALLED", "TOOL_SUCCEEDED", "STEP_SUCCEEDED", "verification.started"]
     + ["verification.check"] * 6
     + ["evidence.recorded"] * 9
     + ["verification.passed", "TASK_COMPLETED"]

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from app.authz import authorization_for_supported_goal
 from app.llm.mock import parse_supported_goal
 from app.models.enums import TaskStatus, VerificationStatus
 from app.planning import PlanningPipeline
@@ -30,7 +31,10 @@ def world(tmp_path: Path) -> World:
 def plan_from_goal(world: World, goal: str):
     planned = PlanningPipeline(MockLLMClient(), world.registry).interpret_and_plan(goal)
     return world.runtime.create_task(
-        user_goal=goal, interpreted_goal=planned.interpreted_goal, plan=planned.plan.steps
+        user_goal=goal,
+        interpreted_goal=planned.interpreted_goal,
+        plan=planned.plan.steps,
+        authorization=authorization_for_supported_goal(goal),
     )
 
 

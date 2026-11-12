@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.authz import AuthorizationScope
 from app.models.enums import TaskStatus
 from app.models.plan import PlanStep
 from app.models.state import ExecutionState
@@ -15,6 +16,7 @@ from app.store import SQLiteStore
 from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
 from app.world import CompanyRepository
 from app.world.demo_fixture import seed_demo_company
+from tests.authz_support import matching_scope_for_plan
 
 
 @dataclass
@@ -58,9 +60,40 @@ class World:
             )
         }
 
-    def run(self, *steps: PlanStep, approve: bool = True, user_goal: str = "test") -> ExecutionState:
+    def scope_for(self, *steps: PlanStep, **budget_overrides: int) -> AuthorizationScope:
+        """Trusted test helper: independently supply a scope matching the plan."""
+        scope = matching_scope_for_plan(list(steps))
+        if budget_overrides:
+            budgets = scope.budgets.model_copy(update=budget_overrides)
+            scope = scope.model_copy(update={"budgets": budgets})
+        return scope
+
+    def create(
+        self,
+        *steps: PlanStep,
+        user_goal: str = "test",
+        authorization: AuthorizationScope | None = None,
+        **kwargs: Any,
+    ) -> ExecutionState:
+        """Create a task with an independently supplied (or plan-matching) scope."""
+        plan = list(steps)
+        scope = authorization if authorization is not None else self.scope_for(*plan)
+        return self.runtime.create_task(
+            user_goal=user_goal,
+            plan=plan,
+            authorization=scope,
+            **kwargs,
+        )
+
+    def run(
+        self,
+        *steps: PlanStep,
+        approve: bool = True,
+        user_goal: str = "test",
+        authorization: AuthorizationScope | None = None,
+    ) -> ExecutionState:
         """Execute an explicit plan, approving every gated step if ``approve``."""
-        state = self.runtime.create_task(user_goal=user_goal, plan=list(steps))
+        state = self.create(*steps, user_goal=user_goal, authorization=authorization)
         state = self.runtime.run(state.task_id)
         while approve and state.final_status is TaskStatus.NEEDS_APPROVAL:
             state = self.runtime.approve_task(state.task_id, approver="test-approver")
@@ -79,7 +112,10 @@ def make_world(tmp_path: Path, *, demo: bool) -> World:
     registry.register(CompanyAPITool(repo, failure_injector=injector))
     registry.register(FileTool(workspace, protected_paths=[db]))
     store = SQLiteStore(db)
-    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=workspace)
+    lock_dir = db.parent / "locks"
+    runtime = ExecutionRuntime(
+        store=store, registry=registry, workspace_path=workspace, lock_dir=lock_dir
+    )
     return World(db, workspace, repo, injector, registry, store, runtime)
 
 
@@ -91,7 +127,10 @@ def reopen(world: World) -> World:
     registry.register(CompanyAPITool(repo, failure_injector=injector))
     registry.register(FileTool(world.workspace, protected_paths=[world.db]))
     store = SQLiteStore(world.db)
-    runtime = ExecutionRuntime(store=store, registry=registry, workspace_path=world.workspace)
+    lock_dir = world.db.parent / "locks"
+    runtime = ExecutionRuntime(
+        store=store, registry=registry, workspace_path=world.workspace, lock_dir=lock_dir
+    )
     return World(world.db, world.workspace, repo, injector, registry, store, runtime)
 
 
@@ -128,3 +167,12 @@ def step(step_id: str, operation: str, **arguments: Any) -> PlanStep:
 
 def checks(state: ExecutionState) -> dict[str, bool]:
     return {c["name"]: c["passed"] for c in state.verification_checks}
+
+
+def auth_for(*steps: PlanStep) -> AuthorizationScope:
+    """Independently supply a matching scope for an explicit test plan."""
+    return matching_scope_for_plan(list(steps))
+
+
+def auth_for_plan(plan: list[PlanStep]) -> AuthorizationScope:
+    return matching_scope_for_plan(list(plan))

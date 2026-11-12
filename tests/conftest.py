@@ -9,6 +9,29 @@ from app.store import SQLiteStore
 from app.tools import CompanyAPITool, FailureInjector, FileTool, ToolRegistry
 from app.verify import OutcomeVerifier
 from app.world import CompanyRepository
+from tests.authz_support import matching_scope_for_plan
+
+
+@pytest.fixture(autouse=True)
+def _inject_matching_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Trusted test boundary: when a test omits ``authorization``, supply a
+    narrow scope derived from the explicit plan. Production callers (CLI/API)
+    always pass an independently derived scope. Tests that need a missing or
+    narrower scope pass ``authorization=`` explicitly.
+    """
+    original = ExecutionRuntime.create_task
+
+    def create_task(self, *args, **kwargs):  # noqa: ANN001
+        if "authorization" not in kwargs:
+            plan = kwargs.get("plan")
+            if plan is None and len(args) >= 1:
+                # Positional use is not part of the public signature; ignore.
+                plan = None
+            if plan is not None:
+                kwargs["authorization"] = matching_scope_for_plan(list(plan))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ExecutionRuntime, "create_task", create_task)
 
 
 @pytest.fixture
@@ -60,5 +83,11 @@ def runtime(
     store: SQLiteStore,
     registry: ToolRegistry,
     verifier: OutcomeVerifier,
+    db_path: Path,
 ) -> ExecutionRuntime:
-    return ExecutionRuntime(store=store, registry=registry, verifier=verifier)
+    return ExecutionRuntime(
+        store=store,
+        registry=registry,
+        verifier=verifier,
+        lock_dir=db_path.parent / "locks",
+    )

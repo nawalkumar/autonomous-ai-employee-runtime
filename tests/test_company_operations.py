@@ -378,17 +378,26 @@ def test_deactivation_unknown_or_malformed_employee(world: World, employee_id, e
 
 
 def test_stale_approval_for_a_new_operation_is_never_executed(world: World) -> None:
+    """Changing the pending ticket to another entity is outside task scope.
+
+    Goal-scoped authorization fails closed before a stale-approval refresh can
+    authorize the new ticket. Neither ticket is mutated.
+    """
+    from app.runtime import ApprovalError
+
     paused = world.run(step("c", "update_ticket", ticket_id="T-10009", fields={"status": "closed"}), approve=False)
     assert paused.final_status is TaskStatus.NEEDS_APPROVAL
     assert paused.pending_action.fingerprint
     state = world.store.get_state(paused.task_id)
     plan = [state.plan[0].model_copy(update={"arguments": {**state.plan[0].arguments, "ticket_id": "T-10010"}})]
     world.store.save_state(state.model_copy(update={"plan": plan}))
-    with pytest.raises(StaleApprovalError):
+    with pytest.raises(ApprovalError, match="authorization scope"):
         world.runtime.approve_task(paused.task_id)
+    final = world.store.get_state(paused.task_id)
+    assert final.final_status is TaskStatus.FAILED
+    assert final.pending_action is None
     assert world.repo.get_ticket("T-10009").status == "resolved"
     assert world.repo.get_ticket("T-10010").status == "resolved"
-    assert world.store.get_state(paused.task_id).pending_action.arguments["ticket_id"] == "T-10010"
 
 
 def test_transient_failure_retry_writes_once(world: World) -> None:

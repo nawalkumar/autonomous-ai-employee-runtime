@@ -596,6 +596,12 @@ def test_api_binds_approval_to_the_displayed_fingerprint(api_settings: Settings)
 
 
 def test_api_reports_stale_pending_action_and_new_request(api_settings: Settings) -> None:
+    """Changing a pending action outside the goal scope fails closed (unauthorized).
+
+    Scenario A authorizes title ``Senior Engineer`` exactly. Mutating the pending
+    step to ``CEO`` is outside scope, so approval cannot continue it — distinct
+    from an in-scope fingerprint mismatch (``stale_approval``).
+    """
     with TestClient(create_app(api_settings)) as client:
         task_id = wait_for(client, submit(client, EMPLOYEE_GOAL)["task_id"], {"needs_approval"})["task_id"]
         store = build_runtime(api_settings).store
@@ -605,11 +611,12 @@ def test_api_reports_stale_pending_action_and_new_request(api_settings: Settings
             f"/api/v1/tasks/{task_id}/approve", json={"step_id": "step_1", "confirm": True}
         )
         assert response.status_code == 409
-        assert response.json()["error"]["code"] == "stale_approval"
-        pending = client.get(f"/api/v1/tasks/{task_id}").json()["pending_action"]
-        assert pending["arguments"]["fields"] == {"title": "CEO"}
+        assert response.json()["error"]["code"] == "unauthorized"
+        detail = client.get(f"/api/v1/tasks/{task_id}").json()
+        assert detail["status"] == "failed"
+        assert detail["pending_action"] is None
         types = [e["event_type"] for e in client.get(f"/api/v1/tasks/{task_id}/history").json()["events"]]
-        assert types[-2:] == ["approval.invalidated", "approval.requested"]
+        assert "authorization.denied" in types
 
 
 def test_api_exposes_unverified_status(api_settings: Settings) -> None:
