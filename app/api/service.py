@@ -45,10 +45,7 @@ from app.api.schemas import (
     WorkspaceFileContent,
     WorkspaceFileOut,
 )
-from app.authz import (
-    AuthorizationError,
-    authorization_for_supported_goal,
-)
+from app.authz import AuthorizationError, authorization_for_supported_goal
 from app.cli import CliError, CliRuntime, build_runtime
 from app.config import Settings
 from app.models.enums import (
@@ -295,7 +292,12 @@ class TaskService:
                 )
 
             try:
-                authorization = authorization_for_supported_goal(goal)
+                authorization = planned.authorization
+                if authorization is None:
+                    authorization = authorization_for_supported_goal(
+                        goal,
+                        max_recovery_attempts=rt.settings.max_recovery_attempts,
+                    )
             except AuthorizationError as exc:
                 raise ApiError(
                     422,

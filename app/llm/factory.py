@@ -15,5 +15,7 @@ def create_llm_client(settings: Settings | None = None) -> LLMClient:
             api_key=cfg.xai_api_key,
             model=cfg.xai_model,
             base_url=cfg.xai_base_url,
+            timeout_seconds=cfg.llm_request_timeout_seconds,
+            max_response_bytes=cfg.llm_max_response_bytes,
         )
     raise ValueError(f"Unsupported LLM_PROVIDER: {cfg.llm_provider}")
