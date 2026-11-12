@@ -186,6 +186,54 @@ every value comes from the API:
 `demo-ui/index.html` is the earlier **scripted simulation** for offline presentations.
 It is clearly labelled, is not served by the API, and does not execute anything.
 
+### Reproducible local demo
+
+This is a local demonstration of the real API and SQLite database. It is not a
+production deployment, and a scripted provider is not live model reasoning.
+
+```text
+uv run python -m app.world.demo_fixture --database data/demo.db
+DATABASE_PATH=data/demo.db AAE_DYNAMIC_PLANNING_ENABLED=true uv run aae-api
+```
+
+Open http://127.0.0.1:8000. The seeder writes only a new, empty, or already marked
+demo file. `--reset` recreates a marked demo file. It refuses any other database,
+including a normal `data/runtime.db`, and it refuses a directory. Loading the
+dashboard does not seed or migrate the company tables.
+
+With dynamic planning on, the page can show:
+
+- `List up to 5 open high-priority tickets.` Read-only. The ids on the page are the
+  ids the tool returned. The demo fixture has three open high-priority tickets.
+- `Assign up to 2 open high-priority tickets to employee E-40.` Collection progress
+  comes from the API. `completed` means the step ran. `verified` means independent
+  verification passed.
+- `Mark tickets T-10009 and T-10010 as closed.` The page pauses once per ticket.
+  Approve only after reading the pending arguments. Both tickets stay resolved
+  until those approvals.
+- `Assign ticket T-10018 to eligible Support employee E-45.` This fails the company
+  rule. The page shows `failed`.
+
+Each plan step says whether approval was not required, is awaiting, was approved,
+or was rejected. A finished task does not mark every step approved.
+
+Automatic replanning stays off unless `AAE_REPLANNING_ENABLED=true` in the server
+environment. The page cannot change that flag. A trusted batch such as "mark these
+tickets as open" cannot recover by switching to another status, because that would
+widen the original authorization. An accepted revision is visible when a task was
+actually committed with a replacement inside its existing scope. Integration tests
+that show `replan.accepted` use a scripted provider in the test process. Set
+`AAE_MAX_REPLAN_ROUNDS=0` to show `replan.exhausted` with no provider call.
+
+Browser tests, including those scripted cases:
+
+```text
+AAE_REQUIRE_BROWSER_TESTS=1 AAE_TEST_MODE=1 uv run pytest -q tests/test_dashboard_operations.py
+```
+
+`AAE_TEST_MODE=1` alone does not replace the model. The fixed plan is used only when
+`AAE_TEST_SCRIPTED_PLAN` is also set, and only in that process.
+
 ## CLI walkthrough
 
 `python -m app.cli` is equivalent to `aae`. Every command prints the resolved database
@@ -303,12 +351,16 @@ Behaviour worth knowing:
 - Approve, reject and resume take the task's lock (waiting up to 2 s). Concurrent or
   repeated approvals execute the write once; the others get `409`.
 - `pending_action.fingerprint` identifies the exact action awaiting approval (tool,
-  operation and canonical arguments). Sending it with approve or reject is optional; if
-  it does not match the pending action, nothing changes and the response is
-  `409 stale_approval`. Approve also returns `409 stale_approval` when the planned step
-  no longer matches the pending action; the server then records `approval.invalidated`
-  and requests a fresh approval for the current action. The dashboard always sends the
-  fingerprint it displayed.
+  operation and canonical arguments). The documented request may omit it, because the
+  CLI loads the pending action and sends that fingerprint itself, and older API clients
+  send only `step_id` and `confirm`. A fingerprint that is present must match; a
+  mismatch returns `409 stale_approval` and changes nothing. Requiring the field on
+  every request would reject those clients, so local mode still accepts a missing
+  fingerprint. That is not authentication. Anyone who can reach the local API can
+  approve. The dashboard always sends the fingerprint it displayed. Approve also
+  returns `409 stale_approval` when the planned step no longer matches the pending
+  action; the server then records `approval.invalidated` and requests a fresh approval
+  for the current action. A changed mutation does not reuse the previous approval.
 - `verification_status` is `pending`, `passed`, `failed` or `unverified`. `unverified`
   means the task completed but had no outcome to check independently (for example a
   read-only plan); it is never reported as `passed`.
@@ -1154,7 +1206,12 @@ one instance.
   memory; behind Render's proxy all clients may share one rate-limit key if the last
   forwarded hop is a proxy address, which makes limits stricter, not looser.
 - **No accounts or roles.** Local mode trusts whoever can reach localhost. In public mode
-  the session that creates a task is the one that approves it.
+  the session that creates a task is the one that approves it. A missing approval
+  fingerprint is still accepted so the documented CLI and API bodies keep working.
+  The dashboard sends the fingerprint it showed. This milestone does not add accounts.
+- **Scripted plans are tests.** `AAE_TEST_SCRIPTED_PLAN` replaces the provider only
+  when `AAE_TEST_MODE=1` as well. Do not set either on a shared server. Those
+  responses are not live model reasoning.
 - **Approver identity** is a label (`local-dashboard`, `demo-session:<id>`, `cli:<user>`),
   not an authenticated person.
 - **Interrupted writes** are re-invoked with the same idempotency key within the retry
