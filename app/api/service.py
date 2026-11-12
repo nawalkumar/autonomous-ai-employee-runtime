@@ -187,6 +187,21 @@ def _sha256(text: str) -> str:
 # --- Service --------------------------------------------------------------------
 
 
+def _planning_source(goal: str) -> str:
+    """How this goal was allowed to become a plan. Never taken from model text."""
+    from app.llm.mock import parse_supported_goal
+    from app.planning.intents import COLLECTION_INTENT_IDS, parse_trusted_intent
+
+    if parse_supported_goal(goal) is not None:
+        return "mock"
+    intent = parse_trusted_intent(goal)
+    if intent is None:
+        return "unknown"
+    if intent.intent_id in COLLECTION_INTENT_IDS:
+        return "trusted_collection"
+    return "dynamic_catalog"
+
+
 class TaskService:
     def __init__(self, *, jobs: JobRunner, redactor: Redactor, allow_failure_injection: bool):
         self.jobs = jobs
@@ -665,6 +680,7 @@ class TaskService:
                 state.final_status in (TaskStatus.QUEUED, TaskStatus.RUNNING) and not executing
             ),
             idempotent_replay=idempotent_replay,
+            planning_source=_planning_source(state.user_goal),
             collection_progress=[
                 CollectionProgressOut(
                     collection_id=item.collection_id,

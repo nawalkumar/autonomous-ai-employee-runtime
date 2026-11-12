@@ -76,12 +76,18 @@ class ScenarioOut(BaseModel):
     goals: list[str]
     requires_approval: bool
     injectable_operation: str | None
+    # mock: the two original grammars. trusted_collection: deterministic, no model.
+    # dynamic_catalog: the model may propose a plan inside a trusted grammar.
+    planning: Literal["mock", "trusted_collection", "dynamic_catalog"] = "mock"
 
 
 class ScenariosResponse(BaseModel):
     scenarios: list[ScenarioOut]
     supported_formats: list[str]
     failure_injection_enabled: bool
+    dynamic_planning_enabled: bool = False
+    # Read-only. The dashboard cannot change this.
+    replanning_enabled: bool = False
 
 
 class CapabilityOut(BaseModel):
@@ -126,6 +132,8 @@ class SessionResponse(BaseModel):
     task_quota: int | None
     tasks_used: int | None
     notice: str
+    dynamic_planning_enabled: bool = False
+    replanning_enabled: bool = False
 
 
 class CriterionOut(BaseModel):
@@ -246,6 +254,7 @@ class TaskDetail(BaseModel):
     resumable: bool
     idempotent_replay: bool = False
     collection_progress: list[CollectionProgressOut] = Field(default_factory=list)
+    planning_source: Literal["mock", "trusted_collection", "dynamic_catalog", "unknown"] = "unknown"
 
 
 class EventOut(BaseModel):
