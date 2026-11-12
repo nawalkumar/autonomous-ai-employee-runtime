@@ -52,10 +52,21 @@ def ref(step_id: str, *path: Any) -> dict[str, Any]:
 
 
 def _persist_corrupt(world: World, task_id: str, **updates: Any) -> None:
+    """Plant a corrupt row below the ordinary-save guard.
+
+    The guard refuses this write. The runtime must still fail closed when the
+    stored JSON itself has been replaced.
+    """
     state = world.runtime.load(task_id)
     data = state.model_dump(mode="json")
     data.update(updates)
-    world.store.save_state(type(state).model_validate(data))
+    payload = type(state).model_validate(data).model_dump_json()
+    world.execute(
+        "UPDATE tasks SET state_json = ?, status = ? WHERE task_id = ?",
+        payload,
+        data["final_status"],
+        task_id,
+    )
 
 
 # --- Task 1: fingerprints -------------------------------------------------------

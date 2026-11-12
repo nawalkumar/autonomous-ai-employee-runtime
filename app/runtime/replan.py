@@ -5,8 +5,10 @@ recognized recoverable business-state condition occurs, and only when a trusted
 enablement context says replanning is on. It never rewrites history, resets
 budgets, expands authorization, or auto-approves mutations.
 
-Execution does not call this module. ``AAE_REPLANNING_ENABLED=false`` is the
-default, and a direct call with no enablement context fails closed.
+``AAE_REPLANNING_ENABLED=false`` is the default. A direct call with no
+enablement context fails closed. When the flag is on, the executor may commit
+a revision only through ``commit_replan`` for the recoverable triggers below.
+Ordinary state saves cannot install that revision.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from app.planning.schemas import DynamicPlanDraft
 from app.planning.validator import PlanValidationError, validate_plan
 from app.runtime.collections import CollectionError, select_collection_items
 from app.runtime.transitions import EventType, make_event
+from app.store.revision_guard import StaleRevisionError, plan_structure_token
 from app.store.sqlite_store import SQLiteStore
 from app.tools.capabilities import CAPABILITIES, CapabilityRegistry, operation_of
 from app.tools.registry import ToolRegistry
@@ -263,6 +266,20 @@ def validate_revision(
         return RevisionVerdict(
             ok=False,
             reason="rejected:invalid_proposal",
+            authorization="not_evaluated",
+            budgets=budgets,
+        )
+    unfinished = [
+        step
+        for step in state.plan
+        if step.step_id not in completed and step.status is not PlanStepStatus.SKIPPED
+    ]
+    if unfinished and [_step_signature(step) for step in unfinished] == [
+        _step_signature(step) for step in replacement
+    ]:
+        return RevisionVerdict(
+            ok=False,
+            reason="rejected:no_progress",
             authorization="not_evaluated",
             budgets=budgets,
         )
@@ -527,6 +544,19 @@ def apply_replan(state: ExecutionState, result: ReplanResult) -> ExecutionState:
         (index for index, step in enumerate(new_plan) if step.step_id not in completed_ids),
         len(new_plan),
     )
+    pending = state.pending_action
+    approval = state.approval_status
+    if pending is not None:
+        match = next((step for step in new_plan if step.step_id == pending.step_id), None)
+        same_action = (
+            match is not None
+            and match.resolved_tool_name() == pending.tool_name
+            and (match.arguments or {}) == (pending.arguments or {})
+        )
+        if not same_action:
+            pending = None
+            if approval in (ApprovalStatus.PENDING, ApprovalStatus.APPROVED):
+                approval = ApprovalStatus.NONE
     return state.model_copy(
         update={
             "plan": new_plan,
@@ -534,6 +564,8 @@ def apply_replan(state: ExecutionState, result: ReplanResult) -> ExecutionState:
             "last_replan_trigger": result.trigger,
             "current_step": current_step,
             "final_status": state.final_status,
+            "pending_action": pending,
+            "approval_status": approval,
         }
     ).touch()
 
@@ -564,6 +596,9 @@ def commit_replan(
         )
         return refused, state
 
+    stored = store.get_state(state.task_id)
+    expected_count = state.replan_count if stored is None else stored.replan_count
+    expected_structure = plan_structure_token(state.plan if stored is None else stored.plan)
     state = _anchor_state(store, state)
     # Persisted task scope wins over the object the caller passed in.
     del scope
@@ -602,15 +637,17 @@ def commit_replan(
             }
         )
         updated = _clamp_limit(state, trusted_limit)
-        _persist(
+        installed = _install(
             store,
             state,
             updated,
             final,
             authorization="not_evaluated",
             budgets=budgets,
+            expected_replan_count=expected_count,
+            expected_structure=expected_structure,
         )
-        return final, updated
+        return installed
 
     if bound is None:
         final = result.model_copy(
@@ -623,15 +660,16 @@ def commit_replan(
             }
         )
         updated = _clamp_limit(state, trusted_limit)
-        _persist(
+        return _install(
             store,
             state,
             updated,
             final,
             authorization="denied",
             budgets=budgets,
+            expected_replan_count=expected_count,
+            expected_structure=expected_structure,
         )
-        return final, updated
 
     authorization: AuthorizationOutcome = "not_evaluated"
     if result.accepted:
@@ -685,15 +723,16 @@ def commit_replan(
 
     updated = _clamp_limit(apply_replan(state, final), trusted_limit)
     budgets = {**budgets, "replan_limit": updated.replan_limit}
-    _persist(
+    return _install(
         store,
         state,
         updated,
         final,
         authorization=authorization,
         budgets=budgets,
+        expected_replan_count=expected_count,
+        expected_structure=expected_structure,
     )
-    return final, updated
 
 
 async def propose_and_commit(
@@ -720,11 +759,12 @@ async def propose_and_commit(
 
 
 def _anchor_state(store: SQLiteStore, state: ExecutionState) -> ExecutionState:
-    """Restore durable counters from the last committed snapshot.
+    """Rebuild the revision base from the last committed snapshot.
 
-    A caller can hand in a copy with a higher round cap, a lower round count,
-    or tool-call history removed. None of those are allowed to loosen the
-    budgets or the replan limit that were already persisted.
+    The stored plan, authorization, round count and round cap win. A caller
+    who already spliced a plan in memory, raised the cap, or dropped tool-call
+    history does not get that copy persisted. Completed step ids are kept only
+    when those steps still exist on the stored plan.
     """
     stored = store.get_state(state.task_id)
     if stored is None:
@@ -734,30 +774,28 @@ def _anchor_state(store: SQLiteStore, state: ExecutionState) -> ExecutionState:
     for call in state.tool_calls or []:
         if call.call_id not in seen:
             merged_calls.append(call)
-    completed = list(
-        dict.fromkeys([*(stored.completed_steps or []), *(state.completed_steps or [])])
-    )
-    stored_completed = {
-        step.step_id: step
-        for step in stored.plan
-        if step.step_id in set(stored.completed_steps or [])
-    }
-    plan = list(state.plan)
-    present = {step.step_id for step in plan}
-    missing = [
-        stored_completed[step_id]
-        for step_id in stored.completed_steps or []
-        if step_id in stored_completed and step_id not in present
+    on_plan = {step.step_id for step in stored.plan}
+    completed = [
+        step_id
+        for step_id in dict.fromkeys(
+            [*(stored.completed_steps or []), *(state.completed_steps or [])]
+        )
+        if step_id in on_plan
     ]
-    if missing:
-        plan = [*missing, *plan]
-    return state.model_copy(
+    completed_ids = set(completed)
+    plan = [
+        step.model_copy(update={"status": PlanStepStatus.COMPLETED})
+        if step.step_id in completed_ids
+        else step
+        for step in stored.plan
+    ]
+    return stored.model_copy(
         update={
             "plan": plan,
             "tool_calls": merged_calls,
             "completed_steps": completed,
             "replan_limit": min(int(stored.replan_limit), int(state.replan_limit)),
-            "replan_count": max(int(stored.replan_count), int(state.replan_count)),
+            "replan_count": int(stored.replan_count),
         }
     )
 
@@ -778,6 +816,42 @@ def _consumes_round(result: ReplanResult) -> bool:
     return True
 
 
+def _install(
+    store: SQLiteStore,
+    before: ExecutionState,
+    updated: ExecutionState,
+    result: ReplanResult,
+    *,
+    authorization: AuthorizationOutcome,
+    budgets: dict[str, int],
+    expected_replan_count: int,
+    expected_structure: str,
+) -> tuple[ReplanResult, ExecutionState]:
+    try:
+        _persist(
+            store,
+            before,
+            updated,
+            result,
+            authorization=authorization,
+            budgets=budgets,
+            expected_replan_count=expected_replan_count,
+            expected_structure=expected_structure,
+        )
+    except StaleRevisionError:
+        current = store.get_state(before.task_id) or before
+        stale = result.model_copy(
+            update={
+                "accepted": False,
+                "reason": "rejected:stale_revision",
+                "replacement_steps": [],
+                "revision": current.replan_count,
+            }
+        )
+        return stale, current
+    return result, updated
+
+
 def _persist(
     store: SQLiteStore,
     before: ExecutionState,
@@ -786,6 +860,8 @@ def _persist(
     *,
     authorization: AuthorizationOutcome,
     budgets: dict[str, int],
+    expected_replan_count: int,
+    expected_structure: str,
 ) -> None:
     events = _replan_events(
         before,
@@ -794,7 +870,12 @@ def _persist(
         budgets=budgets,
         authorization=authorization,
     )
-    store.save_state_and_events(updated, events)
+    store.commit_checked_revision(
+        updated,
+        events,
+        expected_replan_count=expected_replan_count,
+        expected_structure=expected_structure,
+    )
 
 
 def _replan_events(
@@ -907,6 +988,23 @@ def _budget_summary(
 def _step_is_mutating(step: PlanStep) -> bool:
     tool = step.resolved_tool_name() or ""
     return call_is_mutating(tool, step.arguments)
+
+
+def _step_signature(step: PlanStep) -> str:
+    collection = (
+        step.collection.model_dump(mode="json") if step.collection is not None else None
+    )
+    return json.dumps(
+        {
+            "step_id": step.step_id,
+            "tool": step.resolved_tool_name(),
+            "operation": _operation_name(step.arguments),
+            "arguments": step.arguments or {},
+            "collection": collection,
+        },
+        sort_keys=True,
+        default=str,
+    )
 
 
 def _operation_name(arguments: dict[str, Any] | None) -> str | None:

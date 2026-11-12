@@ -461,14 +461,19 @@ def test_restart_with_corrupted_authorization(world: World) -> None:
         "constraints": {},
         "budgets": {"max_steps": 10, "max_mutations": 10, "max_tool_calls": 10},
     }
-    # Keep old fingerprint so resume detects tampering.
-    world.store.save_state(
-        type(state).model_validate(
-            {
-                **corrupted,
-                "authorization_fingerprint": state.authorization_fingerprint,
-            }
-        )
+    # Keep old fingerprint so resume detects tampering. The ordinary save
+    # refuses a scope swap; this plants the corrupt row the way a rewritten
+    # database file would.
+    planted = type(state).model_validate(
+        {
+            **corrupted,
+            "authorization_fingerprint": state.authorization_fingerprint,
+        }
+    )
+    world.execute(
+        "UPDATE tasks SET state_json = ? WHERE task_id = ?",
+        planted.model_dump_json(),
+        task.task_id,
     )
     restarted = reopen(world)
     final = restarted.runtime.run(task.task_id)

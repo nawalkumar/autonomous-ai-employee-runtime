@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +46,12 @@ from app.runtime.recovery import (
     classify_failure,
     evaluate_recovery,
 )
+from app.runtime.replan import (
+    enablement_for_runtime,
+    propose_and_commit,
+    task_scope,
+)
+from app.runtime.replan_triggers import recoverable_trigger
 from app.runtime.transitions import (
     EventType,
     action_fingerprint,
@@ -131,6 +138,9 @@ class ExecutionRuntime:
                 CompanyRepository(store.db_path),
                 ws,
             )
+        # Tests inject a scripted client. Production builds one only when a
+        # supported failure is actually replanned.
+        self._replan_llm: Any = None
 
     @contextmanager
     def _maybe_execution_lock(self, task_id: str, execution_locked: bool):
@@ -186,7 +196,7 @@ class ExecutionRuntime:
 
         fingerprint = authorization.fingerprint()
         # Round cap comes from validated settings, never from caller arguments.
-        # Replanning stays opt-in and is not invoked by execute/run/approve.
+        # Automatic replanning stays off unless AAE_REPLANNING_ENABLED is set.
         replan_limit = get_settings().aae_max_replan_rounds
         kwargs: dict[str, Any] = {
             "user_goal": user_goal,
@@ -907,6 +917,17 @@ class ExecutionRuntime:
                         },
                     )
                 )
+            else:
+                replanned = self._replan_failed_step(
+                    state,
+                    step_index,
+                    step,
+                    call,
+                    result,
+                    decision.failure_type,
+                )
+                if replanned is not None:
+                    return replanned
             return self._finalize_step_failure(
                 state=state,
                 step_index=step_index,
@@ -1048,9 +1069,10 @@ class ExecutionRuntime:
         result: ToolResult,
         failure_type: FailureType,
         recovery_action: str,
+        completion_summary: str | None = None,
     ) -> ExecutionState:
         step = state.plan[step_index]
-        summary = observe_tool_result(call.tool_name, result)
+        summary = completion_summary or observe_tool_result(call.tool_name, result)
         plan = list(state.plan)
         plan[step_index] = step.model_copy(update={"status": PlanStepStatus.FAILED})
         state = state.model_copy(
@@ -1872,6 +1894,85 @@ class ExecutionRuntime:
         if "path" in data:
             extracted["last_file_path"] = data.get("path")
         return extracted
+
+    def _replan_failed_step(
+        self,
+        state: ExecutionState,
+        step_index: int,
+        step: PlanStep,
+        call: ToolCallRecord,
+        result: ToolResult,
+        failure_type: FailureType,
+    ) -> ExecutionState | None:
+        """Commit one bounded revision for a supported business conflict.
+
+        Returns None when replanning does not apply, so the caller fails the
+        step exactly as before. An accepted revision resumes under the lock
+        already held by this execution. A rejected revision fails the task
+        with the rejection reason and does not run the proposed steps.
+        """
+        enablement = enablement_for_runtime()
+        if not enablement.enabled:
+            return None
+        if state.approval_status is ApprovalStatus.REJECTED:
+            return None
+        trigger = recoverable_trigger(result, failure_type)
+        if trigger is None:
+            return None
+        fresh = self.load(state.task_id)
+        scope = task_scope(fresh)
+        if scope is None:
+            return self._finalize_step_failure(
+                state=fresh,
+                step_index=step_index,
+                call=call,
+                result=result,
+                failure_type=failure_type,
+                recovery_action=RecoveryAction.FAIL.value,
+                completion_summary="Replan refused: missing authorization",
+            )
+        from app.runtime.replan import Replanner
+
+        replanner = Replanner(
+            self._replan_client(),
+            self.registry,
+            max_tokens=get_settings().llm_max_tokens,
+        )
+        outcome, revised = asyncio.run(
+            propose_and_commit(
+                self.store,
+                replanner,
+                fresh,
+                scope,
+                trigger=trigger,
+                failure_summary=(result.error_message or "")[:500],
+                enablement=enablement,
+            )
+        )
+        if outcome.accepted:
+            return self._execute_next_locked(revised.task_id)
+        reloaded = self.load(revised.task_id)
+        index = next(
+            (i for i, item in enumerate(reloaded.plan) if item.step_id == step.step_id),
+            step_index,
+        )
+        return self._finalize_step_failure(
+            state=reloaded,
+            step_index=index,
+            call=call,
+            result=result,
+            failure_type=failure_type,
+            recovery_action=RecoveryAction.FAIL.value,
+            completion_summary=f"Replan {outcome.reason}",
+        )
+
+    def _replan_client(self) -> Any:
+        if self._replan_llm is not None:
+            return self._replan_llm
+        from app.llm.factory import create_llm_client
+
+        self._replan_llm = create_llm_client(get_settings())
+        return self._replan_llm
 
     def _save(self, state: ExecutionState) -> ExecutionState:
         state = sync_collection_progress(state)
