@@ -143,16 +143,44 @@ def parse_collection_item_ref(value: Any) -> CollectionItemRef | None:
     return CollectionItemRef.model_validate(inner)
 
 
+# Derived from plan-step, approval and verification state. "verified" is set only
+# after independent verification passes — a completed step or model reply is not
+# success. "succeeded" is accepted only as a legacy alias for "completed".
+CollectionItemStatus = Literal[
+    "pending",
+    "running",
+    "awaiting_approval",
+    "completed",
+    "verified",
+    "failed",
+    "rejected",
+    "skipped",
+]
+
+_LEGACY_PROGRESS_STATUS = {"succeeded": "completed"}
+
+
 class CollectionProgress(BaseModel):
-    """Per-item progress for an expanded collection workflow."""
+    """Per-item progress for an expanded collection workflow.
+
+    ``status`` is a projection of the linked plan step plus task approval and
+    verification. It is not a second record of what the model claimed.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     collection_id: str
     item_id: str
     step_id: str
-    status: Literal["pending", "running", "succeeded", "failed", "skipped"] = "pending"
-    error: str | None = None
+    status: CollectionItemStatus = "pending"
+    error: str | None = Field(default=None, max_length=200)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _legacy_status(cls, value: object) -> object:
+        if isinstance(value, str):
+            return _LEGACY_PROGRESS_STATUS.get(value, value)
+        return value
 
 
 class CollectionExecutionState(BaseModel):

@@ -16,7 +16,12 @@ from app.models.collections import (
     CollectionWork,
     parse_collection_item_ref,
 )
-from app.models.enums import ToolCallStatus
+from app.models.enums import (
+    ApprovalStatus,
+    PlanStepStatus,
+    ToolCallStatus,
+    VerificationStatus,
+)
 from app.models.ids import new_id
 from app.models.plan import PlanStep
 from app.models.references import BindingError, read_path
@@ -205,3 +210,82 @@ def progress_records(
             )
         )
     return records
+
+
+def sync_collection_progress(state: ExecutionState) -> ExecutionState:
+    """Project collection item status from step, approval and verification state.
+
+    Plan-step status, the pending approval and the task verification result are
+    the source of truth. This projection is deterministic: the same snapshot
+    always yields the same item statuses, including after a restart.
+    """
+    records = list(state.collections.progress or [])
+    if not records:
+        return state
+    steps = {step.step_id: step for step in state.plan}
+    updated = [
+        _project_progress(state, record, steps.get(record.step_id)) for record in records
+    ]
+    if updated == records:
+        return state
+    return state.model_copy(
+        update={
+            "collections": state.collections.model_copy(update={"progress": updated})
+        }
+    )
+
+
+def _project_progress(
+    state: ExecutionState,
+    record: CollectionProgress,
+    step: PlanStep | None,
+) -> CollectionProgress:
+    status, error = _progress_status(state, step)
+    if record.status == status and record.error == error:
+        return record
+    return record.model_copy(update={"status": status, "error": error})
+
+
+def _progress_status(
+    state: ExecutionState,
+    step: PlanStep | None,
+) -> tuple[str, str | None]:
+    """Map durable execution state onto one collection-item status.
+
+    Independent verification is the only path to ``verified``. Tool output and
+    model text are not consulted.
+    """
+    if step is None:
+        return "failed", "missing_step"
+
+    pending = state.pending_action
+    approval_for_step = pending is not None and pending.step_id == step.step_id
+    if (
+        state.approval_status is ApprovalStatus.REJECTED
+        and approval_for_step
+        and step.status in {PlanStepStatus.PENDING, PlanStepStatus.RUNNING}
+    ):
+        return "rejected", "approval_rejected"
+
+    if step.status is PlanStepStatus.FAILED:
+        return "failed", "execution_failed"
+    if step.status is PlanStepStatus.SKIPPED:
+        return "skipped", None
+    if (
+        state.approval_status is ApprovalStatus.PENDING
+        and approval_for_step
+        and step.status is PlanStepStatus.PENDING
+    ):
+        return "awaiting_approval", None
+    if step.status is PlanStepStatus.RUNNING:
+        return "running", None
+    if step.status is PlanStepStatus.PENDING:
+        return "pending", None
+    if step.status is PlanStepStatus.COMPLETED:
+        if state.verification_status is VerificationStatus.PASSED:
+            return "verified", None
+        if state.verification_status is VerificationStatus.FAILED:
+            return "failed", "verification_failed"
+        # Executed, but not independently verified (pending or unverified).
+        return "completed", None
+    return "failed", "execution_failed"

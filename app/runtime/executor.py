@@ -39,6 +39,7 @@ from app.models.state import ExecutionState
 from app.policy import ApprovalPolicy
 from app.models.references import BindingError, contains_reference
 from app.runtime.binding import prepare_arguments
+from app.runtime.collections import sync_collection_progress
 from app.runtime.recovery import (
     RecoveryAction,
     classify_failure,
@@ -184,6 +185,9 @@ class ExecutionRuntime:
             criteria = list(interpreted_goal.success_criteria)
 
         fingerprint = authorization.fingerprint()
+        # Round cap comes from validated settings, never from caller arguments.
+        # Replanning stays opt-in and is not invoked by execute/run/approve.
+        replan_limit = get_settings().aae_max_replan_rounds
         kwargs: dict[str, Any] = {
             "user_goal": user_goal,
             "interpreted_goal": interpreted_goal,
@@ -193,18 +197,24 @@ class ExecutionRuntime:
             "authorization_fingerprint": fingerprint,
             "final_status": TaskStatus.QUEUED,
             "current_step": 0,
+            "replan_count": 0,
+            "replan_limit": replan_limit,
         }
         if task_id is not None:
             kwargs["task_id"] = task_id
 
         state = ExecutionState(**kwargs)
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
                 event_type=EventType.TASK_CREATED,
                 action="create_task",
-                result={"plan_steps": len(plan), "user_goal": user_goal},
+                result={
+                    "plan_steps": len(plan),
+                    "user_goal": user_goal,
+                    "replan_limit": replan_limit,
+                },
             )
         )
         self._emit(
@@ -226,7 +236,9 @@ class ExecutionRuntime:
         state = self.store.get_state(task_id)
         if state is None:
             raise KeyError(f"Unknown task_id: {task_id}")
-        return state
+        # Item progress is a projection of step/approval/verification state, so a
+        # snapshot saved by an older build (or mid-flight) still reads correctly.
+        return sync_collection_progress(state)
 
     def run(self, task_id: str, *, execution_locked: bool = False) -> ExecutionState:
         """Execute pending steps until complete, failed, aborted, or approval required.
@@ -359,7 +371,7 @@ class ExecutionRuntime:
                     "final_status": TaskStatus.RUNNING,
                 }
             ).touch()
-            self._save(state)
+            state = self._save(state)
             self._emit(
                 make_event(
                     task_id=state.task_id,
@@ -407,7 +419,7 @@ class ExecutionRuntime:
                     "completion_summary": reason,
                 }
             ).touch()
-            self._save(state)
+            state = self._save(state)
             self._emit(
                 make_event(
                     task_id=state.task_id,
@@ -549,7 +561,7 @@ class ExecutionRuntime:
                     ],
                 }
             ).touch()
-            self._save(state)
+            state = self._save(state)
             failure = {
                 "failure_type": FailureType.UNAUTHORIZED.value,
                 "message": message,
@@ -607,7 +619,7 @@ class ExecutionRuntime:
                 ],
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
         failure = {"failure_type": failure_type.value, "message": message, "step_id": step.step_id}
         for kind, action in (
             (event_type, event_type.replace(".", "_")),
@@ -627,7 +639,7 @@ class ExecutionRuntime:
 
     def _mark_running(self, state: ExecutionState) -> ExecutionState:
         state = state.model_copy(update={"final_status": TaskStatus.RUNNING}).touch()
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -704,7 +716,7 @@ class ExecutionRuntime:
             status=PlanStepStatus.RUNNING,
             current_step=step_index,
         )
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -799,7 +811,7 @@ class ExecutionRuntime:
             state = state.model_copy(
                 update={"tool_calls": [*state.tool_calls, call]}
             ).touch()
-            self._save(state)
+            state = self._save(state)
             self._emit(
                 make_event(
                     task_id=state.task_id,
@@ -977,7 +989,7 @@ class ExecutionRuntime:
             }
         ).touch()
         # Keep step RUNNING while recovery may continue.
-        self._save(state)
+        state = self._save(state)
 
         self._emit(
             make_event(
@@ -1049,7 +1061,7 @@ class ExecutionRuntime:
                 "completion_summary": summary,
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
 
         self._emit(
             make_event(
@@ -1146,7 +1158,7 @@ class ExecutionRuntime:
             updates["approval_status"] = ApprovalStatus.NONE
 
         state = state.model_copy(update=updates).touch()
-        self._save(state)
+        state = self._save(state)
 
         self._emit(
             make_event(
@@ -1261,7 +1273,7 @@ class ExecutionRuntime:
                 "failures": [*state.failures, failure],
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -1292,7 +1304,7 @@ class ExecutionRuntime:
                 result={"completed_steps": state.completed_steps},
             )
         )
-        self._save(state.touch())
+        state = self._save(state.touch())
 
         result = self.verifier.verify(state)
         for check in result.checks:
@@ -1316,7 +1328,7 @@ class ExecutionRuntime:
                 "evidence": evidence,
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
 
         for item in result.evidence:
             self._emit(
@@ -1347,7 +1359,7 @@ class ExecutionRuntime:
                     "verification_status": result.status,
                 }
             ).touch()
-            self._save(state)
+            state = self._save(state)
             self._emit(
                 make_event(
                     task_id=state.task_id,
@@ -1390,7 +1402,7 @@ class ExecutionRuntime:
                 "failures": [*state.failures, failure],
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -1526,7 +1538,7 @@ class ExecutionRuntime:
                 "completion_summary": decision.reason,
             }
         ).touch()
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -1674,7 +1686,7 @@ class ExecutionRuntime:
                 )
             tool_calls.append(call)
         state = state.model_copy(update={"tool_calls": tool_calls}).touch()
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -1699,7 +1711,12 @@ class ExecutionRuntime:
         step_index: int,
         template: PlanStep,
     ) -> ExecutionState:
-        """Seal a collection snapshot, expand the template, re-authorize, continue."""
+        """Seal a collection snapshot, expand the template, re-authorize, continue.
+
+        The snapshot is saved before the template is replaced, so a restart in
+        between resumes from the sealed snapshot and does not observe twice.
+        The expanded plan is authorized before that replacement is saved.
+        """
         from app.models.collections import CollectionExecutionState
         from app.runtime.collections import (
             CollectionError,
@@ -1730,6 +1747,7 @@ class ExecutionRuntime:
                         )
                     }
                 ).touch()
+                state = self._save(state)
                 self._emit(
                     make_event(
                         task_id=state.task_id,
@@ -1755,7 +1773,7 @@ class ExecutionRuntime:
                 step_index,
                 template,
                 template.resolved_tool_name() or "",
-                failure_type=FailureType.PERMANENT,
+                failure_type=FailureType.ENVIRONMENT_UNEXPECTED,
                 message=str(exc),
                 event_type=EventType.STEP_FAILED,
             )
@@ -1769,12 +1787,26 @@ class ExecutionRuntime:
             state = state.model_copy(
                 update={"plan": plan, "current_step": step_index + 1}
             ).touch()
-            self._save(state)
+            state = self._save(state)
             return self._execute_next_locked(state.task_id)
 
-        # Replace template with expanded ordinary steps; preserve prefix/suffix.
+        # Authorize the replacement before it becomes the durable plan.
         plan = list(state.plan)
         new_plan = [*plan[:step_index], *expanded, *plan[step_index + 1 :]]
+        try:
+            scope = ensure_task_authorization(state)
+            authorize_plan(new_plan, scope)
+        except AuthorizationError as exc:
+            return self._fail_before_call(
+                state,
+                step_index,
+                template,
+                template.resolved_tool_name() or "",
+                failure_type=FailureType.UNAUTHORIZED,
+                message=f"Expanded collection plan unauthorized: {exc.reason.value}",
+                event_type=EventType.AUTHORIZATION_DENIED,
+            )
+
         expanded_from = dict(state.collections.expanded_from or {})
         for child in expanded:
             expanded_from[child.step_id] = template.step_id
@@ -1793,21 +1825,7 @@ class ExecutionRuntime:
             }
         ).touch()
 
-        try:
-            scope = ensure_task_authorization(state)
-            authorize_plan(new_plan, scope)
-        except AuthorizationError as exc:
-            return self._fail_before_call(
-                state,
-                step_index,
-                template,
-                template.resolved_tool_name() or "",
-                failure_type=FailureType.UNAUTHORIZED,
-                message=f"Expanded collection plan unauthorized: {exc.message}",
-                event_type=EventType.AUTHORIZATION_DENIED,
-            )
-
-        self._save(state)
+        state = self._save(state)
         self._emit(
             make_event(
                 task_id=state.task_id,
@@ -1855,8 +1873,10 @@ class ExecutionRuntime:
             extracted["last_file_path"] = data.get("path")
         return extracted
 
-    def _save(self, state: ExecutionState) -> None:
+    def _save(self, state: ExecutionState) -> ExecutionState:
+        state = sync_collection_progress(state)
         self.store.save_state(state)
+        return state
 
     def _emit(self, event: Any) -> None:
         self.store.append_event(event)
