@@ -201,6 +201,11 @@ def fixture_tickets() -> list[dict[str, Any]]:
 
 def _classify(db_path: Path) -> str:
     """'absent', 'empty', 'demo' or 'other'."""
+    # Directories (and other non-files) are never seedable. On Windows a directory
+    # often reports st_size == 0, which previously looked like an absent DB file
+    # and fell through to SQLite ("unable to open database file").
+    if db_path.exists() and not db_path.is_file():
+        return "other"
     if not db_path.exists() or db_path.stat().st_size == 0:
         return "absent"
     try:
@@ -235,6 +240,11 @@ def _remove(db_path: Path) -> None:
 def seed_demo_company(db_path: str | Path, *, reset: bool = False) -> FixtureSummary:
     """Create the fixture in a disposable database; idempotent for an existing one."""
     path = Path(db_path).expanduser()
+    if path.exists() and not path.is_file():
+        raise FixtureSafetyError(
+            f"{path} is not a SQLite database file path "
+            "(directories and special files are refused); nothing was changed."
+        )
     kind = _classify(path)
     if kind == "other":
         raise FixtureSafetyError(
