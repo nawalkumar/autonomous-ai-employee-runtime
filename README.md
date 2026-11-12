@@ -145,24 +145,41 @@ The dashboard keeps the dark design and eight-stage pipeline of the original dem
 every value comes from the API:
 
 - **Goal:** one button per supported goal; free text is allowed and sent to the server,
-  which rejects unsupported goals (`422`, no task created). For the ticket scenario an
-  explicitly labelled control injects **one simulated 503** into `create_ticket`.
-- **Execution:** real task ID and status, interpreted goal, plan steps with attempt
-  counts, tool arguments (secret-looking values redacted), retries, errors, and the
-  persisted audit events with their stored timestamps. Pipeline stages are derived from
-  those events.
+  which rejects unsupported goals (`422`, no task created). Creating a task is not
+  shown as a successful execution. For the ticket scenario an explicitly labelled
+  control injects **one simulated 503** into `create_ticket`. With
+  `AAE_DYNAMIC_PLANNING_ENABLED=true`, the three collection grammars appear as
+  trusted plans. Assignment and batch examples are shown only when the open
+  database actually contains `E-40`, `T-10002` and `T-10004` (seed
+  `python -m app.world.demo_fixture --database <DATABASE_PATH>` into an empty
+  file first). Those plans are deterministic. Other catalog goals may call the
+  configured provider. The page labels which kind of plan a task used.
+- **Execution:** real task ID and status, interpreted goal, and each plan step's
+  id, tool, operation, status, approval, tool-result summary, error and
+  verification. Tool arguments are shown with secret-looking values redacted.
+  The audit timeline uses persisted events and their stored timestamps.
+- **Collection:** `collection_progress` from the task, including selected and
+  processed counts and each ticket id with its step status. `completed` and
+  `verified` are separate. A task with no collection says so.
 - **Approval:** when the policy gate pauses a task, the card shows the pending step,
   operation, arguments, risk and reason. Approve and Reject each require confirmation in
-  a dialog and send an API request; the server enforces the decision and the card shows
-  the resulting status.
-- **Verification:** result, each independent check (expected vs actual), failure reasons
-  and evidence.
+  a dialog and send the existing API request with the displayed fingerprint. The
+  server enforces the decision. A stale fingerprint is an error, not a second approval.
+- **Verification:** the independent result, each check (expected vs actual), failure
+  reasons and evidence. The page does not treat a model explanation as verification.
+- **Replanning:** read-only `replan.proposed`, `replan.accepted`, `replan.rejected`
+  and `replan.exhausted` events, with revision, trigger, outcome, plan identity and
+  budget figures when the audit row has them. The page shows whether
+  `AAE_REPLANNING_ENABLED` is on and has no control that changes it or submits a plan.
 - **History:** persisted tasks (including ones started from the CLI); select one to
-  reload it, or resume a queued or interrupted task. `#task=<id>` in the URL reopens it.
+  reload it, or resume a queued or interrupted task. `#task=<id>` in the URL reopens
+  the task from the API, not from browser storage.
 - **Company and workspace:** read-only employees, tickets, customers, and the files
-  written to the workspace.
+  written to the workspace. Values are inserted as text, not HTML.
 - While a task executes the page polls every second (at most 120 times), stops when the
   task is settled, and shows a banner if the backend is unreachable or has restarted.
+  Local mode has no login; it is the same loopback API as the CLI. Public mode still
+  requires its existing session cookie. The dashboard does not add a new authority.
 
 ![Approval card for update_employee on step_1](docs/images/dashboard-approval.png)
 
@@ -513,7 +530,7 @@ fails closed because the unused mutation step was skipped.
 
 `status` and `history` show per-item progress and the ticket ids a list call
 actually returned. The task-detail JSON adds `collection_progress` and each
-tool call's `result`. The current dashboard ignores those fields.
+tool call's `result`. The dashboard renders those fields as text.
 
 What remains library-only: choosing an arbitrary collection path, item field or
 iteration expression. A replan cannot add those.
@@ -566,7 +583,8 @@ AAE_REPLANNING_ENABLED=false
 provider and does not change the plan. A direct `Replanner` call fails closed
 unless the caller passes a `ReplanEnablement` built from validated settings
 (`ReplanEnablement.from_settings` / `enablement_for_runtime`). Independent of
-dynamic planning. There is no dashboard replan view.
+dynamic planning. The dashboard shows the persisted replan events and cannot
+change this flag.
 
 When the flag is on, the existing executor may replace **remaining** work after
 exactly these tool failures:
