@@ -75,6 +75,12 @@ goal, plan or tool; dynamic (LLM-based) planning is **not** part of them.
   an independently granted, versioned allowlist of operations with entity/field
   constraints and execution budgets. Plans and resolved actions outside that scope
   fail closed before side effects. This is not LLM autonomy.
+- Optional [dynamic LLM planning](#dynamic-llm-planning) behind
+  `AAE_DYNAMIC_PLANNING_ENABLED` (default **false**). When enabled, a trusted intent
+  catalog may ask a configured provider to **propose** structured plans that still
+  pass deterministic validation and independently derived authorization before any
+  execution. The LLM never grants permissions, executes tools, approves actions, or
+  declares verification success.
 
 ## Platform support
 
@@ -347,10 +353,89 @@ tool instances or settings, so it contains no filesystem paths, secrets, configu
 or task data. Like `/api/v1/scenarios` it needs no demo session, and the `Host`
 allowlist and rate limits apply.
 
-**What it is not:** the registry describes the existing deterministic runtime. The mock
-planner still accepts only its two goal formats. LLM-based planning, dynamic tool
-selection and replanning are planned future work and are not implemented. Step-output
-references (below) are for explicit plans only.
+**What it is not:** the registry describes the existing deterministic runtime. With
+dynamic planning disabled (the default), the mock planner still accepts only its two
+goal formats. Optional LLM planning for a [trusted intent catalog](#dynamic-llm-planning)
+is feature-flagged and still cannot expand authorization. Generic replanning and
+unrestricted natural-language autonomy are out of scope. Step-output references
+(below) work for both explicit plans and accepted dynamic plans.
+
+## Dynamic LLM planning
+
+Feature flag (default off):
+
+```bash
+AAE_DYNAMIC_PLANNING_ENABLED=false
+```
+
+| Mode | Behavior |
+|------|----------|
+| **Disabled (default)** | Identical to prior releases: only the two deterministic mock goal contracts; no external provider calls from CLI/API planning. |
+| **Enabled** | Goals matching the trusted intent catalog (or the original two mock scenarios) may produce plans via `DynamicPlanner`. Unsupported goals fail closed. Authorization never falls back to a permissive planner. |
+
+### Trusted goal intents
+
+Intent parsing is **deterministic and independent of the LLM**. Entity IDs and bounded
+fields are taken from the matched grammar. Ambiguous or vague goals are rejected.
+
+Supported when the flag is on (in addition to the original two mock scenarios):
+
+- List open high-priority tickets
+- List / retrieve / get tickets for customer `C-<id>`
+- Create a support ticket for customer `C-<id>` about `<subject>`
+- Mark ticket `T-<id>` as `<status>` (or update ticket status to …)
+- Assign ticket `T-<id>` to [eligible Support] employee `E-<id>`
+- Update employee `E-<id>` title to `<title>`
+- Create a new customer named … at company … with email … and a welcome ticket
+
+Excluded on purpose (cannot be safely authorized from text alone): unrestricted
+searches, bulk/collection workflows, department transfers without explicit fields,
+`deactivate_employee`, and any goal that would require inventing entity IDs.
+
+### Planner interface
+
+`DynamicPlanner` accepts the original goal (as a trusted `InterpretedGoal`), the
+independently derived `AuthorizationScope`, capability descriptions filtered to that
+scope, typed argument schemas, `$ref` syntax, and plan limits. It returns a structured
+`Plan` compatible with the existing Pydantic models. Provider adapters implement
+`LLMClient`; tests use `MockLLMClient` canned plans or scripted doubles. Live xAI is
+optional via `LLM_PROVIDER=xai` and `XAI_API_KEY` when the flag is on — unit tests
+never call the network.
+
+Provider knobs (ignored when dynamic planning is disabled):
+`LLM_REQUEST_TIMEOUT_SECONDS`, `LLM_MAX_TOKENS`, `LLM_MAX_RESPONSE_BYTES`,
+`LLM_MAX_PROVIDER_RETRIES`. Missing credentials still allow disabled-mode operation;
+enabled mode with `LLM_PROVIDER=xai` and no key fails closed with a classified error
+(no secret leakage).
+
+### Validation and authorization sequence
+
+1. Parse provider JSON into a strict plan draft (`extra=forbid`)
+2. Validate against the plan schema and tool registry
+3. Validate dependencies and typed `$ref`s
+4. Validate capability argument contracts
+5. Run goal-scoped `authorize_plan`
+6. Enforce plan budgets from the trusted scope
+7. Reject the **entire** plan if any check fails — no partial execution, no automatic
+   approval of mutations, no silent repair of unauthorized plans
+
+Prompt-injection text in the user goal fails the trusted grammar. Malicious plan JSON
+(extra operations, expanded entities, raised budgets) is rejected by the same
+deterministic checks — system-prompt wording is not the safety boundary.
+
+### Example (mocked LLM, no API key)
+
+```bash
+AAE_DYNAMIC_PLANNING_ENABLED=true \
+LLM_PROVIDER=mock \
+uv run python -m app.cli run 'List open high-priority tickets.'
+```
+
+### Limitations
+
+Not every natural-language goal is supported. There is no generic autonomous
+replanning, collection iteration, unrestricted goal interpretation, shell execution,
+or public plan-submission endpoint. See also [Limitations](#limitations).
 
 ## Step-output references
 
@@ -575,10 +660,12 @@ permissions.
 
 ### Known limitations
 
-- No LLM-backed or natural-language-general authorization.
+- No natural-language-general authorization: scopes come only from trusted grammars
+  (mock scenarios, dynamic intents when flagged, or trusted internal `create_task`).
 - No public plan-submission or self-granted permission endpoints.
-- No generic collection iteration or bounded replanning.
+- No generic collection iteration or unbounded replanning.
 - Constraint vocabulary is intentionally small and typed.
+- The LLM cannot create, widen, or replace an `AuthorizationScope`.
 
 ## Company data model and demo company
 
@@ -682,19 +769,19 @@ mock goals work on it.
 |----------|--------|------------------|--------------------------------|
 | W1 Change an employee title | Supported | Natural-language goal (mock format A), approval, verification | — |
 | W2 Create a billing discrepancy ticket | Supported | Natural-language goal (mock format B), verification | — |
-| W3 Transfer an employee between departments | Operations supported | Explicit `update_employee` plan with approval | Natural-language planning |
-| W4 Correct an employee email | Operations supported | Explicit plan; a duplicate email fails with no change | Natural-language planning |
-| W5 Resolve or close a ticket | Operations supported | Allowed transitions; closing paused for approval | Natural-language planning |
+| W3 Transfer an employee between departments | Operations supported | Explicit `update_employee` plan with approval | Dynamic NL (department field not in title intent) |
+| W4 Correct an employee email | Operations supported | Explicit plan; a duplicate email fails with no change | Dynamic NL (email updates not catalogued) |
+| W5 Resolve or close a ticket | Operations supported | Allowed transitions; closing paused for approval | Dynamic NL for status updates when flag on |
 | W6 Escalate matching customer tickets | Partial | `list_tickets` and per-ticket `update_ticket`; `$ref` can bind one listed ticket | Generic iteration over a listing's output |
-| W7 Assign a ticket to a support engineer | Operations supported | Eligibility rules enforced and verified | Natural-language planning |
-| W8 Create a customer and welcome ticket | Supported (explicit plan) | `$ref` binds the new `customer_id` into `create_ticket`; approval and verification | Natural-language planning |
+| W7 Assign a ticket to a support engineer | Supported when dynamic planning is on | Eligibility rules enforced and verified; trusted assign intent | Flag off → explicit plan only |
+| W8 Create a customer and welcome ticket | Supported (explicit plan; dynamic when flag on) | `$ref` binds the new `customer_id` into `create_ticket`; approval and verification | — |
 | W9 Produce a daily ticket summary | Partial | Counts match an independent recount; summary file verified | Writing content derived from a listing |
 | W10 Deactivate an employee safely | Partial | Refusal with open tickets; reassign, then deactivate with approval | Finding and reassigning blocking tickets automatically |
 
-W8 is covered end-to-end by `tests/test_reference_execution.py` (demo fixture and fresh
-DB). Other partial workflows may still pass earlier results between steps in the test
-harness when the scenario needs iteration the runtime does not provide. There is no
-natural-language handler for W3–W10.
+W8 is covered end-to-end by `tests/test_reference_execution.py` and, with the feature
+flag, by `tests/test_dynamic_planning.py`. Other partial workflows may still pass
+earlier results between steps in the test harness when the scenario needs iteration
+the runtime does not provide.
 
 ## Local mode and public demo mode
 
@@ -717,7 +804,8 @@ erased. Public demo data is fictional and may be reset at any time.
 
 Enforced on the server, in both modes:
 
-- Tasks come only from goals accepted by the strict mock grammar. There is no endpoint
+- Tasks come only from goals accepted by the strict mock grammar (and, when enabled,
+  the trusted dynamic intent catalog). There is no endpoint
   that runs a tool, plan, shell command or file write directly.
 - Each task is bound to a [goal-scoped authorization](#goal-scoped-plan-authorization)
   contract derived from that grammar (not from the planner or the caller). Plans and
@@ -837,10 +925,13 @@ one instance.
 
 ## Limitations
 
-- **Not LLM-autonomous.** Exactly two mock goal formats; no live LLM planning.
-  Authorization is independently granted from those grammars (or trusted internal
-  scopes), not inferred from free-form natural language. `--provider xai` is refused
-  by the CLI and `LLM_PROVIDER` does not affect the CLI or the API.
+- **Not LLM-autonomous by default.** With `AAE_DYNAMIC_PLANNING_ENABLED=false`
+  (default), exactly two mock goal formats apply and no external planner calls are
+  made. With the flag enabled, only the [trusted intent catalog](#dynamic-llm-planning)
+  is accepted; authorization is still independently granted from those grammars, not
+  from free-form model text. The CLI still refuses `--provider xai`; set
+  `LLM_PROVIDER=xai` (with `XAI_API_KEY`) when the flag is on if you want the live
+  adapter. Unit tests never make live provider calls.
 - **Fictional world.** The company API, employees, customers and tickets are a seeded
   SQLite mock; there are no real integrations.
 - **Locks protect cooperating processes only** (the CLI and the API). Code that calls
@@ -863,9 +954,11 @@ one instance.
 ## How it works
 
 ```text
-Goal → mock interpreter (strict grammar) → trusted authorization scope
-     → plan validated against registry + scope
-     → resolve $ref arguments from earlier step outputs (explicit plans)
+Goal → trusted grammar (mock scenarios and/or dynamic intents)
+     → independently derived authorization scope
+     → plan (mock planner, or DynamicPlanner proposal when flag enabled)
+     → validate schema / refs / capabilities → authorize_plan
+     → resolve $ref arguments from earlier step outputs
      → authorize resolved action → policy gate (HITL) → tool calls with bounded retry
      → independent verification of database + workspace → COMPLETED / FAILED
 ```
@@ -920,7 +1013,7 @@ app/
   api/        # v1 routes, service layer, sessions, request guard, errors, redaction
   web/        # live dashboard (index.html, app.css, app.js)
   llm/        # LLM clients; mock.py holds the strict two-goal grammar
-  planning/   # goal interpreter, planner, plan validation
+  planning/   # interpreter, mock/dynamic planners, trusted intents, validation
   authz/      # goal-scoped authorization contract, trusted origin, plan/runtime gates
   runtime/    # ExecutionRuntime, recovery, audit event types, shared task locks
   policy/     # approval policy (HITL; distinct from authorization)
