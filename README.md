@@ -480,17 +480,30 @@ Contract (`app/models/collections.py`):
 - Unique `item_id` values; duplicates dropped and recorded.
 - Typed `$collection_item` placeholders in plan arguments (not JSONPath).
 - `PlanStep.collection` declares selection (`first_n` or `explicit_ids`) and
-  `max_items`. The runtime expands the template into ordinary steps, persists the
-  expanded plan, re-runs `authorize_plan`, then executes each item with normal
-  approval, idempotency and verification.
+  `max_items`. The runtime seals the snapshot and saves it before replacing the
+  template, authorizes the expanded plan, then persists that plan and executes
+  each item with normal approval, idempotency and verification.
 - `FromCollectionConstraint` authorizes item ids only if they appear in the sealed
   snapshot for `source_step_id` — appearing in a live query is not enough.
 
-**Restart and progress:** Restart safety relies on durable plan-step state,
-tool-call history and per-step idempotency keys — not on
-`collections.progress`. That progress list is created in an initial `pending`
-state when a template expands and is **not currently updated** afterward.
-Partial completion is visible from plan step statuses and tool-call records.
+**Progress:** `collections.progress` is a projection of the linked plan step, the
+task approval and independent verification. It is rewritten on every state save
+and again when a task is loaded, so a restart cannot leave an item looking
+successful when the step or the verifier does not. Status values:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Not started |
+| `running` | Step execution has started |
+| `awaiting_approval` | This item is the pending approval |
+| `completed` | Step finished; verification has not passed |
+| `verified` | Step finished and independent verification passed |
+| `failed` | Execution failed, or verification failed after execution |
+| `rejected` | Approval for this item was rejected |
+| `skipped` | Step was skipped |
+
+A model reply is never treated as success. `verified` is set only when
+`verification_status` is `passed`.
 
 ## Bounded replanning
 
@@ -503,28 +516,41 @@ AAE_REPLANNING_ENABLED=false
 # AAE_MAX_REPLAN_ROUNDS=2
 ```
 
-`AAE_REPLANNING_ENABLED=false` is the configured default. The setting is **not yet
-enforced** by the replanning library: callers that invoke `Replanner` directly are
-not gated by this flag. Independent of dynamic planning.
+`AAE_REPLANNING_ENABLED=false` is the default and is enforced. The executor,
+CLI, API and dashboard do not call the replanner. A direct `Replanner` call
+fails closed unless the caller passes a `ReplanEnablement` built from validated
+settings (`ReplanEnablement.from_settings` / `enablement_for_runtime`). Turning
+the flag on does not start automatic replanning. Independent of dynamic planning.
 
-When used, a `Replanner` may propose a replacement for **remaining** work only
-under recognized recoverable triggers (for example `ticket_state_conflict`). It
-must not run for authorization denials, approval rejection, budget exhaustion,
-malformed plans, or policy violations.
+When a trusted caller does invoke it, a `Replanner` may propose a replacement
+for **remaining** work only under recognized recoverable triggers (for example
+`ticket_state_conflict`). It does not run for authorization denials, approval
+rejection, budget exhaustion, malformed plans, or policy violations.
 
-Rules (intended):
+Rules:
 
-- Original `AuthorizationScope` is immutable; replacement steps are validated against it.
-- Completed verified steps are retained; side effects are not replayed by revision alone.
-- `replan_count` / `replan_limit` are persisted on state when a revision is applied;
-  budgets must not be reset.
+- The task's original `AuthorizationScope` is authoritative. A wider scope object
+  passed by the caller is ignored.
+- `AAE_MAX_REPLAN_ROUNDS` (0–5, default 2) is copied onto the task as
+  `replan_limit` at creation. Restart keeps that limit and `replan_count`.
+  A later caller cannot raise either above the persisted values, and cannot
+  raise the limit above the trusted enablement cap.
+- Completed steps are retained. The effective plan is those steps plus the
+  replacement, with each collection template counted as its expansion (the
+  sealed selection, or the declared upper bound when no snapshot exists yet).
+  That total must fit the original `max_steps`. Historical tool-call attempts
+  and historical mutating attempts (from capability `mutating` metadata,
+  including failures) stay consumed. A proposal that would exceed any original
+  budget is rejected and not installed.
+- Accepted and rejected decisions are stored with `replan.proposed`,
+  `replan.accepted` or `replan.rejected` events in one database transaction.
+  `replan.exhausted` is written when the round cap has already been reached.
+  Event metadata is task id, revision, trigger, plan identities, authorization
+  outcome, budget figures and a short reason. It does not include prompts,
+  secrets or raw tool payloads.
 - New mutations still require approval when policy says so.
-- Provider output is untrusted structured JSON (mocked in tests).
-
-**Known gaps (do not treat as complete):** aggregate step-budget accounting when
-completed steps are retained alongside a replacement plan; mutation accounting that
-does not fully align with capability-based mutating detection; and replan audit
-events (`replan.*`) that are defined but not yet emitted on the runtime path.
+- Provider output is untrusted structured JSON (mocked in tests). Replacement
+  steps are stored as pending; a proposal cannot mark itself complete.
 
 ## Step-output references
 
@@ -953,8 +979,8 @@ See `.env.example`. Settings are read from the environment and an optional `.env
 | `WORKSPACE_PATH` | File tool sandbox (default `workspace`) |
 | `MAX_RECOVERY_ATTEMPTS` | Retries allowed after a step's first attempt (default `2`) |
 | `LLM_PROVIDER`, `XAI_API_KEY`, `XAI_MODEL`, `XAI_BASE_URL` | Provider settings for library use; ignored by the CLI and the API |
-| `AAE_REPLANNING_ENABLED` | Configured default `false`. Documents intent only today: the replanning library does not yet enforce this flag |
-| `AAE_MAX_REPLAN_ROUNDS` | Conservative default `2` in settings; task state also carries `replan_limit` (not an end-user product control) |
+| `AAE_REPLANNING_ENABLED` | Default `false`. Library calls fail closed without a trusted enablement context. Not automatic, and not a CLI, API or dashboard control |
+| `AAE_MAX_REPLAN_ROUNDS` | Default `2`, valid range 0–5. Copied onto each new task as `replan_limit` and kept across restart |
 
 Never commit `.env` or real secrets.
 
