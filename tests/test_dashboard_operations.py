@@ -10,7 +10,9 @@ import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -128,24 +130,115 @@ def expect_approval(page, step_id: str, label: str) -> None:
     )
 
 
+def _approval_diagnostic_snapshot(
+    page, server: LiveServer, task_id: str, *, detail: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Redacted approval sync snapshot for failure diagnosis (no argument payloads)."""
+    detail = detail if detail is not None else api(server, f"/api/v1/tasks/{task_id}")
+    pending = detail.get("pending_action")
+    card = page.locator("#approvalCard")
+    return {
+        "task_id": task_id,
+        "api_status": detail.get("status"),
+        "api_approval_status": detail.get("approval_status"),
+        "api_executing": detail.get("executing"),
+        "api_current_step": detail.get("current_step"),
+        "api_pending_step": (pending or {}).get("step_id"),
+        "api_pending_fingerprint": (pending or {}).get("fingerprint"),
+        "api_pending_operation": (pending or {}).get("operation"),
+        "ui_status": page.locator("#statusPill").inner_text(),
+        "ui_ready": card.get_attribute("data-approval-ready"),
+        "ui_task_id": card.get_attribute("data-task-id"),
+        "ui_pending_step": card.get_attribute("data-pending-step"),
+        "ui_pending_fingerprint": card.get_attribute("data-pending-fingerprint"),
+        "ui_approve_enabled": page.locator("#approveBtn").is_enabled(),
+        "ui_hash": page.evaluate("() => location.hash"),
+    }
+
+
+def _with_recent_events(
+    server: LiveServer, task_id: str, snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    history = api(server, f"/api/v1/tasks/{task_id}/history")
+    enriched = dict(snapshot)
+    enriched["recent_events"] = [
+        event["event_type"] for event in history.get("events", [])[-8:]
+    ]
+    return enriched
+
+
+def _approval_states_agree(snapshot: dict[str, Any], task_id: str) -> bool:
+    return (
+        snapshot["api_status"] == "needs_approval"
+        and snapshot["api_approval_status"] == "pending"
+        and snapshot["api_executing"] is False
+        and bool(snapshot["api_pending_step"])
+        and bool(snapshot["api_pending_fingerprint"])
+        and snapshot["ui_status"] == "needs_approval"
+        and snapshot["ui_ready"] == "1"
+        and snapshot["ui_task_id"] == task_id
+        and snapshot["ui_pending_step"] == snapshot["api_pending_step"]
+        and snapshot["ui_pending_fingerprint"] == snapshot["api_pending_fingerprint"]
+        and snapshot["ui_approve_enabled"] is True
+        and task_id in (snapshot["ui_hash"] or "")
+    )
+
+
 def wait_until_approvable(page, server: LiveServer, task_id: str) -> dict:
-    """Sync on backend pending approval and the matching enabled dashboard control."""
-    expect(page.locator("#approvalCard")).to_have_attribute(
-        "data-approval-ready", "1", timeout=20_000
+    """Require durable backend pause and matching dashboard controls before click.
+
+    UI-ready alone is not enough: a transitional poll can advertise approval while
+    a later GET sees no pending_action. Align with API wait_for semantics
+    (needs_approval and not executing) plus fingerprint agreement.
+    """
+    last: dict[str, Any] = {}
+    deadline = time.monotonic() + 20.0
+
+    while time.monotonic() < deadline:
+        detail = api(server, f"/api/v1/tasks/{task_id}")
+        snapshot = _approval_diagnostic_snapshot(page, server, task_id, detail=detail)
+        last = snapshot
+        pending = detail.get("pending_action")
+
+        if pending is not None and _approval_states_agree(snapshot, task_id):
+            # Re-check one more GET so we never click a revision that just moved.
+            confirm = api(server, f"/api/v1/tasks/{task_id}")
+            confirm_snap = _approval_diagnostic_snapshot(
+                page, server, task_id, detail=confirm
+            )
+            last = confirm_snap
+            confirm_pending = confirm.get("pending_action")
+            if (
+                confirm_pending is not None
+                and _approval_states_agree(confirm_snap, task_id)
+                and confirm_pending.get("step_id") == pending.get("step_id")
+                and confirm_pending.get("fingerprint") == pending.get("fingerprint")
+            ):
+                expect(page.locator("#approveBtn")).to_be_visible()
+                return confirm_pending
+
+        if (
+            snapshot["api_status"] == "needs_approval"
+            and snapshot["api_executing"] is False
+            and snapshot["api_approval_status"] == "pending"
+            and pending is None
+        ):
+            diagnostic = _with_recent_events(server, task_id, snapshot)
+            print("approval_diagnostic", json.dumps(diagnostic, sort_keys=True, default=str))
+            raise AssertionError(
+                "backend reports needs_approval/pending without pending_action: "
+                f"{json.dumps(diagnostic, sort_keys=True, default=str)}"
+            )
+
+        # In-flight execution or UI catching up — do not click.
+        time.sleep(0.05)
+
+    diagnostic = _with_recent_events(server, task_id, last)
+    print("approval_diagnostic", json.dumps(diagnostic, sort_keys=True, default=str))
+    raise AssertionError(
+        "timed out waiting for backend and dashboard approval agreement: "
+        f"{json.dumps(diagnostic, sort_keys=True, default=str)}"
     )
-    expect(page.locator("#statusPill")).to_have_text("needs_approval")
-    pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
-    assert pending is not None
-    assert pending.get("step_id") and pending.get("fingerprint")
-    expect(page.locator("#approvalCard")).to_have_attribute(
-        "data-pending-step", pending["step_id"]
-    )
-    expect(page.locator("#approvalCard")).to_have_attribute(
-        "data-pending-fingerprint", pending["fingerprint"]
-    )
-    expect(page.locator("#approveBtn")).to_be_enabled()
-    expect(page.locator("#approveBtn")).to_be_visible()
-    return pending
 
 
 def approve_through_dashboard(page, server: LiveServer, task_id: str) -> dict:
