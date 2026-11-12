@@ -657,3 +657,34 @@ def test_legacy_update_is_unchanged_when_replanning_is_on(world: World, replan_o
     assert llm.calls == 0
     assert world.repo.get_ticket("T-10002").status == "in_progress"
     assert _replan_events(world, state.task_id) == []
+
+
+def test_executor_exhausts_a_zero_budget_without_calling_the_provider(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AAE_REPLANNING_ENABLED", "true")
+    monkeypatch.setenv("AAE_MAX_REPLAN_ROUNDS", "0")
+    get_settings.cache_clear()
+    llm = ScriptedLLM(_proposal("fix", "in_progress"))
+    world.runtime._replan_llm = llm
+    state = world.runtime.create_task(
+        user_goal="exhausted",
+        plan=[step("u", "update_ticket", ticket_id="T-10009", fields={"status": "open"})],
+        authorization=_scope("open", "in_progress"),
+    )
+    final = world.runtime.run(state.task_id)
+    assert final.final_status is TaskStatus.FAILED
+    assert final.replan_count == 0
+    assert final.replan_limit == 0
+    assert llm.calls == 0
+    assert world.repo.get_ticket("T-10009").status == "resolved"
+    assert [event.event_type for event in _replan_events(world, state.task_id)] == [
+        EventType.REPLAN_EXHAUSTED
+    ]
+    restarted = reopen(world)
+    stored = restarted.store.get_state(state.task_id)
+    assert stored is not None
+    assert stored.replan_limit == 0
+    assert stored.replan_count == 0
+    assert restarted.runtime.run(state.task_id).final_status is TaskStatus.FAILED
+    assert restarted.runtime._replan_llm is None

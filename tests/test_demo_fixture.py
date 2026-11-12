@@ -143,6 +143,11 @@ def test_command_line(tmp_path: Path, capsys) -> None:
     sqlite3.connect(other).execute("CREATE TABLE t (x)").connection.close()
     assert main(["--database", str(other), "--reset"]) == 2
     assert "not a disposable demo database" in capsys.readouterr().err
+    directory = tmp_path / "db-dir"
+    directory.mkdir()
+    with pytest.raises(FixtureSafetyError):
+        seed_demo_company(directory, reset=True)
+    assert directory.is_dir()
 
 
 def test_default_scenarios_still_work_on_the_demo_company(tmp_path: Path, capsys) -> None:

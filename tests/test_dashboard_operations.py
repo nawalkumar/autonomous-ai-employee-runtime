@@ -88,6 +88,46 @@ def run_goal(page, goal: str) -> str:
     return re.search(r"(task_[0-9a-f]{32})", page.locator("#formMsg").inner_text()).group(1)
 
 
+COLLECTION_STATUSES = (
+    "pending",
+    "running",
+    "awaiting_approval",
+    "completed",
+    "verified",
+    "failed",
+    "rejected",
+    "skipped",
+)
+
+
+def expect_collection_matches_api(page, detail: dict) -> None:
+    """Every counter is counted from the API rows, not from a tool result."""
+    items = detail["collection_progress"]
+    counts = {status: 0 for status in COLLECTION_STATUSES}
+    for item in items:
+        assert item["status"] in counts
+        counts[item["status"]] += 1
+    processed = sum(
+        1 for item in items if item["status"] not in {"pending", "running"}
+    )
+    expect(page.locator("[data-field='collection_selected']")).to_have_text(str(len(items)))
+    expect(page.locator("[data-field='collection_total']")).to_have_text(str(len(items)))
+    expect(page.locator("[data-field='collection_processed']")).to_have_text(str(processed))
+    for status, count in counts.items():
+        expect(page.locator(f"[data-collection-count='{status}']")).to_have_text(
+            f"{status} {count}"
+        )
+    for item in items:
+        row = page.locator(f"[data-collection-item='{item['item_id']}']")
+        expect(row).to_have_attribute("data-status", item["status"])
+
+
+def expect_approval(page, step_id: str, label: str) -> None:
+    expect(page.locator(f"#planList li[data-step-id='{step_id}']")).to_have_attribute(
+        "data-approval", label
+    )
+
+
 def test_read_only_list_shows_real_ticket_ids(page, tmp_path: Path) -> None:
     server = start_demo(tmp_path)
     try:
@@ -104,6 +144,8 @@ def test_read_only_list_shows_real_ticket_ids(page, tmp_path: Path) -> None:
         for ticket_id in ticket_ids:
             expect(page.locator(f"[data-result='list']")).to_contain_text(ticket_id)
         expect(page.locator("#collectionPanel")).to_contain_text("No collection on this task.")
+        for step in detail["plan"]:
+            expect_approval(page, step["step_id"], "Not required.")
         expect(page.locator("#statusPill")).not_to_have_text("completed success")
     finally:
         server.stop()
@@ -119,15 +161,14 @@ def test_bounded_assignment_shows_collection_progress(page, tmp_path: Path) -> N
         verification = api(server, f"/api/v1/tasks/{task_id}/verification")
         assert detail["collection_progress"]
         assert verification["status"] == "passed"
-        expect(page.locator("[data-field='collection_selected']")).to_have_text(
-            str(len(detail["collection_progress"]))
-        )
+        expect_collection_matches_api(page, detail)
+        assert any(item["status"] == "verified" for item in detail["collection_progress"])
+        assert all(item["status"] != "completed" for item in detail["collection_progress"])
         expect(page.locator("#collectionPanel")).to_contain_text(
             "A successful tool result is not verification."
         )
-        for item in detail["collection_progress"]:
-            row = page.locator(f"[data-collection-item='{item['item_id']}']")
-            expect(row).to_have_attribute("data-status", item["status"])
+        for step in detail["plan"]:
+            expect_approval(page, step["step_id"], "Not required.")
         expect(page.locator("[data-field='verification_result']")).to_contain_text("PASSED")
     finally:
         server.stop()
@@ -142,6 +183,10 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
         pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
         expect(page.locator("#apOperation")).to_have_text(pending["operation"])
         expect(page.locator("#apArgs")).to_contain_text("closed")
+        plan = api(server, f"/api/v1/tasks/{task_id}")["plan"]
+        for step in plan:
+            label = "Awaiting approval." if step["step_id"] == pending["step_id"] else "Not required."
+            expect_approval(page, step["step_id"], label)
         assert api(server, "/api/v1/company/tickets")
         before = {
             ticket["ticket_id"]: ticket["status"]
@@ -160,6 +205,9 @@ def test_close_batch_pauses_until_dashboard_approval(page, tmp_path: Path) -> No
             page.click("#confirmOk")
             expect(page.locator("#approvalMsg")).to_contain_text("Resulting task status:", timeout=20_000)
         expect(page.locator("#statusPill")).to_have_text("completed")
+        finished = api(server, f"/api/v1/tasks/{task_id}")
+        for step in finished["plan"]:
+            expect_approval(page, step["step_id"], "Approved.")
         after = {
             ticket["ticket_id"]: ticket["status"]
             for ticket in api(server, "/api/v1/company/tickets")["tickets"]
@@ -176,6 +224,7 @@ def test_rejection_does_not_continue_or_replan(page, tmp_path: Path) -> None:
         page.goto(server.url)
         task_id = run_goal(page, CLOSE_GOAL)
         expect(page.locator("#approvalCard")).to_be_visible(timeout=20_000)
+        pending = api(server, f"/api/v1/tasks/{task_id}")["pending_action"]
         page.click("#rejectBtn")
         page.click("#confirmOk")
         expect(page.locator("#statusPill")).to_have_text("aborted", timeout=20_000)
@@ -190,6 +239,9 @@ def test_rejection_does_not_continue_or_replan(page, tmp_path: Path) -> None:
         }
         assert statuses == {"T-10009": "resolved", "T-10010": "resolved"}
         expect(page.locator("#replanPanel")).to_contain_text("No replan events")
+        for step in detail["plan"]:
+            label = "Rejected." if step["step_id"] == pending["step_id"] else "Not required."
+            expect_approval(page, step["step_id"], label)
     finally:
         server.stop()
 
@@ -352,5 +404,155 @@ def test_dashboard_security_boundaries(page, tmp_path: Path) -> None:
         page.click("#approveBtn")
         page.click("#confirmCancel")
         expect(page.locator("#statusPill")).to_have_text("needs_approval")
+        expect_approval(page, pending["step_id"], "Awaiting approval.")
+    finally:
+        server.stop()
+
+
+def test_empty_assignment_is_not_shown_as_verified(page, tmp_path: Path) -> None:
+    root = tmp_path / "app"
+    database = root / "data" / "runtime.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    (root / "workspace").mkdir(parents=True, exist_ok=True)
+    seed_demo_company(database)
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "UPDATE company_tickets SET status = 'resolved' "
+            "WHERE status = 'open' AND priority = 'high'"
+        )
+    server = LiveServer(root, {"AAE_DYNAMIC_PLANNING_ENABLED": "true"}).start()
+    try:
+        page.goto(server.url)
+        task_id = run_goal(page, ASSIGN_GOAL)
+        expect(page.locator("#statusPill")).to_have_text("failed", timeout=20_000)
+        detail = api(server, f"/api/v1/tasks/{task_id}")
+        verification = api(server, f"/api/v1/tasks/{task_id}/verification")
+        assert detail["status"] == "failed"
+        assert verification["status"] != "passed"
+        if not detail["collection_progress"]:
+            expect(page.locator("#collectionPanel")).to_contain_text("No collection on this task.")
+        else:
+            expect_collection_matches_api(page, detail)
+            assert all(item["status"] != "verified" for item in detail["collection_progress"])
+    finally:
+        server.stop()
+
+
+def prepare_scripted_acceptance(root: str) -> str:
+    """Commit one accepted revision with a scripted provider.
+
+    This runs in a child process. Playwright already owns an event loop, and the
+    executor's ``asyncio.run`` cannot share it. The provider is the test double,
+    not a live model.
+    """
+    import app.main  # noqa: F401  stable import order before the model package
+    from app.config import get_settings
+    from app.models.enums import TaskStatus, VerificationStatus
+    from app.models.goal import SuccessCriterion
+    from tests.company_support import make_world, step
+    from tests.test_automatic_replan import ScriptedLLM, _proposal, _scope
+
+    os.environ["AAE_REPLANNING_ENABLED"] = "true"
+    os.environ["AAE_MAX_REPLAN_ROUNDS"] = "2"
+    get_settings.cache_clear()
+    world = make_world(Path(root), demo=True)
+    world.runtime._replan_llm = ScriptedLLM(_proposal("fix", "in_progress"))
+    state = world.runtime.create_task(
+        user_goal="scripted recovery of T-10009",
+        plan=[step("u", "update_ticket", ticket_id="T-10009", fields={"status": "open"})],
+        authorization=_scope("open", "in_progress"),
+        success_criteria=[
+            SuccessCriterion(
+                description="ticket moved",
+                criterion_type="ticket_fields",
+                expected_value={"ticket_id": "T-10009", "status": "in_progress"},
+            )
+        ],
+    )
+    final = world.runtime.run(state.task_id)
+    if final.final_status is not TaskStatus.COMPLETED:
+        raise RuntimeError(final.completion_summary)
+    if final.verification_status is not VerificationStatus.PASSED or final.replan_count != 1:
+        raise RuntimeError(f"unexpected revision outcome {final.verification_status} {final.replan_count}")
+    return state.task_id
+
+
+def test_dashboard_shows_scripted_accepted_replan(page, tmp_path: Path) -> None:
+    """The dashboard only renders the audit rows the child process committed."""
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    root = tmp_path / "app"
+    with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as pool:
+        task_id = pool.submit(prepare_scripted_acceptance, str(root)).result()
+    server = LiveServer(
+        root,
+        {"AAE_DYNAMIC_PLANNING_ENABLED": "true", "AAE_REPLANNING_ENABLED": "true"},
+    ).start()
+    try:
+        page.goto(f"{server.url}/#task={task_id}")
+        page.reload()
+        expect(page.locator("#statusPill")).to_have_text("completed", timeout=20_000)
+        history = api(server, f"/api/v1/tasks/{task_id}/history")
+        replan = [event for event in history["events"] if str(event["event_type"]).startswith("replan.")]
+        assert [event["event_type"] for event in replan] == ["replan.proposed", "replan.accepted"]
+        rendered = page.locator("[data-replan-event]").evaluate_all(
+            "nodes => nodes.map(node => node.dataset.replanEvent)"
+        )
+        assert rendered == [event["event_id"] for event in replan]
+        accepted = replan[-1]["result"]
+        budgets = accepted["budgets"]
+        row = page.locator(f"[data-replan-event='{replan[-1]['event_id']}']")
+        expect(row).to_contain_text(f"revision {accepted['revision']}")
+        expect(row).to_contain_text(str(accepted["trigger"]))
+        expect(row).to_contain_text(str(accepted["outcome"]))
+        expect(row).to_contain_text(f"steps {budgets['effective_steps']}/{budgets['max_steps']}")
+        expect(row).to_contain_text(f"mutations remaining {budgets['mutations_remaining']}")
+        ticket = next(
+            item
+            for item in api(server, "/api/v1/company/tickets")["tickets"]
+            if item["ticket_id"] == "T-10009"
+        )
+        assert ticket["status"] == "in_progress"
+        expect(page.locator("[data-field='verification_result']")).to_contain_text("PASSED")
+    finally:
+        server.stop()
+
+
+def test_dashboard_shows_exhausted_replan_without_applying_a_script(page, tmp_path: Path) -> None:
+    """A zero round budget is server configuration. The scripted plan must not run."""
+    server = start_demo(
+        tmp_path,
+        AAE_REPLANNING_ENABLED="true",
+        AAE_MAX_REPLAN_ROUNDS="0",
+        AAE_TEST_MODE="1",
+        AAE_TEST_SCRIPTED_PLAN=SCRIPTED,
+    )
+    try:
+        page.goto(server.url)
+        task_id = run_goal(page, OPEN_GOAL)
+        expect(page.locator("#statusPill")).to_have_text("failed", timeout=20_000)
+        detail = api(server, f"/api/v1/tasks/{task_id}")
+        history = api(server, f"/api/v1/tasks/{task_id}/history")
+        replan = [event for event in history["events"] if str(event["event_type"]).startswith("replan.")]
+        assert [event["event_type"] for event in replan] == ["replan.exhausted"]
+        assert detail["status"] == "failed"
+        rendered = page.locator("[data-replan-event]").evaluate_all(
+            "nodes => nodes.map(node => node.getAttribute('data-event-type'))"
+        )
+        assert rendered == ["replan.exhausted"]
+        statuses = {
+            ticket["ticket_id"]: ticket["status"]
+            for ticket in api(server, "/api/v1/company/tickets")["tickets"]
+            if ticket["ticket_id"] in {"T-10009", "T-10010", "E-17"}
+        }
+        assert statuses["T-10009"] == "resolved"
+        assert statuses["T-10010"] == "resolved"
+        employees = api(server, "/api/v1/company/employees")["employees"]
+        active = next(employee for employee in employees if employee["employee_id"] == "E-17")
+        assert active["status"] == "active"
+        page.reload()
+        expect(page.locator("[data-replan-event]")).to_have_attribute("data-event-type", "replan.exhausted")
+        expect(page.locator("#statusPill")).to_have_text("failed")
     finally:
         server.stop()
